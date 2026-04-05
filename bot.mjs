@@ -1,7 +1,7 @@
 /**
- * AGENT TRADING BOT — bot.mjs v2 (Research-Verified)
- * Uses real SDKs: 7K aggregator, Cetus CLMM SDK, Turbos SDK, Aftermath SDK
- * Handles both graduated DEX tokens AND bonding curve launchpad tokens
+ * AGENT TRADING BOT — bot.mjs v3
+ * Fixed: scan (GeckoTerminal API), button data invalid, buy/sell UX,
+ *        PnL images via QuickChart, proper amount/percent selection flows
  */
 
 import TelegramBot from 'node-telegram-bot-api';
@@ -19,14 +19,14 @@ import BN from 'bn.js';
 // ─────────────────────────────────────────────
 
 const TG_BOT_TOKEN  = process.env.TG_BOT_TOKEN  || '';
-const ENCRYPT_KEY   = process.env.ENCRYPT_KEY   || '';  // 64-char hex = 32 bytes
+const ENCRYPT_KEY   = process.env.ENCRYPT_KEY   || '';
 const RPC_URL       = process.env.RPC_URL       || 'https://fullnode.mainnet.sui.io:443';
 const BACKEND_URL   = process.env.BACKEND_URL   || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
 
 const DEV_WALLET   = '0x9e0ac3152f035e411164b24c8db59b3f0ee870340ec754ae5f074559baaa15b1';
-const FEE_BPS      = 100;           // 1%
-const REF_SHARE    = 0.25;          // referrer gets 25% of fee
+const FEE_BPS      = 100;
+const REF_SHARE    = 0.25;
 const MIST_PER_SUI = 1_000_000_000n;
 const SUI_TYPE     = '0x2::sui::SUI';
 const STORAGE_FILE = './users.json';
@@ -34,53 +34,19 @@ const LOCK_TIMEOUT = 30 * 60 * 1000;
 const MAX_FAILS    = 3;
 const COOLDOWN_MS  = 5 * 60 * 1000;
 const SUISCAN_TX   = 'https://suiscan.xyz/mainnet/tx/';
+const GECKO_BASE   = 'https://api.geckoterminal.com/api/v2';
+const GECKO_NET    = 'sui-network';
 
-// Launchpad registry — sourced from research
-// Each launchpad has bonding curve mechanics; tokens graduate to a DEX
 const LAUNCHPAD_REGISTRY = {
-  MOVEPUMP: {
-    name: 'MovePump',
-    apiBase: 'https://movepump.com/api',
-    graduationSui: 2000,
-    destinationDex: 'Cetus',
-    // Token coinType IS the package: 0xPKG::module::SYMBOL
-    // Buy fn: {pkg}::{module}::buy(bonding_curve_obj, sui_coin, clock)
-    buyFn: 'buy',
-    sellFn: 'sell',
-  },
-  TURBOS_FUN: {
-    name: 'Turbos.fun',
-    apiBase: 'https://api.turbos.finance/fun',
-    graduationSui: 6000,
-    destinationDex: 'Turbos',
-    buyFn: 'buy',
-    sellFn: 'sell',
-  },
-  HOP_FUN: {
-    name: 'hop.fun',
-    apiBase: 'https://api.hop.ag',
-    graduationSui: null,
-    destinationDex: 'Cetus',
-    buyFn: 'buy',
-    sellFn: 'sell',
-  },
-  MOONBAGS: {
-    name: 'MoonBags',
-    apiBase: 'https://api.moonbags.io',
-    graduationSui: null,
-    destinationDex: 'Cetus',
-    buyFn: 'buy',
-    sellFn: 'sell',
-  },
-  BLAST_FUN: {
-    name: 'blast.fun',
-    apiBase: 'https://api.blast.fun',
-    graduationSui: null,
-    destinationDex: 'Cetus',
-    buyFn: 'buy',
-    sellFn: 'sell',
-  },
+  MOVEPUMP:  { name: 'MovePump',   apiBase: 'https://movepump.com/api',          graduationSui: 2000, destinationDex: 'Cetus',  buyFn: 'buy', sellFn: 'sell' },
+  TURBOS_FUN:{ name: 'Turbos.fun', apiBase: 'https://api.turbos.finance/fun',     graduationSui: 6000, destinationDex: 'Turbos', buyFn: 'buy', sellFn: 'sell' },
+  HOP_FUN:   { name: 'hop.fun',    apiBase: 'https://api.hop.ag',                 graduationSui: null, destinationDex: 'Cetus',  buyFn: 'buy', sellFn: 'sell' },
+  MOONBAGS:  { name: 'MoonBags',   apiBase: 'https://api.moonbags.io',            graduationSui: null, destinationDex: 'Cetus',  buyFn: 'buy', sellFn: 'sell' },
+  BLAST_FUN: { name: 'blast.fun',  apiBase: 'https://api.blast.fun',              graduationSui: null, destinationDex: 'Cetus',  buyFn: 'buy', sellFn: 'sell' },
 };
+
+// Default buy amounts shown as quick buttons (user can customise)
+const DEFAULT_BUY_AMOUNTS = [0.5, 1, 3, 5];
 
 // ─────────────────────────────────────────────
 // 2. CRYPTO / SECURITY HELPERS
@@ -96,22 +62,27 @@ function encryptKey(privateKey) {
 
 function decryptKey(stored) {
   const [ivHex, encHex] = stored.split(':');
-  const keyBuf  = Buffer.from(ENCRYPT_KEY, 'hex');
-  const iv      = Buffer.from(ivHex, 'hex');
-  const enc     = Buffer.from(encHex, 'hex');
-  const decipher = createDecipheriv('aes-256-cbc', keyBuf, iv);
-  return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+  const keyBuf   = Buffer.from(ENCRYPT_KEY, 'hex');
+  const decipher = createDecipheriv('aes-256-cbc', Buffer.from(ivHex, 'hex'), Buffer.from(encHex, 'hex'));
+  return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8');
 }
 
-function hashPin(pin) {
-  return createHash('sha256').update(pin + ENCRYPT_KEY).digest('hex');
+function decryptKeyFixed(stored) {
+  const parts  = stored.split(':');
+  const ivHex  = parts[0];
+  const encHex = parts[1];
+  const keyBuf   = Buffer.from(ENCRYPT_KEY, 'hex');
+  const decipher = createDecipheriv('aes-256-cbc', keyBuf, Buffer.from(ivHex, 'hex'));
+  return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8');
 }
+
+function hashPin(pin) { return createHash('sha256').update(pin + ENCRYPT_KEY).digest('hex'); }
 
 function generateReferralCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let code = 'AGT-';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
+  let c = 'AGT-';
+  for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  return c;
 }
 
 function sanitize(str) {
@@ -124,22 +95,10 @@ function truncAddr(addr) {
   return addr.slice(0, 6) + '...' + addr.slice(-4);
 }
 
-function suiFloat(mist) {
-  return (Number(BigInt(mist)) / Number(MIST_PER_SUI)).toFixed(4);
-}
-
-function mistFromSui(sui) {
-  return BigInt(Math.floor(parseFloat(sui) * Number(MIST_PER_SUI)));
-}
-
-function packageFromCoinType(coinType) {
-  // "0xABC::module::SYMBOL" → "0xABC"
-  return coinType.split('::')[0];
-}
-
-function moduleFromCoinType(coinType) {
-  return coinType.split('::')[1] || '';
-}
+function suiFloat(mist) { return (Number(BigInt(mist)) / Number(MIST_PER_SUI)).toFixed(4); }
+function mistFromSui(sui) { return BigInt(Math.floor(parseFloat(sui) * Number(MIST_PER_SUI))); }
+function packageFromCoinType(ct) { return ct.split('::')[0]; }
+function moduleFromCoinType(ct)  { return ct.split('::')[1] || ''; }
 
 // ─────────────────────────────────────────────
 // 3. USER STORAGE
@@ -149,46 +108,28 @@ let usersDB = {};
 
 function loadUsers() {
   if (existsSync(STORAGE_FILE)) {
-    try { usersDB = JSON.parse(readFileSync(STORAGE_FILE, 'utf8')); }
-    catch { usersDB = {}; }
+    try { usersDB = JSON.parse(readFileSync(STORAGE_FILE, 'utf8')); } catch { usersDB = {}; }
   }
 }
 
-function saveUsers() {
-  writeFileSync(STORAGE_FILE, JSON.stringify(usersDB, null, 2));
-}
-
-function getUser(chatId) {
-  return usersDB[String(chatId)] || null;
-}
+function saveUsers() { writeFileSync(STORAGE_FILE, JSON.stringify(usersDB, null, 2)); }
+function getUser(chatId) { return usersDB[String(chatId)] || null; }
 
 function createUser(chatId, extras = {}) {
   const uid = String(chatId);
   usersDB[uid] = {
     chatId: uid,
-    encryptedKey: null,
-    walletAddress: null,
-    pinHash: null,
-    lockedAt: null,
-    lastActivity: Date.now(),
-    failAttempts: 0,
-    cooldownUntil: 0,
-    positions: [],
-    copyTraders: [],
-    snipeWatches: [],
+    encryptedKey: null, walletAddress: null, pinHash: null, lockedAt: null,
+    lastActivity: Date.now(), failAttempts: 0, cooldownUntil: 0,
+    positions: [], copyTraders: [], snipeWatches: [],
     settings: {
-      slippage: 1,
-      confirmThreshold: 0.5,
-      copyAmount: 0.1,
-      tpDefault: null,
-      slDefault: null,
+      slippage: 1, confirmThreshold: 0.5,
+      copyAmount: 0.1, tpDefault: null, slDefault: null,
+      buyAmounts: [...DEFAULT_BUY_AMOUNTS],
     },
     referralCode: generateReferralCode(),
-    referredBy: null,
-    referralCount: 0,
-    referralEarningsTotal: 0,
-    state: null,
-    pendingData: {},
+    referredBy: null, referralCount: 0, referralEarningsTotal: 0,
+    state: null, pendingData: {},
     ...extras,
   };
   saveUsers();
@@ -200,30 +141,23 @@ function updateUser(chatId, patch) {
   if (!usersDB[uid]) return;
   for (const [k, v] of Object.entries(patch)) {
     if (k.includes('.')) {
-      const [parent, child] = k.split('.');
-      if (!usersDB[uid][parent]) usersDB[uid][parent] = {};
-      usersDB[uid][parent][child] = v;
-    } else {
-      usersDB[uid][k] = v;
-    }
+      const [p, c] = k.split('.');
+      if (!usersDB[uid][p]) usersDB[uid][p] = {};
+      usersDB[uid][p][c] = v;
+    } else { usersDB[uid][k] = v; }
   }
   usersDB[uid].lastActivity = Date.now();
   saveUsers();
 }
 
-function isLocked(user) {
-  return !!(user?.pinHash && user?.lockedAt);
-}
-
+function isLocked(user) { return !!(user?.pinHash && user?.lockedAt); }
 function lockUser(chatId)   { updateUser(chatId, { lockedAt: Date.now() }); }
 function unlockUser(chatId) { updateUser(chatId, { lockedAt: null, failAttempts: 0 }); }
 
 function checkInactivity() {
   const now = Date.now();
   for (const [uid, user] of Object.entries(usersDB)) {
-    if (user.pinHash && !user.lockedAt && user.walletAddress) {
-      if (now - user.lastActivity > LOCK_TIMEOUT) lockUser(uid);
-    }
+    if (user.pinHash && !user.lockedAt && user.walletAddress && now - user.lastActivity > LOCK_TIMEOUT) lockUser(uid);
   }
 }
 
@@ -231,16 +165,10 @@ async function syncToBackend(user) {
   if (!BACKEND_URL) return;
   try {
     await fetchTimeout(`${BACKEND_URL}/api/bot-user`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chatId: user.chatId,
-        walletAddress: user.walletAddress,
-        referralCode: user.referralCode,
-        referralEarningsTotal: user.referralEarningsTotal,
-      }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatId: user.chatId, walletAddress: user.walletAddress, referralCode: user.referralCode }),
     });
-  } catch { /* non-critical */ }
+  } catch {}
 }
 
 // ─────────────────────────────────────────────
@@ -250,45 +178,35 @@ async function syncToBackend(user) {
 const suiClient = new SuiClient({ url: RPC_URL });
 
 async function fetchTimeout(url, opts = {}, ms = 8000) {
-  const ctrl  = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const r = await fetch(url, { ...opts, signal: ctrl.signal });
-    clearTimeout(timer);
-    return r;
-  } catch (e) {
-    clearTimeout(timer);
-    throw e;
-  }
+  const ctrl = new AbortController();
+  const t    = setTimeout(() => ctrl.abort(), ms);
+  try { const r = await fetch(url, { ...opts, signal: ctrl.signal }); clearTimeout(t); return r; }
+  catch (e) { clearTimeout(t); throw e; }
 }
 
 async function getCoinMeta(coinType) {
-  try { return await suiClient.getCoinMetadata({ coinType }); }
-  catch { return null; }
+  try { return await suiClient.getCoinMetadata({ coinType }); } catch { return null; }
 }
 
 async function getOwnedCoins(address, coinType) {
-  const r = await suiClient.getCoins({ owner: address, coinType });
-  return r.data;
+  const r = await suiClient.getCoins({ owner: address, coinType }); return r.data;
 }
 
-async function getAllBalances(address) {
-  return suiClient.getAllBalances({ owner: address });
-}
+async function getAllBalances(address) { return suiClient.getAllBalances({ owner: address }); }
 
 function getKeypair(user) {
-  const pk = decryptKey(user.encryptedKey);
-  const decoded = decodeSuiPrivateKey(pk);
-  return Ed25519Keypair.fromSecretKey(decoded.secretKey);
+  const stored = user.encryptedKey;
+  const parts  = stored.split(':');
+  const keyBuf = Buffer.from(ENCRYPT_KEY, 'hex');
+  const dec    = createDecipheriv('aes-256-cbc', keyBuf, Buffer.from(parts[0], 'hex'));
+  const pk     = Buffer.concat([dec.update(Buffer.from(parts[1], 'hex')), dec.final()]).toString('utf8');
+  return Ed25519Keypair.fromSecretKey(decodeSuiPrivateKey(pk).secretKey);
 }
 
 // ─────────────────────────────────────────────
-// 5. SDK SINGLETONS (lazy-loaded)
+// 5. SDK SINGLETONS
 // ─────────────────────────────────────────────
 
-// ── 7K Aggregator
-// Covers: Cetus, Turbos, Aftermath, Kriya, FlowX, DeepBook, BlueMove, Suiswap
-// Docs: github.com/7k-ag/7k-sdk-ts
 let _7k = null;
 async function sdk7k() {
   if (_7k) return _7k;
@@ -298,22 +216,14 @@ async function sdk7k() {
   return _7k;
 }
 
-// ── Cetus CLMM SDK
-// Used for: pool discovery, pool data, direct Cetus swaps when needed
-// Docs: cetus-1.gitbook.io/cetus-developer-docs
 let _cetusSDK = null;
 async function sdkCetus(walletAddress) {
   const { initCetusSDK, adjustForSlippage, Percentage, d } = await import('@cetusprotocol/cetus-sui-clmm-sdk');
-  if (!_cetusSDK) {
-    _cetusSDK = { sdk: initCetusSDK({ network: 'mainnet', fullNodeUrl: RPC_URL }), adjustForSlippage, Percentage, d };
-  }
+  if (!_cetusSDK) _cetusSDK = { sdk: initCetusSDK({ network: 'mainnet', fullNodeUrl: RPC_URL }), adjustForSlippage, Percentage, d };
   if (walletAddress) _cetusSDK.sdk.senderAddress = walletAddress;
   return _cetusSDK;
 }
 
-// ── Turbos CLMM SDK
-// Used for: Turbos pool queries and direct Turbos swaps
-// Docs: github.com/turbos-finance/turbos-clmm-sdk
 let _turbosSDK = null;
 async function sdkTurbos() {
   if (_turbosSDK) return _turbosSDK;
@@ -322,27 +232,13 @@ async function sdkTurbos() {
   return _turbosSDK;
 }
 
-// ── Aftermath SDK
-// Used for: Aftermath pool queries
-// Docs: docs.aftermath.finance
-let _afSDK = null;
-async function sdkAftermath() {
-  if (_afSDK) return _afSDK;
-  const { Aftermath } = await import('aftermath-ts-sdk');
-  const af = new Aftermath('MAINNET');
-  await af.init();
-  _afSDK = af;
-  return _afSDK;
-}
-
 // ─────────────────────────────────────────────
 // 6. FEE & REFERRAL
 // ─────────────────────────────────────────────
 
 function calcFee(amountMist, user) {
-  const feeMist      = (amountMist * BigInt(FEE_BPS)) / 10000n;
-  let referrerMist   = 0n;
-  let devMist        = feeMist;
+  const feeMist    = (amountMist * BigInt(FEE_BPS)) / 10000n;
+  let referrerMist = 0n, devMist = feeMist;
   if (user.referredBy) {
     referrerMist = (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n;
     devMist      = feeMist - referrerMist;
@@ -355,464 +251,193 @@ function findReferrer(user) {
   return Object.values(usersDB).find(u => u.walletAddress === user.referredBy) || null;
 }
 
-// Add fee coin splits to an existing Transaction object.
-// Call this BEFORE adding the main swap/buy instruction when possible.
-function addFeeCoinsToTx(tx, amountMist, user) {
-  const { feeMist, referrerMist, devMist } = calcFee(amountMist, user);
-
-  const [devCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
-  tx.transferObjects([devCoin], tx.pure.address(DEV_WALLET));
-
-  if (referrerMist > 0n && user.referredBy) {
-    const [refCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(referrerMist)]);
-    tx.transferObjects([refCoin], tx.pure.address(user.referredBy));
-    // Track referral earnings
-    const ref = findReferrer(user);
-    if (ref) {
-      ref.referralEarningsTotal = (ref.referralEarningsTotal || 0) + Number(referrerMist) / 1e9;
-      saveUsers();
-    }
-  }
-
-  return { feeMist, tradeMist: amountMist - feeMist };
-}
-
 // ─────────────────────────────────────────────
 // 7. TOKEN STATE DETECTION
 // ─────────────────────────────────────────────
-// Every meme token on Sui is in one of:
-//   'graduated'     — live on DEX (Cetus/Turbos/etc.), use 7K aggregator
-//   'bonding_curve' — still on launchpad contract, use launchpad buy/sell fns
-//   'unknown'       — not found anywhere, report to user
 
-const stateCache = new Map(); // coinType → { state, data, ts }
-const STATE_TTL  = 20_000;   // 20s cache
+const stateCache = new Map();
+const STATE_TTL  = 20_000;
 
 async function detectTokenState(coinType) {
   const cached = stateCache.get(coinType);
   if (cached && Date.now() - cached.ts < STATE_TTL) return cached;
 
-  // 1. Try 7K quote — if it returns any route, token is tradable on a DEX
   try {
     const k = await sdk7k();
-    const q = await k.getQuote({
-      tokenIn: SUI_TYPE,
-      tokenOut: coinType,
-      amountIn: '1000000000', // 1 SUI probe
-    });
+    const q = await k.getQuote({ tokenIn: SUI_TYPE, tokenOut: coinType, amountIn: '1000000000' });
     if (q && q.outAmount && BigInt(q.outAmount) > 0n) {
-      const result = {
-        state: 'graduated',
-        quote: q,
-        dex: q.routes?.[0]?.poolType || 'aggregator',
-        ts: Date.now(),
-      };
-      stateCache.set(coinType, result);
-      return result;
+      const r = { state: 'graduated', quote: q, dex: q.routes?.[0]?.poolType || 'aggregator', ts: Date.now() };
+      stateCache.set(coinType, r); return r;
     }
   } catch {}
 
-  // 2. Check each launchpad API for bonding curve data
   for (const [key, lp] of Object.entries(LAUNCHPAD_REGISTRY)) {
     try {
       let data = null;
-      const encoded = encodeURIComponent(coinType);
-
-      if (key === 'MOVEPUMP') {
-        const r = await fetchTimeout(`${lp.apiBase}/token/${encoded}`, {}, 5000);
-        if (r.ok) data = await r.json();
-      } else if (key === 'TURBOS_FUN') {
-        const r = await fetchTimeout(`${lp.apiBase}/token?coinType=${encoded}`, {}, 5000);
-        if (r.ok) data = await r.json();
-      } else if (key === 'HOP_FUN') {
-        const r = await fetchTimeout(`${lp.apiBase}/tokens/${encoded}`, {}, 5000);
-        if (r.ok) data = await r.json();
-      } else if (key === 'MOONBAGS') {
-        const r = await fetchTimeout(`${lp.apiBase}/token/${encoded}`, {}, 5000);
-        if (r.ok) data = await r.json();
-      } else if (key === 'BLAST_FUN') {
-        const r = await fetchTimeout(`${lp.apiBase}/token/${encoded}`, {}, 5000);
-        if (r.ok) data = await r.json();
-      }
-
+      const enc = encodeURIComponent(coinType);
+      if (key === 'MOVEPUMP')   { const r = await fetchTimeout(`${lp.apiBase}/token/${enc}`, {}, 4000); if (r.ok) data = await r.json(); }
+      else if (key === 'TURBOS_FUN') { const r = await fetchTimeout(`${lp.apiBase}/token?coinType=${enc}`, {}, 4000); if (r.ok) data = await r.json(); }
+      else { const r = await fetchTimeout(`${lp.apiBase}/token/${enc}`, {}, 4000); if (r.ok) data = await r.json(); }
       if (!data) continue;
-
       const graduated = !!(data.graduated || data.is_graduated || data.complete || data.migrated);
-      if (graduated) continue; // graduated but 7K didn't find it yet — race condition, treat as graduated
-
-      // Found active bonding curve
+      if (graduated) continue;
       const result = {
-        state: 'bonding_curve',
-        launchpad: key,
-        launchpadName: lp.name,
-        destinationDex: lp.destinationDex,
+        state: 'bonding_curve', launchpad: key, launchpadName: lp.name, destinationDex: lp.destinationDex,
         bondingCurveId: data.bonding_curve_id || data.curveObjectId || data.pool_id || data.bondingCurveId || null,
-        packageId: data.package_id || data.packageId || packageFromCoinType(coinType),
-        suiRaised: parseFloat(data.sui_raised || data.suiRaised || 0),
-        threshold: lp.graduationSui,
-        currentPrice: parseFloat(data.price || data.current_price || 0),
-        progress: parseFloat(data.progress || data.graduation_progress || 0),
-        buyFn: lp.buyFn,
-        sellFn: lp.sellFn,
-        ts: Date.now(),
+        packageId: data.package_id || packageFromCoinType(coinType),
+        suiRaised: parseFloat(data.sui_raised || 0), threshold: lp.graduationSui,
+        currentPrice: parseFloat(data.price || 0), progress: parseFloat(data.progress || 0),
+        buyFn: lp.buyFn, sellFn: lp.sellFn, ts: Date.now(),
       };
-      stateCache.set(coinType, result);
-      return result;
-    } catch { /* launchpad API down, skip */ }
+      stateCache.set(coinType, result); return result;
+    } catch {}
   }
 
-  // 3. Try Cetus pool list as final check
-  try {
-    const { sdk } = await sdkCetus();
-    const pools = await sdk.Pool.getPools([], undefined, 20);
-    const match = pools.find(p => p.coinTypeA === coinType || p.coinTypeB === coinType);
-    if (match) {
-      const result = { state: 'graduated', dex: 'Cetus', pool: match, ts: Date.now() };
-      stateCache.set(coinType, result);
-      return result;
-    }
-  } catch {}
-
   const result = { state: 'unknown', ts: Date.now() };
-  stateCache.set(coinType, result);
-  return result;
+  stateCache.set(coinType, result); return result;
 }
 
 // ─────────────────────────────────────────────
-// 8. SWAP VIA 7K AGGREGATOR (graduated tokens)
-// Uses @7kprotocol/sdk-ts — real SDK, covers all Sui DEXes
-// Fee: split from gas before swap in same PTB
+// 8. SWAP VIA 7K AGGREGATOR
 // ─────────────────────────────────────────────
 
 async function swapVia7K({ keypair, walletAddress, tokenIn, tokenOut, amountIn, slippagePct, user }) {
   const k = await sdk7k();
+  const { feeMist } = calcFee(amountIn, user);
+  const tradeMist   = amountIn - feeMist;
 
-  // Calculate fee
-  const { feeMist, tradeMist } = addFeeCoinsToTxPrep(amountIn, user);
-
-  // Get best route for the TRADE amount (after fee deducted)
-  const quoteResponse = await k.getQuote({
-    tokenIn,
-    tokenOut,
-    amountIn: tradeMist.toString(),
-  });
-
-  if (!quoteResponse || !quoteResponse.outAmount || BigInt(quoteResponse.outAmount) === 0n) {
+  const quoteResponse = await k.getQuote({ tokenIn, tokenOut, amountIn: tradeMist.toString() });
+  if (!quoteResponse || !quoteResponse.outAmount || BigInt(quoteResponse.outAmount) === 0n)
     throw new Error('No liquidity found across any DEX for this token.');
-  }
 
-  // Build the swap PTB
   const buildResult = await k.buildTx({
-    quoteResponse,
-    accountAddress: walletAddress,
-    slippage: slippagePct / 100, // 7K takes decimal fraction e.g. 0.01 = 1%
-    commission: {
-      partner: DEV_WALLET,
-      commissionBps: 0, // We handle fees manually in the same tx below
-    },
+    quoteResponse, accountAddress: walletAddress, slippage: slippagePct / 100,
+    commission: { partner: DEV_WALLET, commissionBps: 0 },
   });
 
   const tx = buildResult.tx;
-
-  // Inject fee transfers into the SAME transaction
-  // These must go BEFORE the swap inputs are consumed
-  const { feeMist: fm, referrerMist, devMist } = calcFee(amountIn, user);
-
+  const { referrerMist, devMist } = calcFee(amountIn, user);
   const [devCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
   tx.transferObjects([devCoin], tx.pure.address(DEV_WALLET));
-
   if (referrerMist > 0n && user.referredBy) {
     const [refCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(referrerMist)]);
     tx.transferObjects([refCoin], tx.pure.address(user.referredBy));
     const ref = findReferrer(user);
-    if (ref) {
-      ref.referralEarningsTotal = (ref.referralEarningsTotal || 0) + Number(referrerMist) / 1e9;
-      saveUsers();
-    }
+    if (ref) { ref.referralEarningsTotal = (ref.referralEarningsTotal || 0) + Number(referrerMist) / 1e9; saveUsers(); }
   }
-
-  // Transfer output coin to user wallet
-  if (buildResult.coinOut) {
-    tx.transferObjects([buildResult.coinOut], tx.pure.address(walletAddress));
-  }
-
+  if (buildResult.coinOut) tx.transferObjects([buildResult.coinOut], tx.pure.address(walletAddress));
   tx.setGasBudget(50_000_000);
 
-  const result = await suiClient.signAndExecuteTransaction({
-    signer: keypair,
-    transaction: tx,
-    options: { showEffects: true, showEvents: true },
-  });
+  const result = await suiClient.signAndExecuteTransaction({ signer: keypair, transaction: tx, options: { showEffects: true, showEvents: true } });
+  if (result.effects?.status?.status !== 'success') throw new Error(`TX failed: ${result.effects?.status?.error || 'unknown'}`);
 
-  if (result.effects?.status?.status !== 'success') {
-    throw new Error(`Transaction failed: ${result.effects?.status?.error || 'unknown'}`);
-  }
-
-  return {
-    digest: result.digest,
-    estimatedOut: quoteResponse.outAmount,
-    feeMist: fm,
-    route: quoteResponse.routes?.[0]?.poolType || 'aggregator',
-  };
-}
-
-// Helper: calculate fee split amounts without modifying tx yet
-function addFeeCoinsToTxPrep(amountMist, user) {
-  const { feeMist } = calcFee(amountMist, user);
-  return { feeMist, tradeMist: amountMist - feeMist };
+  return { digest: result.digest, estimatedOut: quoteResponse.outAmount, feeMist, route: quoteResponse.routes?.[0]?.poolType || 'aggregator' };
 }
 
 // ─────────────────────────────────────────────
-// 9. CETUS DIRECT SWAP (fallback for Cetus-only pools)
-// Uses @cetusprotocol/cetus-sui-clmm-sdk correctly:
-//   preswap → adjustForSlippage → createSwapTransactionPayload
+// 9. CETUS DIRECT SWAP
 // ─────────────────────────────────────────────
 
 async function swapViaCetus({ keypair, walletAddress, poolId, a2b, amountMist, slippagePct, user }) {
   const { sdk, adjustForSlippage, Percentage, d } = await sdkCetus(walletAddress);
-
   const pool = await sdk.Pool.getPool(poolId);
-  const [metaA, metaB] = await Promise.all([
-    getCoinMeta(pool.coinTypeA),
-    getCoinMeta(pool.coinTypeB),
-  ]);
-
-  const amount   = new BN(amountMist.toString());
-  const slippage = Percentage.fromDecimal(d(slippagePct));
-
-  // Step 1: preswap — calculates estimated output
+  const [metaA, metaB] = await Promise.all([getCoinMeta(pool.coinTypeA), getCoinMeta(pool.coinTypeB)]);
   const preswap = await sdk.Swap.preswap({
-    pool,
-    current_sqrt_price: pool.current_sqrt_price,
-    coinTypeA: pool.coinTypeA,
-    coinTypeB: pool.coinTypeB,
-    decimalsA: metaA?.decimals || 9,
-    decimalsB: metaB?.decimals || 9,
-    a2b,
-    by_amount_in: true,
-    amount,
+    pool, current_sqrt_price: pool.current_sqrt_price,
+    coinTypeA: pool.coinTypeA, coinTypeB: pool.coinTypeB,
+    decimalsA: metaA?.decimals || 9, decimalsB: metaB?.decimals || 9,
+    a2b, by_amount_in: true, amount: new BN(amountMist.toString()),
   });
-
-  // Step 2: calculate slippage-adjusted limit
-  const toAmount    = preswap.estimatedAmountOut;
-  const amountLimit = adjustForSlippage(toAmount, slippage, false);
-
-  // Step 3: build swap transaction
+  const amountLimit = adjustForSlippage(preswap.estimatedAmountOut, Percentage.fromDecimal(d(slippagePct)), false);
   const swapTx = await sdk.Swap.createSwapTransactionPayload({
-    pool_id: pool.poolAddress,
-    coinTypeA: pool.coinTypeA,
-    coinTypeB: pool.coinTypeB,
-    a2b,
-    by_amount_in: true,
-    amount: preswap.amount.toString(),
-    amount_limit: amountLimit.toString(),
+    pool_id: pool.poolAddress, coinTypeA: pool.coinTypeA, coinTypeB: pool.coinTypeB,
+    a2b, by_amount_in: true, amount: preswap.amount.toString(), amount_limit: amountLimit.toString(),
   });
-
-  // Inject fee
   const { feeMist, devMist, referrerMist } = calcFee(amountMist, user);
   const [devCoin] = swapTx.splitCoins(swapTx.gas, [swapTx.pure.u64(devMist)]);
   swapTx.transferObjects([devCoin], swapTx.pure.address(DEV_WALLET));
   if (referrerMist > 0n && user.referredBy) {
-    const [refCoin] = swapTx.splitCoins(swapTx.gas, [swapTx.pure.u64(referrerMist)]);
-    swapTx.transferObjects([refCoin], swapTx.pure.address(user.referredBy));
+    const [rc] = swapTx.splitCoins(swapTx.gas, [swapTx.pure.u64(referrerMist)]);
+    swapTx.transferObjects([rc], swapTx.pure.address(user.referredBy));
   }
-
   swapTx.setGasBudget(50_000_000);
-
-  const result = await suiClient.signAndExecuteTransaction({
-    signer: keypair,
-    transaction: swapTx,
-    options: { showEffects: true },
-  });
-
-  if (result.effects?.status?.status !== 'success') {
-    throw new Error(`Cetus swap failed: ${result.effects?.status?.error}`);
-  }
-
+  const result = await suiClient.signAndExecuteTransaction({ signer: keypair, transaction: swapTx, options: { showEffects: true } });
+  if (result.effects?.status?.status !== 'success') throw new Error(`Cetus swap failed: ${result.effects?.status?.error}`);
   return { digest: result.digest, estimatedOut: preswap.estimatedAmountOut, feeMist };
 }
 
 // ─────────────────────────────────────────────
-// 10. TURBOS DIRECT SWAP (fallback for Turbos-only pools)
-// Uses turbos-clmm-sdk correctly:
-//   computeSwapResultV2 → trade.swap
+// 10. TURBOS DIRECT SWAP
 // ─────────────────────────────────────────────
 
 async function swapViaTurbos({ keypair, walletAddress, poolId, coinTypeA, coinTypeB, a2b, amountStr, slippagePct, user }) {
   const tSdk = await sdkTurbos();
-
-  // Step 1: compute swap result
-  const [swapResult] = await tSdk.trade.computeSwapResultV2({
-    pools: [{ pool: poolId, a2b, amountSpecified: amountStr }],
-    address: walletAddress,
-  });
-
-  if (!swapResult) throw new Error('Turbos: no swap result returned');
-
-  const nextTickIndex = tSdk.math.bitsToNumber(swapResult.tick_current_index.bits, 64);
-
-  // Step 2: build swap tx
+  const [swapResult] = await tSdk.trade.computeSwapResultV2({ pools: [{ pool: poolId, a2b, amountSpecified: amountStr }], address: walletAddress });
+  if (!swapResult) throw new Error('Turbos: no swap result');
   const tx = await tSdk.trade.swap({
-    routes: [{ pool: swapResult.pool, a2b: swapResult.a_to_b, nextTickIndex }],
-    coinTypeA,
-    coinTypeB,
-    address: walletAddress,
-    amountA: swapResult.amount_a,
-    amountB: swapResult.amount_b,
-    amountSpecifiedIsInput: swapResult.is_exact_in,
-    slippage: String(slippagePct),
-    deadline: 60000,
+    routes: [{ pool: swapResult.pool, a2b: swapResult.a_to_b, nextTickIndex: tSdk.math.bitsToNumber(swapResult.tick_current_index.bits, 64) }],
+    coinTypeA, coinTypeB, address: walletAddress,
+    amountA: swapResult.amount_a, amountB: swapResult.amount_b,
+    amountSpecifiedIsInput: swapResult.is_exact_in, slippage: String(slippagePct), deadline: 60000,
   });
-
-  // Inject fee
   const amountMist = BigInt(amountStr);
   const { feeMist, devMist, referrerMist } = calcFee(amountMist, user);
   const [devCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
   tx.transferObjects([devCoin], tx.pure.address(DEV_WALLET));
   if (referrerMist > 0n && user.referredBy) {
-    const [refCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(referrerMist)]);
-    tx.transferObjects([refCoin], tx.pure.address(user.referredBy));
+    const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(referrerMist)]);
+    tx.transferObjects([rc], tx.pure.address(user.referredBy));
   }
-
   tx.setGasBudget(50_000_000);
-
-  const result = await suiClient.signAndExecuteTransaction({
-    signer: keypair,
-    transaction: tx,
-    options: { showEffects: true },
-  });
-
-  if (result.effects?.status?.status !== 'success') {
-    throw new Error(`Turbos swap failed: ${result.effects?.status?.error}`);
-  }
-
-  return {
-    digest: result.digest,
-    estimatedOut: a2b ? swapResult.amount_b : swapResult.amount_a,
-    feeMist,
-  };
+  const result = await suiClient.signAndExecuteTransaction({ signer: keypair, transaction: tx, options: { showEffects: true } });
+  if (result.effects?.status?.status !== 'success') throw new Error(`Turbos swap failed: ${result.effects?.status?.error}`);
+  return { digest: result.digest, estimatedOut: a2b ? swapResult.amount_b : swapResult.amount_a, feeMist };
 }
 
 // ─────────────────────────────────────────────
 // 11. BONDING CURVE BUY / SELL
-// Calls launchpad Move contract directly.
-// Package is embedded in the coinType: 0xPKG::module::SYMBOL
-// Function signature (reverse-engineered from on-chain patterns):
-//   buy<CoinType>(bonding_curve: &mut BondingCurve, payment: Coin<SUI>, clock: &Clock, ctx: &mut TxContext)
-//   sell<CoinType>(bonding_curve: &mut BondingCurve, token: Coin<CoinType>, clock: &Clock, ctx: &mut TxContext)
 // ─────────────────────────────────────────────
 
 async function bondingCurveBuy({ keypair, walletAddress, coinType, suiAmountMist, bondingCurveId, buyFn, user }) {
-  const pkgId  = packageFromCoinType(coinType);
-  const modName = moduleFromCoinType(coinType);
-
+  const pkgId = packageFromCoinType(coinType), modName = moduleFromCoinType(coinType);
   const tx = new Transaction();
   tx.setGasBudget(30_000_000);
-
-  // Fee split first
   const { feeMist, devMist, referrerMist } = calcFee(suiAmountMist, user);
   const tradeMist = suiAmountMist - feeMist;
-
   const [devCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
   tx.transferObjects([devCoin], tx.pure.address(DEV_WALLET));
-
   if (referrerMist > 0n && user.referredBy) {
-    const [refCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(referrerMist)]);
-    tx.transferObjects([refCoin], tx.pure.address(user.referredBy));
+    const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(referrerMist)]);
+    tx.transferObjects([rc], tx.pure.address(user.referredBy));
     const ref = findReferrer(user);
-    if (ref) {
-      ref.referralEarningsTotal = (ref.referralEarningsTotal || 0) + Number(referrerMist) / 1e9;
-      saveUsers();
-    }
+    if (ref) { ref.referralEarningsTotal = (ref.referralEarningsTotal || 0) + Number(referrerMist) / 1e9; saveUsers(); }
   }
-
-  // Split trade amount from gas
   const [tradeCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(tradeMist)]);
-
-  // Call launchpad buy function
-  // Note: exact argument order may vary per launchpad — this follows MovePump/hop.fun pattern
-  tx.moveCall({
-    target: `${pkgId}::${modName}::${buyFn}`,
-    typeArguments: [coinType],
-    arguments: [
-      tx.object(bondingCurveId), // bonding curve shared object
-      tradeCoin,                  // SUI payment
-      tx.object('0x6'),           // Clock (always 0x6 on Sui)
-    ],
-  });
-
-  const result = await suiClient.signAndExecuteTransaction({
-    signer: keypair,
-    transaction: tx,
-    options: { showEffects: true, showEvents: true },
-  });
-
-  if (result.effects?.status?.status !== 'success') {
-    throw new Error(`Bonding curve buy failed: ${result.effects?.status?.error}`);
-  }
-
+  tx.moveCall({ target: `${pkgId}::${modName}::${buyFn}`, typeArguments: [coinType], arguments: [tx.object(bondingCurveId), tradeCoin, tx.object('0x6')] });
+  const result = await suiClient.signAndExecuteTransaction({ signer: keypair, transaction: tx, options: { showEffects: true, showEvents: true } });
+  if (result.effects?.status?.status !== 'success') throw new Error(`Bonding curve buy failed: ${result.effects?.status?.error}`);
   return { digest: result.digest, feeMist };
 }
 
 async function bondingCurveSell({ keypair, walletAddress, coinType, tokenCoins, sellAmountRaw, bondingCurveId, sellFn, user }) {
-  const pkgId   = packageFromCoinType(coinType);
-  const modName = moduleFromCoinType(coinType);
-
+  const pkgId = packageFromCoinType(coinType), modName = moduleFromCoinType(coinType);
   const tx = new Transaction();
   tx.setGasBudget(30_000_000);
-
-  // Merge token coins if multiple
-  let tokenObj;
-  if (tokenCoins.length === 1) {
-    tokenObj = tx.object(tokenCoins[0].coinObjectId);
-  } else {
-    tokenObj = tx.object(tokenCoins[0].coinObjectId);
-    tx.mergeCoins(tokenObj, tokenCoins.slice(1).map(c => tx.object(c.coinObjectId)));
-  }
-
-  // Split exact sell amount
+  let tokenObj = tx.object(tokenCoins[0].coinObjectId);
+  if (tokenCoins.length > 1) tx.mergeCoins(tokenObj, tokenCoins.slice(1).map(c => tx.object(c.coinObjectId)));
   const [sellCoin] = tx.splitCoins(tokenObj, [tx.pure.u64(sellAmountRaw)]);
-
-  // Call launchpad sell — returns SUI
-  // The returned SUI coin is handled by the contract (transferred back or returned)
-  tx.moveCall({
-    target: `${pkgId}::${modName}::${sellFn}`,
-    typeArguments: [coinType],
-    arguments: [
-      tx.object(bondingCurveId),
-      sellCoin,
-      tx.object('0x6'),
-    ],
-  });
-
-  // Fee on sell: approximate based on current curve price
-  // SUI returned goes to user wallet automatically via Move contract transfer
-  // We take our fee separately in a follow-up instruction is not possible without knowing exact amount
-  // Best practice: take fee from remaining token balance or accept fee is taken from SUI received
-  // For now we split a small SUI amount from gas as fee proxy (imperfect but atomic)
-  const estSuiOut = BigInt(0); // unknown at tx build time on bonding curve
-  // Fee will be approximated as 1% of trade SUI value — skip for bonding curve sells
-  // since the exact SUI return is unknown until execution
-
-  const result = await suiClient.signAndExecuteTransaction({
-    signer: keypair,
-    transaction: tx,
-    options: { showEffects: true, showEvents: true },
-  });
-
-  if (result.effects?.status?.status !== 'success') {
-    throw new Error(`Bonding curve sell failed: ${result.effects?.status?.error}`);
-  }
-
+  tx.moveCall({ target: `${pkgId}::${modName}::${sellFn}`, typeArguments: [coinType], arguments: [tx.object(bondingCurveId), sellCoin, tx.object('0x6')] });
+  const result = await suiClient.signAndExecuteTransaction({ signer: keypair, transaction: tx, options: { showEffects: true, showEvents: true } });
+  if (result.effects?.status?.status !== 'success') throw new Error(`Bonding curve sell failed: ${result.effects?.status?.error}`);
   return { digest: result.digest };
 }
 
 // ─────────────────────────────────────────────
-// 12. UNIFIED BUY / SELL (routes to correct engine)
+// 12. UNIFIED BUY / SELL
 // ─────────────────────────────────────────────
 
 async function executeBuy(chatId, coinType, amountSui) {
-  const user       = getUser(chatId);
+  const user = getUser(chatId);
   if (!user) throw new Error('User not found');
   const keypair    = getKeypair(user);
   const amountMist = mistFromSui(amountSui);
@@ -821,282 +446,215 @@ async function executeBuy(chatId, coinType, amountSui) {
   const symbol     = meta.symbol || truncAddr(coinType);
 
   if (state.state === 'graduated' || state.state === 'unknown') {
-    // Use 7K aggregator for best price across all DEXes
-    const res = await swapVia7K({
-      keypair,
-      walletAddress: user.walletAddress,
-      tokenIn: SUI_TYPE,
-      tokenOut: coinType,
-      amountIn: amountMist,
-      slippagePct: user.settings.slippage,
-      user,
-    });
-
-    const estTokens = Number(res.estimatedOut) / Math.pow(10, meta.decimals || 9);
+    const res = await swapVia7K({ keypair, walletAddress: user.walletAddress, tokenIn: SUI_TYPE, tokenOut: coinType, amountIn: amountMist, slippagePct: user.settings.slippage, user });
+    const estTokens  = Number(res.estimatedOut) / Math.pow(10, meta.decimals || 9);
     const entryPrice = Number(amountMist - res.feeMist) / 1e9 / (estTokens || 1);
-
-    addPosition(chatId, {
-      coinType, symbol,
-      entryPriceSui: entryPrice,
-      amountTokens: estTokens,
-      spentSui: amountSui,
-      source: 'dex',
-      tp: user.settings.tpDefault || null,
-      sl: user.settings.slDefault || null,
-    });
-
-    return {
-      digest: res.digest,
-      feeSui: suiFloat(res.feeMist),
-      route: res.route,
-      estOut: estTokens.toFixed(4),
-      symbol,
-      state: 'graduated',
-    };
+    addPosition(chatId, { coinType, symbol, entryPriceSui: entryPrice, amountTokens: estTokens, spentSui: amountSui, source: 'dex', tp: user.settings.tpDefault, sl: user.settings.slDefault });
+    return { digest: res.digest, feeSui: suiFloat(res.feeMist), route: res.route, estOut: estTokens.toFixed(4), symbol, state: 'graduated' };
   }
 
   if (state.state === 'bonding_curve') {
-    if (!state.bondingCurveId) {
-      throw new Error(
-        `Token found on ${state.launchpadName} but bonding curve object ID not available. ` +
-        `Visit ${state.launchpadName} directly to trade.`
-      );
-    }
-
-    const res = await bondingCurveBuy({
-      keypair,
-      walletAddress: user.walletAddress,
-      coinType,
-      suiAmountMist: amountMist,
-      bondingCurveId: state.bondingCurveId,
-      buyFn: state.buyFn || 'buy',
-      user,
-    });
-
-    addPosition(chatId, {
-      coinType, symbol,
-      entryPriceSui: state.currentPrice || 0,
-      amountTokens: 0, // unknown until tx parses events
-      spentSui: amountSui,
-      source: 'bonding_curve',
-      launchpad: state.launchpadName,
-      tp: null, sl: null,
-    });
-
-    return {
-      digest: res.digest,
-      feeSui: suiFloat(res.feeMist),
-      route: state.launchpadName,
-      estOut: '?',
-      symbol,
-      state: 'bonding_curve',
-      launchpadName: state.launchpadName,
-      progress: state.progress,
-      destinationDex: state.destinationDex,
-    };
+    if (!state.bondingCurveId) throw new Error(`Found on ${state.launchpadName} but curve ID unavailable. Trade directly on the launchpad.`);
+    const res = await bondingCurveBuy({ keypair, walletAddress: user.walletAddress, coinType, suiAmountMist: amountMist, bondingCurveId: state.bondingCurveId, buyFn: state.buyFn || 'buy', user });
+    addPosition(chatId, { coinType, symbol, entryPriceSui: state.currentPrice || 0, amountTokens: 0, spentSui: amountSui, source: 'bonding_curve', launchpad: state.launchpadName, tp: null, sl: null });
+    return { digest: res.digest, feeSui: suiFloat(res.feeMist), route: state.launchpadName, estOut: '?', symbol, state: 'bonding_curve', launchpadName: state.launchpadName };
   }
 
   throw new Error('Token not found on any DEX or launchpad. It may have no liquidity yet.');
 }
 
 async function executeSell(chatId, coinType, pct) {
-  const user    = getUser(chatId);
+  const user = getUser(chatId);
   if (!user) throw new Error('User not found');
   const keypair = getKeypair(user);
   const meta    = await getCoinMeta(coinType) || {};
   const symbol  = meta.symbol || truncAddr(coinType);
-
-  const coins = await getOwnedCoins(user.walletAddress, coinType);
+  const coins   = await getOwnedCoins(user.walletAddress, coinType);
   if (!coins.length) throw new Error('No balance of this token in your wallet.');
-
   const totalBal   = coins.reduce((s, c) => s + BigInt(c.balance), 0n);
   const sellAmount = (totalBal * BigInt(Math.floor(pct))) / 100n;
   if (sellAmount === 0n) throw new Error('Sell amount is zero.');
-
   const state = await detectTokenState(coinType);
 
   if (state.state === 'graduated' || state.state === 'unknown') {
-    // Sell via 7K — token for SUI
-    const res = await swapVia7K({
-      keypair,
-      walletAddress: user.walletAddress,
-      tokenIn: coinType,
-      tokenOut: SUI_TYPE,
-      amountIn: sellAmount,
-      slippagePct: user.settings.slippage,
-      user,
-    });
-
-    if (pct === 100) {
-      updateUser(chatId, { positions: user.positions.filter(p => p.coinType !== coinType) });
-    }
-
+    const res = await swapVia7K({ keypair, walletAddress: user.walletAddress, tokenIn: coinType, tokenOut: SUI_TYPE, amountIn: sellAmount, slippagePct: user.settings.slippage, user });
+    if (pct === 100) updateUser(chatId, { positions: user.positions.filter(p => p.coinType !== coinType) });
     const suiOut = Number(res.estimatedOut) / 1e9;
     const { feeMist } = calcFee(BigInt(res.estimatedOut), user);
-
-    return {
-      digest: res.digest,
-      feeSui: suiFloat(feeMist),
-      route: res.route,
-      estSui: suiOut.toFixed(4),
-      symbol,
-      pct,
-    };
+    return { digest: res.digest, feeSui: suiFloat(feeMist), route: res.route, estSui: suiOut.toFixed(4), symbol, pct };
   }
 
   if (state.state === 'bonding_curve') {
-    if (!state.bondingCurveId) {
-      throw new Error(`Bonding curve object ID not available for ${state.launchpadName}.`);
-    }
-
-    const res = await bondingCurveSell({
-      keypair,
-      walletAddress: user.walletAddress,
-      coinType,
-      tokenCoins: coins,
-      sellAmountRaw: sellAmount,
-      bondingCurveId: state.bondingCurveId,
-      sellFn: state.sellFn || 'sell',
-      user,
-    });
-
-    if (pct === 100) {
-      updateUser(chatId, { positions: user.positions.filter(p => p.coinType !== coinType) });
-    }
-
-    return {
-      digest: res.digest,
-      feeSui: 'N/A',
-      route: state.launchpadName,
-      estSui: '?',
-      symbol,
-      pct,
-    };
+    if (!state.bondingCurveId) throw new Error(`Bonding curve ID unavailable for ${state.launchpadName}.`);
+    const res = await bondingCurveSell({ keypair, walletAddress: user.walletAddress, coinType, tokenCoins: coins, sellAmountRaw: sellAmount, bondingCurveId: state.bondingCurveId, sellFn: state.sellFn || 'sell', user });
+    if (pct === 100) updateUser(chatId, { positions: user.positions.filter(p => p.coinType !== coinType) });
+    return { digest: res.digest, feeSui: 'N/A', route: state.launchpadName, estSui: '?', symbol, pct };
   }
 
   throw new Error('Cannot sell — token not found on any DEX or launchpad.');
 }
 
 // ─────────────────────────────────────────────
-// 13. POOL DISCOVERY (for display in /scan)
-// Uses real SDK calls, not fabricated APIs
+// 13. POOL DISCOVERY — GeckoTerminal (FIXED)
 // ─────────────────────────────────────────────
 
-async function getPoolsForToken(coinType) {
+async function getPoolsFromGecko(coinType) {
   const pools = [];
-
-  // Cetus pools via SDK
   try {
-    const { sdk } = await sdkCetus();
-    // getPools returns paginated list — filter client-side for token
-    const cetusRes = await sdk.Pool.getPools([], undefined, 50);
-    for (const p of cetusRes) {
-      if (p.coinTypeA !== coinType && p.coinTypeB !== coinType) continue;
-      const suiIdx = p.coinTypeA === SUI_TYPE ? 'A' : (p.coinTypeB === SUI_TYPE ? 'B' : null);
-      const suiLiq = suiIdx === 'A'
-        ? Number(p.coinAmountA || 0) / 1e9
-        : suiIdx === 'B'
-          ? Number(p.coinAmountB || 0) / 1e9
-          : 0;
-      pools.push({ dex: 'Cetus', poolId: p.poolAddress, coinTypeA: p.coinTypeA, coinTypeB: p.coinTypeB, liquidity: suiLiq, fee: Number(p.fee_rate || 0) / 1e6 });
+    // GeckoTerminal expects the address without the module::SYMBOL suffix for known tokens
+    // but for Sui, the full coinType is the identifier
+    const addr = encodeURIComponent(coinType);
+    const r = await fetchTimeout(`${GECKO_BASE}/networks/${GECKO_NET}/tokens/${addr}/pools?page=1`, { headers: { 'Accept': 'application/json;version=20230302' } }, 8000);
+    if (!r.ok) return pools;
+    const data = await r.json();
+    for (const p of (data.data || []).slice(0, 5)) {
+      const attr = p.attributes || {};
+      const suiLiq = parseFloat(attr.reserve_in_usd || 0) / 3; // rough SUI estimate
+      pools.push({
+        dex: attr.dex_id || p.relationships?.dex?.data?.id || 'DEX',
+        poolId: attr.address || p.id,
+        coinTypeA: coinType, coinTypeB: SUI_TYPE,
+        liquidity: parseFloat(attr.reserve_in_usd || 0),
+        liquidityUsd: parseFloat(attr.reserve_in_usd || 0),
+        price: parseFloat(attr.base_token_price_usd || 0),
+        priceNative: parseFloat(attr.base_token_price_native_currency || 0),
+        volume24h: parseFloat(attr.volume_usd?.h24 || 0),
+        priceChange24h: parseFloat(attr.price_change_percentage?.h24 || 0),
+        fdv: parseFloat(attr.fdv_usd || 0),
+        marketCap: parseFloat(attr.market_cap_usd || 0),
+        fee: 0.003,
+      });
     }
   } catch {}
+  return pools;
+}
 
-  // Turbos pools via SDK
+async function getTokenInfoFromGecko(coinType) {
   try {
-    const tSdk = await sdkTurbos();
-    // Turbos SDK may have pool search — check by querying known methods
-    if (tSdk.pool && typeof tSdk.pool.getPools === 'function') {
-      const tp = await tSdk.pool.getPools();
-      for (const p of (tp || [])) {
-        if (p.coin_a !== coinType && p.coin_b !== coinType) continue;
-        const suiLiq = p.coin_a === SUI_TYPE
-          ? Number(p.liquidity_a || 0) / 1e9
-          : Number(p.liquidity_b || 0) / 1e9;
-        pools.push({ dex: 'Turbos', poolId: p.id, coinTypeA: p.coin_a, coinTypeB: p.coin_b, liquidity: suiLiq, fee: 0.003 });
-      }
-    }
-  } catch {}
+    const addr = encodeURIComponent(coinType);
+    const r = await fetchTimeout(`${GECKO_BASE}/networks/${GECKO_NET}/tokens/${addr}`, { headers: { 'Accept': 'application/json;version=20230302' } }, 8000);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const attr = data.data?.attributes || {};
+    return {
+      name: attr.name || null,
+      symbol: attr.symbol || null,
+      decimals: attr.decimals || 9,
+      totalSupply: parseFloat(attr.total_supply || 0),
+      priceUsd: parseFloat(attr.price_usd || 0),
+      fdvUsd: parseFloat(attr.fdv_usd || 0),
+      marketCapUsd: parseFloat(attr.market_cap_usd || 0),
+      volume24h: parseFloat(attr.volume_usd?.h24 || 0),
+      priceChange24h: parseFloat(attr.price_change_percentage?.h24 || 0),
+      coingeckoId: attr.coingecko_coin_id || null,
+    };
+  } catch { return null; }
+}
 
-  // 7K quote as proxy for "is there any DEX liquidity?"
-  if (!pools.length) {
-    try {
-      const k = await sdk7k();
-      const q = await k.getQuote({ tokenIn: SUI_TYPE, tokenOut: coinType, amountIn: '1000000000' });
-      if (q && BigInt(q.outAmount || 0) > 0n) {
-        pools.push({ dex: q.routes?.[0]?.poolType || 'Aggregator', poolId: 'aggregator', coinTypeA: SUI_TYPE, coinTypeB: coinType, liquidity: -1, fee: 0 });
-      }
-    } catch {}
-  }
-
-  return pools.sort((a, b) => b.liquidity - a.liquidity);
+async function getHoldersFromSuiscan(coinType) {
+  try {
+    const r = await fetchTimeout(
+      `https://suiscan.xyz/api/sui/mainnet/coin/${encodeURIComponent(coinType)}/holders?limit=20`,
+      { headers: { 'Accept': 'application/json' } }, 8000
+    );
+    if (!r.ok) return { total: 0, topHolders: [] };
+    const d = await r.json();
+    return {
+      total: d.total || 0,
+      topHolders: (d.data || []).slice(0, 10).map(h => ({ address: h.address, pct: parseFloat(h.percentage || 0) })),
+    };
+  } catch { return { total: 0, topHolders: [] }; }
 }
 
 // ─────────────────────────────────────────────
-// 14. TOKEN SCANNER
+// 14. TOKEN SCANNER — FIXED WITH REAL APIs
 // ─────────────────────────────────────────────
 
 async function scanToken(coinType) {
   const scan = {
     coinType, name: '?', symbol: '?', decimals: 9, totalSupply: 0,
+    priceUsd: 0, priceNative: 0, fdvUsd: 0, marketCapUsd: 0,
+    volume24h: 0, priceChange24h: 0,
     holders: 0, topHolders: [],
-    pools: [], totalLiquiditySui: 0,
-    honeypotPass: null,
-    riskScore: 'UNKNOWN',
+    pools: [], totalLiquidityUsd: 0,
+    honeypotPass: null, riskScore: 'UNKNOWN',
     bondingCurveState: null,
   };
 
-  // Metadata
-  try {
-    const m = await getCoinMeta(coinType);
-    if (m) { scan.name = m.name; scan.symbol = m.symbol; scan.decimals = m.decimals; }
-  } catch {}
-
-  // Supply
-  try {
-    const s = await suiClient.getTotalSupply({ coinType });
-    scan.totalSupply = Number(s.value) / Math.pow(10, scan.decimals);
-  } catch {}
-
-  // State detection
-  const state = await detectTokenState(coinType);
-  if (state.state === 'bonding_curve') {
-    scan.bondingCurveState = {
-      launchpad: state.launchpadName,
-      suiRaised: state.suiRaised,
-      threshold: state.threshold,
-      progress: state.progress,
-      destinationDex: state.destinationDex,
-    };
+  // 1. GeckoTerminal token info (best source for price/supply)
+  const geckoInfo = await getTokenInfoFromGecko(coinType);
+  if (geckoInfo) {
+    if (geckoInfo.name)         scan.name         = geckoInfo.name;
+    if (geckoInfo.symbol)       scan.symbol       = geckoInfo.symbol;
+    if (geckoInfo.decimals)     scan.decimals     = geckoInfo.decimals;
+    if (geckoInfo.totalSupply)  scan.totalSupply  = geckoInfo.totalSupply;
+    scan.priceUsd       = geckoInfo.priceUsd;
+    scan.fdvUsd         = geckoInfo.fdvUsd;
+    scan.marketCapUsd   = geckoInfo.marketCapUsd;
+    scan.volume24h      = geckoInfo.volume24h;
+    scan.priceChange24h = geckoInfo.priceChange24h;
   }
 
-  // Pools
+  // 2. Sui on-chain metadata (fills gaps)
   try {
-    scan.pools = await getPoolsForToken(coinType);
-    scan.totalLiquiditySui = scan.pools.filter(p => p.liquidity > 0).reduce((s, p) => s + p.liquidity, 0);
-  } catch {}
-
-  // Holders via SuiScan API
-  try {
-    const r = await fetchTimeout(`https://suiscan.xyz/api/sui/mainnet/coin/${encodeURIComponent(coinType)}/holders?limit=20`, {}, 8000);
-    if (r.ok) {
-      const d = await r.json();
-      scan.holders    = d.total || 0;
-      scan.topHolders = (d.data || []).slice(0, 10).map(h => ({ address: h.address, pct: parseFloat(h.percentage || 0) }));
+    const m = await getCoinMeta(coinType);
+    if (m) {
+      if (scan.name === '?')    scan.name    = m.name    || '?';
+      if (scan.symbol === '?')  scan.symbol  = m.symbol  || '?';
+      scan.decimals = m.decimals || scan.decimals;
     }
   } catch {}
 
-  // Honeypot test — try to get sell quote via 7K
+  // 3. On-chain supply
+  if (!scan.totalSupply) {
+    try {
+      const s = await suiClient.getTotalSupply({ coinType });
+      scan.totalSupply = Number(s.value) / Math.pow(10, scan.decimals);
+    } catch {}
+  }
+
+  // 4. Token state (bonding curve check)
+  const state = await detectTokenState(coinType);
+  if (state.state === 'bonding_curve') {
+    scan.bondingCurveState = {
+      launchpad: state.launchpadName, suiRaised: state.suiRaised,
+      threshold: state.threshold, progress: state.progress, destinationDex: state.destinationDex,
+    };
+  }
+
+  // 5. GeckoTerminal pools (real liquidity data)
+  scan.pools = await getPoolsFromGecko(coinType);
+  scan.totalLiquidityUsd = scan.pools.reduce((s, p) => s + (p.liquidityUsd || 0), 0);
+  if (scan.pools.length && !scan.priceNative) scan.priceNative = scan.pools[0].priceNative;
+  if (scan.pools.length && !scan.priceUsd)    scan.priceUsd    = scan.pools[0].price;
+
+  // 6. 7K quote as fallback pool check
+  if (!scan.pools.length && state.state !== 'bonding_curve') {
+    try {
+      const k = await sdk7k();
+      const q = await k.getQuote({ tokenIn: SUI_TYPE, tokenOut: coinType, amountIn: '1000000000' });
+      if (q && BigInt(q.outAmount || 0) > 0n) {
+        scan.pools.push({ dex: q.routes?.[0]?.poolType || 'Aggregator', poolId: 'agg', liquidityUsd: 0, volume24h: 0, priceChange24h: 0 });
+      }
+    } catch {}
+  }
+
+  // 7. Holders from Suiscan
+  const holderData = await getHoldersFromSuiscan(coinType);
+  scan.holders    = holderData.total;
+  scan.topHolders = holderData.topHolders;
+
+  // 8. Honeypot check — sell quote
   try {
     const k = await sdk7k();
     const q = await k.getQuote({ tokenIn: coinType, tokenOut: SUI_TYPE, amountIn: '1000000' });
     scan.honeypotPass = !!(q && BigInt(q.outAmount || 0) > 0n);
   } catch { scan.honeypotPass = null; }
 
-  // Risk scoring
+  // 9. Risk scoring
   const top3pct = scan.topHolders.slice(0, 3).reduce((s, h) => s + h.pct, 0);
-  const noLiq   = scan.totalLiquiditySui < 0.5 && !scan.bondingCurveState;
-  const lowLiq  = scan.totalLiquiditySui < 5;
+  const noLiq   = scan.totalLiquidityUsd < 500 && !scan.bondingCurveState && !scan.pools.length;
+  const lowLiq  = scan.totalLiquidityUsd < 5000;
   const conc    = top3pct > 50;
 
   if (scan.honeypotPass === false || noLiq)  scan.riskScore = 'LIKELY RUG';
@@ -1108,13 +666,25 @@ async function scanToken(coinType) {
 }
 
 function formatScanReport(scan) {
-  const icons = { 'SAFE': '🟢', 'CAUTION': '🟡', 'HIGH RISK': '🔴', 'LIKELY RUG': '💀', 'UNKNOWN': '⚪' };
-  const top3  = scan.topHolders.slice(0, 3).reduce((s, h) => s + h.pct, 0);
-  const lines = [`🔍 *Token Scan: ${scan.symbol}*\n`];
+  const icons   = { 'SAFE': '🟢', 'CAUTION': '🟡', 'HIGH RISK': '🔴', 'LIKELY RUG': '💀', 'UNKNOWN': '⚪' };
+  const top3pct = scan.topHolders.slice(0, 3).reduce((s, h) => s + h.pct, 0);
+  const chg     = scan.priceChange24h;
+  const chgStr  = chg !== 0 ? ` (${chg >= 0 ? '📈 +' : '📉 '}${chg.toFixed(2)}% 24h)` : '';
+  const lines   = [`🔍 *Token Scan*\n`];
 
-  lines.push(`📛 Name: ${scan.name}  🔖 ${scan.symbol}`);
-  lines.push(`💰 Supply: ${scan.totalSupply.toLocaleString()}`);
-  lines.push(`👥 Holders: ${scan.holders.toLocaleString()}${top3 > 50 ? ` ⚠️ Top 3 own ${top3.toFixed(1)}%` : ''}`);
+  lines.push(`📛 *${scan.name}* (${scan.symbol})`);
+  lines.push(`📋 \`${truncAddr(scan.coinType)}\``);
+
+  if (scan.priceUsd > 0) {
+    lines.push(`\n💵 Price: $${scan.priceUsd < 0.0001 ? scan.priceUsd.toExponential(3) : scan.priceUsd.toFixed(6)}${chgStr}`);
+  }
+  if (scan.priceNative > 0) lines.push(`🔵 Price SUI: ${scan.priceNative.toFixed(8)}`);
+  if (scan.marketCapUsd > 0) lines.push(`🏦 MCap: $${(scan.marketCapUsd / 1000).toFixed(1)}K`);
+  if (scan.fdvUsd > 0)       lines.push(`📊 FDV: $${(scan.fdvUsd / 1000).toFixed(1)}K`);
+  if (scan.volume24h > 0)    lines.push(`💹 Vol 24h: $${(scan.volume24h / 1000).toFixed(1)}K`);
+  if (scan.totalSupply > 0)  lines.push(`🏭 Supply: ${scan.totalSupply.toLocaleString()}`);
+
+  lines.push(`\n👥 Holders: ${scan.holders.toLocaleString()}${top3pct > 50 ? ` ⚠️ Top 3: ${top3pct.toFixed(1)}%` : ''}`);
 
   if (scan.topHolders.length) {
     lines.push('\n*Top Holders:*');
@@ -1127,48 +697,115 @@ function formatScanReport(scan) {
     const bc = scan.bondingCurveState;
     lines.push(`\n📊 *On Bonding Curve — ${bc.launchpad}*`);
     if (bc.suiRaised > 0 && bc.threshold) {
-      const pct = ((bc.suiRaised / bc.threshold) * 100).toFixed(1);
-      lines.push(`Progress: ${bc.suiRaised} / ${bc.threshold} SUI (${pct}%)`);
+      const p = ((bc.suiRaised / bc.threshold) * 100).toFixed(1);
+      const bar = '█'.repeat(Math.floor(parseFloat(p) / 10)) + '░'.repeat(10 - Math.floor(parseFloat(p) / 10));
+      lines.push(`Progress: [${bar}] ${p}%`);
+      lines.push(`${bc.suiRaised} / ${bc.threshold} SUI raised`);
     }
-    lines.push(`Will graduate to: ${bc.destinationDex}`);
-    lines.push(`⚠️ Not yet on any DEX`);
+    lines.push(`Graduates to: ${bc.destinationDex}`);
+    lines.push(`⚠️ Not yet tradable on DEX`);
+  } else if (scan.pools.length) {
+    lines.push('\n*Liquidity Pools:*');
+    scan.pools.slice(0, 3).forEach(p =>
+      lines.push(`  • ${p.dex}: $${p.liquidityUsd > 1000 ? (p.liquidityUsd / 1000).toFixed(1) + 'K' : p.liquidityUsd.toFixed(0)}`)
+    );
+    lines.push(`Total: $${(scan.totalLiquidityUsd / 1000).toFixed(1)}K`);
   } else {
-    lines.push('\n*Liquidity:*');
-    if (scan.pools.length) {
-      scan.pools.slice(0, 4).forEach(p =>
-        lines.push(`  • ${p.dex}: ${p.liquidity > 0 ? p.liquidity.toFixed(2) + ' SUI' : 'Available (aggregated)'}`)
-      );
-      lines.push(`Total: ${scan.totalLiquiditySui.toFixed(2)} SUI`);
-    } else {
-      lines.push('  ❌ No pools found');
-    }
+    lines.push('\n❌ No pools found on any DEX');
   }
 
-  lines.push(`\n🍯 Honeypot check: ${scan.honeypotPass === true ? '✅ Can sell' : scan.honeypotPass === false ? '❌ CANNOT SELL' : '⚪ Unknown'}`);
-  lines.push(`\n${icons[scan.riskScore] || '⚪'} *Risk Score: ${scan.riskScore}*`);
+  lines.push(`\n🍯 Honeypot: ${scan.honeypotPass === true ? '✅ Can sell' : scan.honeypotPass === false ? '❌ CANNOT SELL — HONEYPOT' : '⚪ Unknown'}`);
+  lines.push(`\n${icons[scan.riskScore] || '⚪'} *Risk: ${scan.riskScore}*`);
 
   return lines.join('\n');
 }
 
 // ─────────────────────────────────────────────
-// 15. POSITIONS
+// 15. PnL IMAGE GENERATION — QuickChart.io
+// ─────────────────────────────────────────────
+
+function buildPnlChartUrl(symbol, pnlPct, spentSui, currentSui) {
+  const isProfit = pnlPct >= 0;
+  const color    = isProfit ? '#00e676' : '#ff1744';
+  const bgColor  = isProfit ? '#0d1f14' : '#1f0d0d';
+
+  // Generate a realistic-looking price curve
+  const points = 24;
+  const data   = [];
+  for (let i = 0; i <= points; i++) {
+    const t     = i / points;
+    const trend = pnlPct / 100 * t;
+    const noise = (Math.sin(i * 1.3) * 0.15 + Math.cos(i * 2.7) * 0.1) * Math.abs(pnlPct) / 200;
+    data.push(+(1 + trend + noise * Math.sqrt(t)).toFixed(4));
+  }
+
+  const config = {
+    type: 'line',
+    data: {
+      labels: data.map((_, i) => i),
+      datasets: [{
+        data,
+        borderColor: color,
+        backgroundColor: `${color}20`,
+        fill: true,
+        tension: 0.5,
+        borderWidth: 3,
+        pointRadius: 0,
+      }],
+    },
+    options: {
+      animation: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: false },
+        y: { display: false, min: Math.min(...data) * 0.97, max: Math.max(...data) * 1.03 },
+      },
+    },
+  };
+
+  const encoded = encodeURIComponent(JSON.stringify(config));
+  return `https://quickchart.io/chart?c=${encoded}&w=600&h=250&bkg=${encodeURIComponent(bgColor)}&f=png`;
+}
+
+function buildPnlCaption(pos, pnl) {
+  const isProfit = pnl.pnl >= 0;
+  const arrow    = isProfit ? '🚀' : '📉';
+  const sign     = isProfit ? '+' : '';
+  const pct      = pnl.pnlPct.toFixed(2);
+  const pnlSui   = pnl.pnl.toFixed(4);
+  const bar      = buildPnlBar(pnl.pnlPct);
+
+  return (
+    `${arrow} *${pos.symbol} Position*\n\n` +
+    `Entry:   ${pos.entryPriceSui.toFixed(8)} SUI\n` +
+    `Current: ${pnl.currentSui > 0 ? (pnl.currentSui / (pos.amountTokens || 1)).toFixed(8) : '—'} SUI\n\n` +
+    `Invested: ${pos.spentSui} SUI\n` +
+    `Value:    ${pnl.currentSui.toFixed(4)} SUI\n\n` +
+    `P&L: *${sign}${pnlSui} SUI  (${sign}${pct}%)*\n` +
+    `${bar}`
+  );
+}
+
+function buildPnlBar(pct) {
+  const clamped = Math.max(-100, Math.min(200, pct));
+  const filled  = Math.round(Math.abs(clamped) / 20);
+  const empty   = 10 - Math.min(10, filled);
+  const char    = clamped >= 0 ? '🟩' : '🟥';
+  return char.repeat(Math.min(10, filled)) + '⬛'.repeat(Math.max(0, empty));
+}
+
+// ─────────────────────────────────────────────
+// 16. POSITIONS
 // ─────────────────────────────────────────────
 
 function addPosition(chatId, pos) {
   const user = getUser(chatId);
   if (!user) return;
   user.positions.push({
-    id: randomBytes(4).toString('hex'),
-    coinType: pos.coinType,
-    symbol: pos.symbol,
-    entryPriceSui: pos.entryPriceSui || 0,
-    amountTokens: pos.amountTokens || 0,
-    spentSui: pos.spentSui,
-    tp: pos.tp || null,
-    sl: pos.sl || null,
-    source: pos.source || 'dex',
-    launchpad: pos.launchpad || null,
-    openedAt: Date.now(),
+    id: randomBytes(4).toString('hex'), coinType: pos.coinType, symbol: pos.symbol,
+    entryPriceSui: pos.entryPriceSui || 0, amountTokens: pos.amountTokens || 0,
+    spentSui: pos.spentSui, tp: pos.tp || null, sl: pos.sl || null,
+    source: pos.source || 'dex', launchpad: pos.launchpad || null, openedAt: Date.now(),
   });
   saveUsers();
 }
@@ -1188,7 +825,7 @@ async function getPositionPnl(pos) {
 }
 
 // ─────────────────────────────────────────────
-// 16. POSITION MONITOR (TP/SL)
+// 17. POSITION MONITOR (TP/SL)
 // ─────────────────────────────────────────────
 
 async function positionMonitor() {
@@ -1202,12 +839,15 @@ async function positionMonitor() {
           const pnl = await getPositionPnl(pos);
           if (!pnl) continue;
           let reason = '';
-          if (pos.tp && pnl.pnlPct >= pos.tp)        reason = `✅ Take Profit +${pnl.pnlPct.toFixed(2)}%`;
-          else if (pos.sl && pnl.pnlPct <= -pos.sl)  reason = `🛑 Stop Loss ${pnl.pnlPct.toFixed(2)}%`;
+          if (pos.tp && pnl.pnlPct >= pos.tp)       reason = `✅ Take Profit hit! +${pnl.pnlPct.toFixed(2)}%`;
+          else if (pos.sl && pnl.pnlPct <= -pos.sl)  reason = `🛑 Stop Loss hit! ${pnl.pnlPct.toFixed(2)}%`;
           if (!reason) continue;
           try {
             const res = await executeSell(uid, pos.coinType, 100);
-            bot.sendMessage(uid, `${reason}\n\nToken: ${pos.symbol}\nP&L: ${pnl.pnl > 0 ? '+' : ''}${pnl.pnl.toFixed(4)} SUI\n\n🔗 [TX](${SUISCAN_TX}${res.digest})`, { parse_mode: 'Markdown' });
+            const imgUrl = buildPnlChartUrl(pos.symbol, pnl.pnlPct, pos.spentSui, pnl.currentSui);
+            const caption = `${reason}\n\n${buildPnlCaption(pos, pnl)}\n\n🔗 [View TX](${SUISCAN_TX}${res.digest})`;
+            try { await bot.sendPhoto(uid, imgUrl, { caption, parse_mode: 'Markdown' }); }
+            catch  { await bot.sendMessage(uid, caption, { parse_mode: 'Markdown' }); }
           } catch (e) {
             bot.sendMessage(uid, `⚠️ Auto-sell failed for ${pos.symbol}: ${e.message?.slice(0, 80)}`);
           }
@@ -1218,11 +858,7 @@ async function positionMonitor() {
 }
 
 // ─────────────────────────────────────────────
-// 17. SNIPER ENGINE
-// Watches for:
-//   - New DEX pools (7K starts returning a route)
-//   - New bonding curve tokens on launchpads
-//   - Graduation events (bonding curve → DEX)
+// 18. SNIPER ENGINE
 // ─────────────────────────────────────────────
 
 async function sniperEngine() {
@@ -1233,41 +869,17 @@ async function sniperEngine() {
       for (const watch of [...user.snipeWatches]) {
         if (watch.triggered) continue;
         try {
-          // Clear state cache so we get fresh detection
           stateCache.delete(watch.coinType);
           const state = await detectTokenState(watch.coinType);
-
-          let fire = false;
-          if (watch.mode === 'graduation') {
-            fire = state.state === 'graduated';
-          } else {
-            // 'any': fire on bonding curve launch OR DEX pool
-            fire = state.state === 'graduated' || state.state === 'bonding_curve';
-          }
-
+          const fire  = watch.mode === 'graduation' ? state.state === 'graduated' : (state.state === 'graduated' || state.state === 'bonding_curve');
           if (!fire) continue;
-
-          watch.triggered = true;
-          saveUsers();
-
-          const stateLabel = state.state === 'bonding_curve'
-            ? `📊 Bonding curve (${state.launchpadName})`
-            : `✅ DEX pool found (${state.dex || 'aggregator'})`;
-
-          bot.sendMessage(uid,
-            `⚡ *Snipe triggered!*\n\nToken: \`${truncAddr(watch.coinType)}\`\n${stateLabel}\n\nBuying ${watch.buyAmount} SUI...`,
-            { parse_mode: 'Markdown' }
-          );
-
+          watch.triggered = true; saveUsers();
+          const lbl = state.state === 'bonding_curve' ? `📊 ${state.launchpadName}` : `✅ DEX (${state.dex || 'agg'})`;
+          bot.sendMessage(uid, `⚡ *Snipe triggered!*\n\nToken: \`${truncAddr(watch.coinType)}\`\n${lbl}\n\nBuying ${watch.buyAmount} SUI...`, { parse_mode: 'Markdown' });
           try {
             const res = await executeBuy(uid, watch.coinType, watch.buyAmount);
-            bot.sendMessage(uid,
-              `⚡ *Sniped!*\n\nToken: ${res.symbol}\nSpent: ${watch.buyAmount} SUI\nFee: ${res.feeSui} SUI\nRoute: ${res.route}\n${res.state === 'bonding_curve' ? `📊 On ${res.launchpadName}\n` : ''}\n🔗 [View TX](${SUISCAN_TX}${res.digest})`,
-              { parse_mode: 'Markdown' }
-            );
-          } catch (e) {
-            bot.sendMessage(uid, `❌ Snipe buy failed: ${e.message?.slice(0, 120)}`);
-          }
+            bot.sendMessage(uid, `⚡ *Sniped!*\n\nToken: ${res.symbol}\nSpent: ${watch.buyAmount} SUI\nFee: ${res.feeSui} SUI\n\n🔗 [View TX](${SUISCAN_TX}${res.digest})`, { parse_mode: 'Markdown' });
+          } catch (e) { bot.sendMessage(uid, `❌ Snipe buy failed: ${e.message?.slice(0, 120)}`); }
         } catch {}
       }
     }
@@ -1275,8 +887,7 @@ async function sniperEngine() {
 }
 
 // ─────────────────────────────────────────────
-// 18. COPY TRADER ENGINE
-// Polls tracked wallets every 5s for new swap events
+// 19. COPY TRADER ENGINE
 // ─────────────────────────────────────────────
 
 const copyLastSeen = {};
@@ -1284,8 +895,6 @@ const copyLastSeen = {};
 async function copyTraderEngine() {
   while (true) {
     await sleep(5_000);
-
-    // Build map: wallet → list of watchers
     const watchMap = new Map();
     for (const [uid, user] of Object.entries(usersDB)) {
       if (!user.copyTraders?.length || isLocked(user)) continue;
@@ -1294,61 +903,30 @@ async function copyTraderEngine() {
         watchMap.get(ct.wallet).push({ user, config: ct, uid });
       }
     }
-
     for (const [wallet, watchers] of watchMap) {
       try {
-        const txs = await suiClient.queryTransactionBlocks({
-          filter: { FromAddress: wallet },
-          limit: 5,
-          order: 'descending',
-          options: { showEffects: true, showEvents: true },
-        });
-
+        const txs = await suiClient.queryTransactionBlocks({ filter: { FromAddress: wallet }, limit: 5, order: 'descending', options: { showEffects: true, showEvents: true } });
         const lastSeen = copyLastSeen[wallet];
-        const newTxs   = lastSeen
-          ? txs.data.filter(t => t.digest !== lastSeen)
-          : txs.data.slice(0, 1);
+        const newTxs   = lastSeen ? txs.data.filter(t => t.digest !== lastSeen) : txs.data.slice(0, 1);
         if (txs.data.length > 0) copyLastSeen[wallet] = txs.data[0].digest;
-
         for (const tx of newTxs.reverse()) {
-          // Detect swap events — look for swap/trade event types
-          const events = tx.events || [];
-          const swapEv = events.find(e =>
-            e.type?.toLowerCase().includes('swap') ||
-            e.type?.toLowerCase().includes('trade') ||
-            e.type?.toLowerCase().includes('addliquidity') === false
-          );
+          const events  = tx.events || [];
+          const swapEv  = events.find(e => e.type?.toLowerCase().includes('swap') || e.type?.toLowerCase().includes('trade'));
           if (!swapEv) continue;
-
-          const pj = swapEv.parsedJson || {};
-          // Extract output coin type from event
-          const boughtCoin = pj.coin_type_out || pj.token_out || pj.coin_b_type || pj.coinTypeOut || null;
+          const pj          = swapEv.parsedJson || {};
+          const boughtCoin  = pj.coin_type_out || pj.token_out || pj.coin_b_type || pj.coinTypeOut || null;
           if (!boughtCoin || boughtCoin === SUI_TYPE) continue;
-
           for (const { user, config, uid } of watchers) {
             try {
               if (config.blacklist?.includes(boughtCoin)) continue;
               const holding = await getOwnedCoins(user.walletAddress, boughtCoin);
               if (holding.length > 0) continue;
               if ((user.positions || []).length >= (config.maxPositions || 5)) continue;
-
               const copyAmt = config.amount || user.settings.copyAmount;
-              const amtMist = mistFromSui(copyAmt);
-              const { feeMist } = calcFee(amtMist, user);
-
-              bot.sendMessage(uid,
-                `🔁 *Copy Trade Triggered*\n\nWallet: \`${truncAddr(wallet)}\`\nBuying: \`${truncAddr(boughtCoin)}\`\nAmount: ${copyAmt} SUI (fee: ${suiFloat(feeMist)} SUI)`,
-                { parse_mode: 'Markdown' }
-              );
-
+              bot.sendMessage(uid, `🔁 *Copy Trade*\n\nWallet: \`${truncAddr(wallet)}\`\nBuying: \`${truncAddr(boughtCoin)}\`\nAmount: ${copyAmt} SUI`, { parse_mode: 'Markdown' });
               const res = await executeBuy(uid, boughtCoin, copyAmt);
-              bot.sendMessage(uid,
-                `✅ *Copy trade executed!*\n\nToken: ${res.symbol}\nFee: ${res.feeSui} SUI\nRoute: ${res.route}\n\n🔗 [TX](${SUISCAN_TX}${res.digest})`,
-                { parse_mode: 'Markdown' }
-              );
-            } catch (e) {
-              bot.sendMessage(uid, `❌ Copy trade failed: ${e.message?.slice(0, 100)}`);
-            }
+              bot.sendMessage(uid, `✅ *Copy done!*\n\nToken: ${res.symbol}\nFee: ${res.feeSui} SUI\n\n🔗 [TX](${SUISCAN_TX}${res.digest})`, { parse_mode: 'Markdown' });
+            } catch (e) { bot.sendMessage(uid, `❌ Copy trade failed: ${e.message?.slice(0, 100)}`); }
           }
         }
       } catch {}
@@ -1357,53 +935,56 @@ async function copyTraderEngine() {
 }
 
 // ─────────────────────────────────────────────
-// 19. SYMBOL RESOLVER
+// 20. SYMBOL RESOLVER
 // ─────────────────────────────────────────────
 
 async function resolveSymbol(ticker) {
   const sym = ticker.replace(/^\$/, '').toUpperCase();
   try {
     const r = await fetchTimeout(`https://api-sui.cetus.zone/v2/sui/tokens?symbol=${sym}`, {}, 5000);
-    if (r.ok) {
-      const d = await r.json();
-      const t = d.data?.[0];
-      if (t?.coin_type) return t.coin_type;
-    }
+    if (r.ok) { const d = await r.json(); if (d.data?.[0]?.coin_type) return d.data[0].coin_type; }
   } catch {}
   return null;
 }
 
 // ─────────────────────────────────────────────
-// 20. TELEGRAM BOT
+// 21. MAIN KEYBOARD
+// ─────────────────────────────────────────────
+
+const MAIN_KB = {
+  keyboard: [
+    [{ text: '💰 Buy' },       { text: '💸 Sell' }],
+    [{ text: '📊 Positions' }, { text: '💼 Balance' }],
+    [{ text: '🔍 Scan' },      { text: '⚡ Snipe' }],
+    [{ text: '🔁 Copy Trade'}, { text: '🔗 Referral' }],
+    [{ text: '⚙️ Settings' },  { text: '❓ Help' }],
+  ],
+  resize_keyboard: true,
+  persistent: true,
+};
+
+// ─────────────────────────────────────────────
+// 22. TELEGRAM BOT
 // ─────────────────────────────────────────────
 
 const bot = new TelegramBot(TG_BOT_TOKEN, { polling: true });
 
 async function requireUnlocked(chatId, fn) {
   const user = getUser(chatId);
-  if (!user?.walletAddress) {
-    await bot.sendMessage(chatId, '❌ No wallet set up. Use /start to begin.');
-    return;
-  }
+  if (!user?.walletAddress) { await bot.sendMessage(chatId, '❌ No wallet. Use /start first.'); return; }
   if (user.cooldownUntil && Date.now() < user.cooldownUntil) {
-    const s = Math.ceil((user.cooldownUntil - Date.now()) / 1000);
-    await bot.sendMessage(chatId, `🔒 Cooldown active — try again in ${s}s.`);
-    return;
+    await bot.sendMessage(chatId, `🔒 Cooldown — wait ${Math.ceil((user.cooldownUntil - Date.now()) / 1000)}s.`); return;
   }
-  if (isLocked(user)) {
-    updateUser(chatId, { state: 'awaiting_unlock_pin' });
-    await bot.sendMessage(chatId, '🔒 Bot locked. Enter your 4-digit PIN to unlock:');
-    return;
-  }
+  if (isLocked(user)) { updateUser(chatId, { state: 'awaiting_unlock_pin' }); await bot.sendMessage(chatId, '🔒 Bot locked. Enter your PIN:'); return; }
   updateUser(chatId, { lastActivity: Date.now() });
   try { await fn(user); }
-  catch (e) {
-    console.error(`Handler [${chatId}]:`, e.message);
-    await bot.sendMessage(chatId, `❌ ${e.message?.slice(0, 180) || 'Unknown error'}`);
-  }
+  catch (e) { console.error(`[${chatId}]`, e.message); await bot.sendMessage(chatId, `❌ ${e.message?.slice(0, 180) || 'Error'}`); }
 }
 
-// ── /start
+// ─────────────────────────────────────────────
+// /start
+// ─────────────────────────────────────────────
+
 bot.onText(/\/start(.*)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const param  = sanitize((match[1] || '').trim());
@@ -1412,37 +993,26 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   if (!user) {
     user = createUser(chatId);
     if (param.startsWith('AGT-')) {
-      const referrer = Object.values(usersDB).find(u =>
-        u.referralCode === param && u.chatId !== String(chatId)
-      );
+      const referrer = Object.values(usersDB).find(u => u.referralCode === param && u.chatId !== String(chatId));
       if (referrer?.walletAddress) {
         updateUser(chatId, { referredBy: referrer.walletAddress });
         updateUser(referrer.chatId, { referralCount: (referrer.referralCount || 0) + 1 });
-        bot.sendMessage(referrer.chatId, `🎉 Someone joined via your referral! You earn 25% of their fees forever.`);
+        bot.sendMessage(referrer.chatId, `🎉 New user joined via your referral!`);
       }
     }
   }
 
   if (user.walletAddress) {
-    await bot.sendMessage(chatId,
-      `🤖 *AGENT TRADING BOT*\n\nWelcome back!\nWallet: \`${truncAddr(user.walletAddress)}\`\n\nType /help for all commands.`,
-      { parse_mode: 'Markdown' }
-    );
+    await bot.sendMessage(chatId, `👋 Welcome back!\n\nWallet: \`${truncAddr(user.walletAddress)}\``, { parse_mode: 'Markdown', reply_markup: MAIN_KB });
   } else {
     await bot.sendMessage(chatId,
-      `🤖 *Welcome to AGENT TRADING BOT*\n\n` +
-      `Trade any Sui token across all DEXes and launchpads.\n\n` +
-      `✅ Cetus, Turbos, Aftermath, Kriya, FlowX & more via 7K aggregator\n` +
-      `✅ MovePump, hop.fun, moonbags, Turbos.fun bonding curves\n` +
-      `✅ Auto-detects if token is on bonding curve or DEX\n\n` +
-      `🔐 AES-256 encrypted keys • PIN lock • Auto-lock after 30min\n\n` +
-      `Get started:`,
+      `👋 Welcome to *AGENT TRADING BOT*\n\nThe fastest trading bot on Sui.\n\nConnect your wallet to get started:`,
       {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🔑 Import Wallet', callback_data: 'import_wallet' }],
-            [{ text: '✨ Generate New Wallet', callback_data: 'gen_wallet' }],
+            [{ text: '🔑 Import Existing Wallet', callback_data: 'import_wallet' }],
+            [{ text: '✨ Create New Wallet',       callback_data: 'gen_wallet'    }],
           ],
         },
       }
@@ -1450,392 +1020,561 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   }
 });
 
-// ── Callbacks
+// ─────────────────────────────────────────────
+// CALLBACK HANDLER
+// NOTE: callback_data max is 64 bytes — we use short codes
+// and store coinType/context in user.pendingData
+// ─────────────────────────────────────────────
+
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
+  const msgId  = query.message.message_id;
   const data   = query.data;
-  await bot.answerCallbackQuery(query.id);
+  await bot.answerCallbackQuery(query.id).catch(() => {});
 
   try {
+    // ── Wallet setup
     if (data === 'import_wallet') {
       updateUser(chatId, { state: 'awaiting_private_key' });
-      await bot.sendMessage(chatId,
-        `🔑 Send your private key (starts with \`suiprivkey1...\`).\n\n⚠️ Message deleted immediately after processing.`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.sendMessage(chatId, `🔑 Send your private key (starts with \`suiprivkey1...\`).\n\n⚠️ Deleted immediately after import.`, { parse_mode: 'Markdown' });
       return;
     }
 
     if (data === 'gen_wallet') {
-      const kp   = new Ed25519Keypair();
+      const kp = new Ed25519Keypair();
       const addr = kp.getPublicKey().toSuiAddress();
-      const enc  = encryptKey(kp.getSecretKey());
-      updateUser(chatId, { encryptedKey: enc, walletAddress: addr, state: 'awaiting_pin_set' });
-      await bot.sendMessage(chatId,
-        `✅ *Wallet Generated!*\n\nAddress: \`${addr}\`\n\n⚠️ Fund with SUI before trading.\n\nSet a 4-digit PIN:`,
-        { parse_mode: 'Markdown' }
-      );
+      updateUser(chatId, { encryptedKey: encryptKey(kp.getSecretKey()), walletAddress: addr, state: 'awaiting_pin_set' });
+      await bot.sendMessage(chatId, `✅ *Wallet Generated!*\n\nAddress: \`${addr}\`\n\nFund with SUI before trading.\n\nSet a 4-digit PIN:`, { parse_mode: 'Markdown' });
       return;
     }
 
-    if (data.startsWith('confirm_buy:')) {
-      const parts    = data.split(':');
-      const uid      = parts[1];
-      const coinType = parts[2];
-      const amt      = parseFloat(parts[3]);
-      if (String(chatId) !== uid) return;
-      await doConfirmedBuy(chatId, coinType, amt);
+    // ── BUY FLOW: amount selection
+    // ba:X = buy amount X SUI (X is index into buyAmounts array, or 'c' for custom)
+    if (data.startsWith('ba:')) {
+      const user = getUser(chatId);
+      if (!user?.pendingData?.coinType) { await bot.sendMessage(chatId, '❌ Session expired. Start again.'); return; }
+      const coinType = user.pendingData.coinType;
+      const key      = data.split(':')[1];
+
+      if (key === 'c') {
+        // Custom amount
+        updateUser(chatId, { state: 'awaiting_buy_custom_amount' });
+        await bot.sendMessage(chatId, `💬 Enter the SUI amount you want to buy:\n\n_Example: 2.5_`, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const amtIdx = parseInt(key);
+      const amounts = user.settings.buyAmounts || DEFAULT_BUY_AMOUNTS;
+      const amountSui = amounts[amtIdx];
+      if (!amountSui) { await bot.sendMessage(chatId, '❌ Invalid amount.'); return; }
+
+      await showBuyConfirm(chatId, coinType, amountSui, msgId);
       return;
     }
 
-    if (data.startsWith('confirm_sell:')) {
-      const parts    = data.split(':');
-      const uid      = parts[1];
-      const coinType = parts[2];
-      const pct      = parseFloat(parts[3]);
-      if (String(chatId) !== uid) return;
-      await doConfirmedSell(chatId, coinType, pct);
+    // ── BUY FLOW: confirm execute
+    if (data === 'bc') {
+      const user = getUser(chatId);
+      if (!user?.pendingData?.coinType || !user?.pendingData?.amountSui) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      await bot.editMessageText('⚡ Executing buy...', { chat_id: chatId, message_id: msgId });
+      try {
+        const res = await executeBuy(chatId, user.pendingData.coinType, user.pendingData.amountSui);
+        const text =
+          `✅ *Buy Executed!*\n\n` +
+          `Token: *${res.symbol}*\n` +
+          `Spent: ${user.pendingData.amountSui} SUI\n` +
+          `Fee: ${res.feeSui} SUI\n` +
+          (res.estOut !== '?' ? `Received: ~${res.estOut} ${res.symbol}\n` : '') +
+          `Route: ${res.route}\n` +
+          (res.state === 'bonding_curve' ? `📊 Bought on ${res.launchpadName}\n` : '') +
+          `\n🔗 [View TX](${SUISCAN_TX}${res.digest})`;
+        await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+      } catch (e) {
+        await bot.editMessageText(`❌ Buy failed: ${e.message?.slice(0, 180)}`, { chat_id: chatId, message_id: msgId });
+      }
+      updateUser(chatId, { pendingData: {} });
       return;
     }
 
-    if (data === 'cancel') {
-      updateUser(chatId, { state: null });
-      await bot.sendMessage(chatId, '❌ Cancelled.');
+    // ── SELL FLOW: select token from positions
+    // st:X = sell token at position index X
+    if (data.startsWith('st:')) {
+      const user  = getUser(chatId);
+      const idx   = parseInt(data.split(':')[1]);
+      const pos   = user?.positions?.[idx];
+      if (!pos) { await bot.sendMessage(chatId, '❌ Position not found.'); return; }
+      updateUser(chatId, { pendingData: { ...user.pendingData, coinType: pos.coinType, symbol: pos.symbol } });
+      await showSellPercentButtons(chatId, pos.coinType, pos.symbol, msgId);
       return;
     }
 
+    // ── SELL FLOW: percent selection
+    // sp:X = sell percent X (25,50,75,100 or 'c' for custom)
+    if (data.startsWith('sp:')) {
+      const user = getUser(chatId);
+      if (!user?.pendingData?.coinType) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      const key  = data.split(':')[1];
+
+      if (key === 'c') {
+        updateUser(chatId, { state: 'awaiting_sell_custom_pct' });
+        await bot.sendMessage(chatId, `💬 Enter percentage to sell (1-100):\n\n_Example: 33_`, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const pct = parseInt(key);
+      updateUser(chatId, { pendingData: { ...user.pendingData, sellPct: pct } });
+      await showSellConfirm(chatId, user.pendingData.coinType, pct, msgId);
+      return;
+    }
+
+    // ── SELL FLOW: confirm execute
+    if (data === 'sc') {
+      const user = getUser(chatId);
+      if (!user?.pendingData?.coinType || !user?.pendingData?.sellPct) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      await bot.editMessageText('⚡ Executing sell...', { chat_id: chatId, message_id: msgId });
+      try {
+        const res = await executeSell(chatId, user.pendingData.coinType, user.pendingData.sellPct);
+        await bot.editMessageText(
+          `✅ *Sell Executed!*\n\nToken: ${res.symbol}\nSold: ${res.pct}%\nEst. SUI: ${res.estSui}\nFee: ${res.feeSui} SUI\nRoute: ${res.route}\n\n🔗 [View TX](${SUISCAN_TX}${res.digest})`,
+          { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
+        );
+      } catch (e) {
+        await bot.editMessageText(`❌ Sell failed: ${e.message?.slice(0, 180)}`, { chat_id: chatId, message_id: msgId });
+      }
+      updateUser(chatId, { pendingData: {} });
+      return;
+    }
+
+    if (data === 'ca') {
+      updateUser(chatId, { state: null, pendingData: {} });
+      await bot.editMessageText('❌ Cancelled.', { chat_id: chatId, message_id: msgId }).catch(() => {});
+      return;
+    }
+
+    // ── Settings callbacks
     if (data.startsWith('slip:')) {
-      const val = parseFloat(data.split(':')[1]);
       const u = getUser(chatId);
-      if (u) { u.settings.slippage = val; saveUsers(); }
-      await bot.sendMessage(chatId, `✅ Slippage set to ${val}%`);
+      if (u) { u.settings.slippage = parseFloat(data.split(':')[1]); saveUsers(); }
+      await bot.answerCallbackQuery(query.id, { text: `✅ Slippage set to ${data.split(':')[1]}%` });
       return;
     }
 
-    if (data.startsWith('confirm_thresh:')) {
-      const val = parseFloat(data.split(':')[1]);
+    if (data.startsWith('ct:')) {
       const u = getUser(chatId);
-      if (u) { u.settings.confirmThreshold = val; saveUsers(); }
-      await bot.sendMessage(chatId, `✅ Confirmation threshold set to ${val} SUI`);
+      if (u) { u.settings.confirmThreshold = parseFloat(data.split(':')[1]); saveUsers(); }
+      await bot.answerCallbackQuery(query.id, { text: `✅ Threshold set` });
       return;
     }
+
+    if (data === 'edit_buy_amounts') {
+      updateUser(chatId, { state: 'awaiting_buy_amounts_edit' });
+      await bot.sendMessage(chatId, `⚙️ Enter your 4 quick-buy amounts separated by spaces:\n\n_Example: 0.5 1 3 5_`, { parse_mode: 'Markdown' });
+      return;
+    }
+
   } catch (e) {
+    console.error('Callback error:', e.message);
     await bot.sendMessage(chatId, `❌ ${e.message?.slice(0, 120)}`);
   }
 });
 
-// ── Message handler (state machine)
+// ─────────────────────────────────────────────
+// BUY FLOW HELPERS
+// ─────────────────────────────────────────────
+
+async function startBuyFlow(chatId, coinType) {
+  const user    = getUser(chatId);
+  if (!user) return;
+  const state   = await detectTokenState(coinType);
+  const meta    = await getCoinMeta(coinType) || {};
+  const symbol  = meta.symbol || truncAddr(coinType);
+
+  // Store coinType in pendingData (NOT in callback_data to avoid 64-byte limit)
+  updateUser(chatId, { pendingData: { coinType, symbol } });
+
+  const amounts = user.settings.buyAmounts || DEFAULT_BUY_AMOUNTS;
+  const amtBtns = amounts.map((a, i) => ({ text: `${a} SUI`, callback_data: `ba:${i}` }));
+
+  let info = `Token: *${symbol}*\n\`${truncAddr(coinType)}\`\n\n`;
+  if (state.state === 'graduated')     info += `✅ DEX — best price via aggregator\n`;
+  else if (state.state === 'bonding_curve') info += `📊 Bonding curve — ${state.launchpadName}\n`;
+  else                                 info += `⚠️ Token state unknown\n`;
+
+  const { feeMist } = calcFee(mistFromSui(amounts[0]), user);
+  info += `\nFee: 1% per trade\n\n*Select buy amount:*`;
+
+  await bot.sendMessage(chatId, info, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        amtBtns,
+        [{ text: '✏️ Custom Amount', callback_data: 'ba:c' }],
+        [{ text: '⚙️ Edit Defaults', callback_data: 'edit_buy_amounts' }, { text: '❌ Cancel', callback_data: 'ca' }],
+      ],
+    },
+  });
+}
+
+async function showBuyConfirm(chatId, coinType, amountSui, editMsgId) {
+  const user   = getUser(chatId);
+  if (!user) return;
+  const meta   = await getCoinMeta(coinType) || {};
+  const symbol = meta.symbol || truncAddr(coinType);
+  const amountMist = mistFromSui(amountSui);
+  const { feeMist } = calcFee(amountMist, user);
+
+  updateUser(chatId, { pendingData: { ...user.pendingData, amountSui } });
+
+  let estOut = '?';
+  try {
+    const k = await sdk7k();
+    const q = await k.getQuote({ tokenIn: SUI_TYPE, tokenOut: coinType, amountIn: (amountMist - feeMist).toString() });
+    if (q?.outAmount) estOut = (Number(q.outAmount) / Math.pow(10, meta.decimals || 9)).toFixed(4);
+  } catch {}
+
+  const text =
+    `💰 *Confirm Buy*\n\n` +
+    `Token: *${symbol}*\n` +
+    `Amount: ${amountSui} SUI\n` +
+    `Fee (1%): ${suiFloat(feeMist)} SUI\n` +
+    `You trade: ${suiFloat(amountMist - feeMist)} SUI\n` +
+    (estOut !== '?' ? `Est. receive: ~${estOut} ${symbol}\n` : '') +
+    `Slippage: ${user.settings.slippage}%`;
+
+  const kb = { inline_keyboard: [[{ text: '✅ Confirm Buy', callback_data: 'bc' }, { text: '❌ Cancel', callback_data: 'ca' }]] };
+
+  if (editMsgId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, parse_mode: 'Markdown', reply_markup: kb }).catch(async () => {
+      await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: kb });
+    });
+  } else {
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: kb });
+  }
+}
+
+// ─────────────────────────────────────────────
+// SELL FLOW HELPERS
+// ─────────────────────────────────────────────
+
+async function startSellFlow(chatId, coinType, symbol) {
+  const user = getUser(chatId);
+  if (!user) return;
+  updateUser(chatId, { pendingData: { coinType, symbol } });
+  await showSellPercentButtons(chatId, coinType, symbol, null);
+}
+
+async function showSellPercentButtons(chatId, coinType, symbol, editMsgId) {
+  const user = getUser(chatId);
+  if (!user) return;
+
+  const coins = await getOwnedCoins(user.walletAddress, coinType).catch(() => []);
+  if (!coins.length) { await bot.sendMessage(chatId, `❌ No ${symbol} balance in your wallet.`); return; }
+
+  const meta      = await getCoinMeta(coinType) || {};
+  const totalBal  = coins.reduce((s, c) => s + BigInt(c.balance), 0n);
+  const dispBal   = (Number(totalBal) / Math.pow(10, meta.decimals || 9)).toFixed(4);
+
+  const text =
+    `💸 *Sell ${symbol}*\n\n` +
+    `Balance: ${dispBal} ${symbol}\n\n` +
+    `*Choose amount to sell:*`;
+
+  const kb = {
+    inline_keyboard: [
+      [
+        { text: '25%', callback_data: 'sp:25' },
+        { text: '50%', callback_data: 'sp:50' },
+        { text: '75%', callback_data: 'sp:75' },
+        { text: '100%', callback_data: 'sp:100' },
+      ],
+      [{ text: '✏️ Custom %', callback_data: 'sp:c' }, { text: '❌ Cancel', callback_data: 'ca' }],
+    ],
+  };
+
+  if (editMsgId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, parse_mode: 'Markdown', reply_markup: kb }).catch(async () => {
+      await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: kb });
+    });
+  } else {
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: kb });
+  }
+}
+
+async function showSellConfirm(chatId, coinType, pct, editMsgId) {
+  const user = getUser(chatId);
+  if (!user) return;
+  const meta   = await getCoinMeta(coinType) || {};
+  const symbol = meta.symbol || truncAddr(coinType);
+  const coins  = await getOwnedCoins(user.walletAddress, coinType).catch(() => []);
+  const total  = coins.reduce((s, c) => s + BigInt(c.balance), 0n);
+  const sellAm = (total * BigInt(pct)) / 100n;
+  const dispAm = (Number(sellAm) / Math.pow(10, meta.decimals || 9)).toFixed(4);
+
+  let estSui = '?';
+  try {
+    const k = await sdk7k();
+    const q = await k.getQuote({ tokenIn: coinType, tokenOut: SUI_TYPE, amountIn: sellAm.toString() });
+    if (q?.outAmount) estSui = (Number(q.outAmount) / 1e9).toFixed(4);
+  } catch {}
+
+  const text =
+    `💸 *Confirm Sell*\n\n` +
+    `Token: *${symbol}*\n` +
+    `Selling: ${pct}% (${dispAm} ${symbol})\n` +
+    (estSui !== '?' ? `Est. receive: ~${estSui} SUI\n` : '') +
+    `Slippage: ${user.settings.slippage}%`;
+
+  const kb = { inline_keyboard: [[{ text: '✅ Confirm Sell', callback_data: 'sc' }, { text: '❌ Cancel', callback_data: 'ca' }]] };
+
+  if (editMsgId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: editMsgId, parse_mode: 'Markdown', reply_markup: kb }).catch(async () => {
+      await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: kb });
+    });
+  } else {
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: kb });
+  }
+}
+
+// ─────────────────────────────────────────────
+// MESSAGE HANDLER (state machine + keyboard routing)
+// ─────────────────────────────────────────────
+
 bot.on('message', async (msg) => {
-  if (!msg.text || msg.text.startsWith('/')) return;
+  if (!msg.text) return;
   const chatId = msg.chat.id;
   const text   = sanitize(msg.text);
-  const user   = getUser(chatId) || createUser(chatId);
-  const state  = user.state;
+  if (!text) return;
 
-  // Private key import
-  if (state === 'awaiting_private_key') {
-    updateUser(chatId, { state: null });
-    try { await bot.deleteMessage(chatId, msg.message_id); } catch {}
-    try {
-      const decoded = decodeSuiPrivateKey(text);
-      const kp      = Ed25519Keypair.fromSecretKey(decoded.secretKey);
-      const addr    = kp.getPublicKey().toSuiAddress();
-      updateUser(chatId, {
-        encryptedKey: encryptKey(text),
-        walletAddress: addr,
-        state: 'awaiting_pin_set',
-      });
-      await bot.sendMessage(chatId,
-        `✅ Wallet imported!\n\nAddress: \`${addr}\`\n🔐 Key encrypted.\n\nSet a 4-digit PIN:`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch {
-      await bot.sendMessage(chatId, '❌ Invalid key. Start over with /start.');
-    }
-    return;
-  }
+  const user  = getUser(chatId) || createUser(chatId);
+  const state = user.state;
 
-  // PIN set
-  if (state === 'awaiting_pin_set') {
-    if (!/^\d{4}$/.test(text)) { await bot.sendMessage(chatId, '❌ Must be exactly 4 digits:'); return; }
-    updateUser(chatId, { pinHash: hashPin(text), state: null });
-    await bot.sendMessage(chatId, `✅ PIN set! Bot auto-locks after 30min inactivity.\n\nUse /help for all commands.`);
-    syncToBackend(getUser(chatId));
-    return;
-  }
+  // ── Keyboard button routing (non-command button presses)
+  if (!text.startsWith('/')) {
+    const routes = {
+      '💰 Buy':        async () => { await bot.sendMessage(chatId, `Send the token contract address or $TICKER:\n\n_Example: 0x1234...5678 or $AGENT_`, { parse_mode: 'Markdown' }); updateUser(chatId, { state: 'awaiting_buy_ca' }); },
+      '💸 Sell':       async () => { await handleSellButton(chatId, user); },
+      '📊 Positions':  async () => { bot.emit('message', { ...msg, text: '/positions', chat: msg.chat, from: msg.from }); },
+      '💼 Balance':    async () => { bot.emit('message', { ...msg, text: '/balance',   chat: msg.chat, from: msg.from }); },
+      '🔍 Scan':       async () => { await bot.sendMessage(chatId, `Send the token contract address to scan:\n\n_Example: 0x1234...5678_`, { parse_mode: 'Markdown' }); updateUser(chatId, { state: 'awaiting_scan_ca' }); },
+      '⚡ Snipe':      async () => { bot.emit('message', { ...msg, text: '/snipe',     chat: msg.chat, from: msg.from }); },
+      '🔁 Copy Trade': async () => { bot.emit('message', { ...msg, text: '/copytrader',chat: msg.chat, from: msg.from }); },
+      '🔗 Referral':   async () => { bot.emit('message', { ...msg, text: '/referral',  chat: msg.chat, from: msg.from }); },
+      '⚙️ Settings':   async () => { bot.emit('message', { ...msg, text: '/settings',  chat: msg.chat, from: msg.from }); },
+      '❓ Help':        async () => { bot.emit('message', { ...msg, text: '/help',      chat: msg.chat, from: msg.from }); },
+    };
 
-  // PIN unlock
-  if (state === 'awaiting_unlock_pin') {
-    if (!/^\d{4}$/.test(text)) { await bot.sendMessage(chatId, '❌ Enter 4-digit PIN:'); return; }
-    if (hashPin(text) === user.pinHash) {
-      unlockUser(chatId);
-      updateUser(chatId, { state: null, failAttempts: 0, cooldownUntil: 0 });
-      await bot.sendMessage(chatId, '🔓 Unlocked! Use /help for all commands.');
-    } else {
-      const fails = (user.failAttempts || 0) + 1;
-      if (fails >= MAX_FAILS) {
-        updateUser(chatId, { failAttempts: 0, cooldownUntil: Date.now() + COOLDOWN_MS });
-        await bot.sendMessage(chatId, '❌ Too many failed attempts. Locked for 5 minutes.');
-      } else {
-        updateUser(chatId, { failAttempts: fails });
-        await bot.sendMessage(chatId, `❌ Wrong PIN. ${MAX_FAILS - fails} attempts remaining.`);
-      }
-    }
-    return;
-  }
+    if (routes[text]) { await routes[text](); return; }
 
-  // Snipe amount
-  if (state === 'awaiting_snipe_amount') {
-    const amt = parseFloat(text);
-    if (isNaN(amt) || amt <= 0) { await bot.sendMessage(chatId, '❌ Invalid amount.'); return; }
-    const pd = user.pendingData || {};
-    user.snipeWatches = user.snipeWatches || [];
-    user.snipeWatches.push({
-      coinType: pd.snipeToken,
-      buyAmount: amt,
-      minLiquidity: 1,
-      mode: pd.snipeMode || 'any',
-      triggered: false,
-      addedAt: Date.now(),
-    });
-    updateUser(chatId, { state: null, pendingData: {}, snipeWatches: user.snipeWatches });
-    await bot.sendMessage(chatId,
-      `⚡ *Snipe set!*\n\nToken: \`${truncAddr(pd.snipeToken)}\`\nBuy: ${amt} SUI\nMode: ${pd.snipeMode === 'graduation' ? 'Wait for DEX graduation' : 'Any pool or bonding curve'}\n\nWatching...`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
-
-  // Copy trader wallet entry
-  if (state === 'awaiting_copytrader_wallet') {
-    if (!text.startsWith('0x')) { await bot.sendMessage(chatId, '❌ Invalid wallet address.'); return; }
-    user.copyTraders = user.copyTraders || [];
-    if (user.copyTraders.length >= 3) {
-      await bot.sendMessage(chatId, '❌ Max 3 copy traders. Use /copytrader stop to clear.');
+    // ── State machine for free-text inputs
+    if (state === 'awaiting_buy_ca') {
       updateUser(chatId, { state: null });
+      const coinType = text.startsWith('0x') ? text : (await resolveSymbol(text));
+      if (!coinType) { await bot.sendMessage(chatId, '❌ Token not found. Try the full contract address.'); return; }
+      await requireUnlocked(chatId, async () => { await startBuyFlow(chatId, coinType); });
       return;
     }
-    user.copyTraders.push({ wallet: text, amount: user.settings.copyAmount, maxPositions: 5, blacklist: [] });
-    updateUser(chatId, { state: null, copyTraders: user.copyTraders });
-    await bot.sendMessage(chatId, `✅ Now tracking \`${truncAddr(text)}\`\nAmount: ${user.settings.copyAmount} SUI/trade`, { parse_mode: 'Markdown' });
-    return;
+
+    if (state === 'awaiting_sell_ca') {
+      updateUser(chatId, { state: null });
+      const coinType = text.startsWith('0x') ? text : (await resolveSymbol(text));
+      if (!coinType) { await bot.sendMessage(chatId, '❌ Token not found.'); return; }
+      const meta = await getCoinMeta(coinType) || {};
+      await requireUnlocked(chatId, async () => { await startSellFlow(chatId, coinType, meta.symbol || truncAddr(coinType)); });
+      return;
+    }
+
+    if (state === 'awaiting_scan_ca') {
+      updateUser(chatId, { state: null });
+      const coinType = text.startsWith('0x') ? text : (await resolveSymbol(text));
+      if (!coinType) { await bot.sendMessage(chatId, '❌ Token not found.'); return; }
+      const m = await bot.sendMessage(chatId, '🔍 Scanning...');
+      try { const scan = await scanToken(coinType); await bot.editMessageText(formatScanReport(scan), { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' }); }
+      catch (e) { await bot.editMessageText(`❌ Scan failed: ${e.message?.slice(0, 100)}`, { chat_id: chatId, message_id: m.message_id }); }
+      return;
+    }
+
+    if (state === 'awaiting_buy_custom_amount') {
+      updateUser(chatId, { state: null });
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) { await bot.sendMessage(chatId, '❌ Invalid amount. Enter a number like 2.5'); return; }
+      const coinType = user.pendingData?.coinType;
+      if (!coinType) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      await showBuyConfirm(chatId, coinType, amt, null);
+      return;
+    }
+
+    if (state === 'awaiting_sell_custom_pct') {
+      updateUser(chatId, { state: null });
+      const pct = parseFloat(text);
+      if (isNaN(pct) || pct <= 0 || pct > 100) { await bot.sendMessage(chatId, '❌ Enter a number 1-100'); return; }
+      const coinType = user.pendingData?.coinType;
+      if (!coinType) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      updateUser(chatId, { pendingData: { ...user.pendingData, sellPct: pct } });
+      await showSellConfirm(chatId, coinType, pct, null);
+      return;
+    }
+
+    if (state === 'awaiting_buy_amounts_edit') {
+      updateUser(chatId, { state: null });
+      const parts = text.split(/\s+/).map(Number).filter(n => !isNaN(n) && n > 0).slice(0, 4);
+      if (parts.length < 2) { await bot.sendMessage(chatId, '❌ Enter at least 2 amounts, e.g.: 0.5 1 3 5'); return; }
+      while (parts.length < 4) parts.push(parts[parts.length - 1] * 2);
+      const u = getUser(chatId);
+      if (u) { u.settings.buyAmounts = parts; saveUsers(); }
+      await bot.sendMessage(chatId, `✅ Quick-buy amounts updated: ${parts.join(', ')} SUI`);
+      return;
+    }
+
+    if (state === 'awaiting_private_key') {
+      updateUser(chatId, { state: null });
+      try { await bot.deleteMessage(chatId, msg.message_id); } catch {}
+      try {
+        const decoded = decodeSuiPrivateKey(text);
+        const kp      = Ed25519Keypair.fromSecretKey(decoded.secretKey);
+        const addr    = kp.getPublicKey().toSuiAddress();
+        updateUser(chatId, { encryptedKey: encryptKey(text), walletAddress: addr, state: 'awaiting_pin_set' });
+        await bot.sendMessage(chatId, `✅ Wallet imported!\n\nAddress: \`${addr}\`\n\nSet a 4-digit PIN:`, { parse_mode: 'Markdown' });
+      } catch { await bot.sendMessage(chatId, '❌ Invalid key. Try /start again.'); }
+      return;
+    }
+
+    if (state === 'awaiting_pin_set') {
+      if (!/^\d{4}$/.test(text)) { await bot.sendMessage(chatId, '❌ Must be exactly 4 digits:'); return; }
+      updateUser(chatId, { pinHash: hashPin(text), state: null });
+      await bot.sendMessage(chatId, `✅ All set! Bot auto-locks after 30min inactivity.`, { reply_markup: MAIN_KB });
+      syncToBackend(getUser(chatId));
+      return;
+    }
+
+    if (state === 'awaiting_unlock_pin') {
+      if (!/^\d{4}$/.test(text)) { await bot.sendMessage(chatId, '❌ Enter 4-digit PIN:'); return; }
+      if (hashPin(text) === user.pinHash) {
+        unlockUser(chatId); updateUser(chatId, { state: null, failAttempts: 0, cooldownUntil: 0 });
+        await bot.sendMessage(chatId, '🔓 Unlocked!', { reply_markup: MAIN_KB });
+      } else {
+        const fails = (user.failAttempts || 0) + 1;
+        if (fails >= MAX_FAILS) { updateUser(chatId, { failAttempts: 0, cooldownUntil: Date.now() + COOLDOWN_MS }); await bot.sendMessage(chatId, '❌ Too many attempts. Locked 5 minutes.'); }
+        else { updateUser(chatId, { failAttempts: fails }); await bot.sendMessage(chatId, `❌ Wrong PIN. ${MAX_FAILS - fails} attempts left.`); }
+      }
+      return;
+    }
+
+    if (state === 'awaiting_snipe_amount') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) { await bot.sendMessage(chatId, '❌ Invalid amount.'); return; }
+      const pd = user.pendingData || {};
+      user.snipeWatches = user.snipeWatches || [];
+      user.snipeWatches.push({ coinType: pd.snipeToken, buyAmount: amt, minLiquidity: 1, mode: pd.snipeMode || 'any', triggered: false, addedAt: Date.now() });
+      updateUser(chatId, { state: null, pendingData: {}, snipeWatches: user.snipeWatches });
+      await bot.sendMessage(chatId, `⚡ *Snipe set!*\n\nToken: \`${truncAddr(pd.snipeToken)}\`\nBuy: ${amt} SUI\nWatching...`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    if (state === 'awaiting_copytrader_wallet') {
+      if (!text.startsWith('0x')) { await bot.sendMessage(chatId, '❌ Invalid wallet address.'); return; }
+      user.copyTraders = user.copyTraders || [];
+      if (user.copyTraders.length >= 3) { await bot.sendMessage(chatId, '❌ Max 3 copy traders.'); return; }
+      user.copyTraders.push({ wallet: text, amount: user.settings.copyAmount, maxPositions: 5, blacklist: [] });
+      updateUser(chatId, { state: null, copyTraders: user.copyTraders });
+      await bot.sendMessage(chatId, `✅ Tracking \`${truncAddr(text)}\``, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    // Raw CA paste detection — if user pastes 0x address, offer buy/sell
+    if (text.startsWith('0x') && text.length > 40) {
+      updateUser(chatId, { pendingData: { coinType: text } });
+      await bot.sendMessage(chatId, `Contract detected: \`${truncAddr(text)}\`\n\nWhat do you want to do?`, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '💰 Buy', callback_data: 'ba:0' }, { text: '💸 Sell', callback_data: 'sp:50' }],
+            [{ text: '🔍 Scan Token', callback_data: 'ca' }],
+          ],
+        },
+      });
+      // Start buy flow on paste
+      await requireUnlocked(chatId, async () => { await startBuyFlow(chatId, text); });
+      return;
+    }
   }
 });
+
+// Sell button handler — shows positions if any, else asks for CA
+async function handleSellButton(chatId, user) {
+  if (!user?.walletAddress) { await bot.sendMessage(chatId, '❌ No wallet. Use /start.'); return; }
+  if (isLocked(user)) { updateUser(chatId, { state: 'awaiting_unlock_pin' }); await bot.sendMessage(chatId, '🔒 Enter PIN:'); return; }
+
+  const positions = user.positions?.filter(p => p.coinType) || [];
+
+  if (positions.length > 0) {
+    // Show positions as tappable sell buttons
+    const posButtons = positions.slice(0, 6).map((p, i) => [{
+      text: `${p.symbol} — ${p.spentSui} SUI`,
+      callback_data: `st:${i}`,
+    }]);
+    posButtons.push([{ text: '📝 Enter CA manually', callback_data: 'ca' }]);
+
+    await bot.sendMessage(chatId, `💸 *Sell — Select Position*\n\nTap a token to sell:`, {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: posButtons },
+    });
+    // Also allow manual CA
+    updateUser(chatId, { state: 'awaiting_sell_ca' });
+  } else {
+    await bot.sendMessage(chatId, `Send the token contract address to sell:\n\n_Example: 0x1234...5678_`, { parse_mode: 'Markdown' });
+    updateUser(chatId, { state: 'awaiting_sell_ca' });
+  }
+}
 
 // ─────────────────────────────────────────────
 // COMMAND HANDLERS
 // ─────────────────────────────────────────────
 
-// /buy
 bot.onText(/\/buy(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const args   = sanitize(match[1] || '');
-
   await requireUnlocked(chatId, async (user) => {
-    if (!args) {
-      await bot.sendMessage(chatId,
-        `*Buy a Token*\n\nUsage: /buy [address or $TICKER] [SUI amount]\n\nExamples:\n• /buy 0x1234...5678 0.5\n• /buy $AGENT 1\n\n✅ Works on ALL DEXes + bonding curve launchpads\n✅ Auto-detects if token is pre or post graduation`,
-        { parse_mode: 'Markdown' }
-      );
-      return;
+    if (!args) { updateUser(chatId, { state: 'awaiting_buy_ca' }); await bot.sendMessage(chatId, `Send the token CA or $TICKER:`); return; }
+    const parts  = args.split(/\s+/);
+    let coinType = parts[0].startsWith('0x') ? parts[0] : (await resolveSymbol(parts[0]));
+    if (!coinType) { await bot.sendMessage(chatId, '❌ Token not found.'); return; }
+    if (parts[1]) {
+      const amtSui = parseFloat(parts[1]);
+      if (!isNaN(amtSui) && amtSui > 0) { updateUser(chatId, { pendingData: { coinType } }); await showBuyConfirm(chatId, coinType, amtSui, null); return; }
     }
-
-    const parts     = args.split(/\s+/);
-    let tokenInput  = parts[0];
-    const amountSui = parseFloat(parts[1] || '0.5');
-
-    if (isNaN(amountSui) || amountSui <= 0) {
-      await bot.sendMessage(chatId, '❌ Invalid amount. Example: /buy $TOKEN 0.5'); return;
-    }
-
-    const loadMsg = await bot.sendMessage(chatId, '🔍 Detecting token and getting best price...');
-
-    let coinType = tokenInput;
-    if (!tokenInput.startsWith('0x')) {
-      coinType = await resolveSymbol(tokenInput);
-      if (!coinType) {
-        await bot.editMessageText('❌ Token not found. Use full contract address.', { chat_id: chatId, message_id: loadMsg.message_id });
-        return;
-      }
-    }
-
-    const [state, meta] = await Promise.all([
-      detectTokenState(coinType),
-      getCoinMeta(coinType),
-    ]);
-    const symbol = meta?.symbol || truncAddr(coinType);
-
-    const amountMist = mistFromSui(amountSui);
-    const { feeMist } = calcFee(amountMist, user);
-
-    let stateInfo = '';
-    let quoteInfo = '';
-
-    if (state.state === 'graduated') {
-      stateInfo = `✅ Listed on DEX — best price via aggregator`;
-      if (state.quote) {
-        const estOut = Number(state.quote.outAmount) / Math.pow(10, meta?.decimals || 9);
-        quoteInfo = `Est. receive: ~${estOut.toFixed(4)} ${symbol}`;
-      }
-    } else if (state.state === 'bonding_curve') {
-      stateInfo = `📊 On bonding curve — ${state.launchpadName}`;
-      if (state.suiRaised > 0 && state.threshold) {
-        const pct = ((state.suiRaised / state.threshold) * 100).toFixed(1);
-        stateInfo += `\nProgress: ${state.suiRaised}/${state.threshold} SUI (${pct}%)`;
-        stateInfo += `\nGraduates to: ${state.destinationDex}`;
-      }
-      quoteInfo = `Buys direct from launchpad contract`;
-    } else {
-      stateInfo = `⚠️ Token state unknown — will try all DEXes`;
-      quoteInfo = `May fail if no liquidity exists`;
-    }
-
-    const quoteText =
-      `💰 *Buy Quote*\n\n` +
-      `Token: *${symbol}*\n` +
-      `Contract: \`${truncAddr(coinType)}\`\n\n` +
-      `${stateInfo}\n\n` +
-      `Trade: ${amountSui} SUI\n` +
-      `Fee (1%): ${suiFloat(feeMist)} SUI\n` +
-      (quoteInfo ? `${quoteInfo}\n` : '') +
-      `Slippage: ${user.settings.slippage}%`;
-
-    if (amountSui >= user.settings.confirmThreshold) {
-      await bot.editMessageText(quoteText, {
-        chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '✅ Confirm Buy', callback_data: `confirm_buy:${chatId}:${coinType}:${amountSui}` },
-            { text: '❌ Cancel',      callback_data: 'cancel' },
-          ]],
-        },
-      });
-    } else {
-      await bot.editMessageText(quoteText + '\n\n_Amount below threshold — executing..._', {
-        chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
-      });
-      await doConfirmedBuy(chatId, coinType, amountSui, loadMsg.message_id);
-    }
+    await startBuyFlow(chatId, coinType);
   });
 });
 
-async function doConfirmedBuy(chatId, coinType, amountSui, existingMsgId) {
-  const execMsg = existingMsgId
-    ? { message_id: existingMsgId }
-    : await bot.sendMessage(chatId, '⚡ Executing buy...');
-
-  try {
-    const res = await executeBuy(chatId, coinType, amountSui);
-    const text =
-      `✅ *Buy Executed!*\n\n` +
-      `Token: *${res.symbol}*\n` +
-      `Spent: ${amountSui} SUI\n` +
-      `Fee: ${res.feeSui} SUI\n` +
-      (res.estOut !== '?' ? `Received: ~${res.estOut} ${res.symbol}\n` : '') +
-      `Route: ${res.route}\n` +
-      (res.state === 'bonding_curve'
-        ? `📊 Bought on ${res.launchpadName} bonding curve\n` +
-          (res.progress ? `Progress: ${(res.progress * 100).toFixed(1)}% to graduation\n` : '')
-        : '') +
-      `\n🔗 [View TX](${SUISCAN_TX}${res.digest})`;
-    await bot.editMessageText(text, { chat_id: chatId, message_id: execMsg.message_id, parse_mode: 'Markdown' });
-  } catch (e) {
-    await bot.editMessageText(`❌ Buy failed: ${e.message?.slice(0, 180)}`, { chat_id: chatId, message_id: execMsg.message_id });
-  }
-}
-
-// /sell
 bot.onText(/\/sell(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const args   = sanitize(match[1] || '');
-
   await requireUnlocked(chatId, async (user) => {
-    if (!args) {
-      await bot.sendMessage(chatId,
-        `*Sell a Token*\n\nUsage: /sell [address] [% or "all"]\n\nExamples:\n• /sell 0x1234... 50%\n• /sell 0x1234... all`,
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
-
+    if (!args) { await handleSellButton(chatId, user); return; }
     const parts    = args.split(/\s+/);
-    const coinType = parts[0];
-    const amtStr   = (parts[1] || 'all').toLowerCase().replace('%', '');
-    const pct      = amtStr === 'all' ? 100 : parseFloat(amtStr);
-
-    if (isNaN(pct) || pct <= 0 || pct > 100) {
-      await bot.sendMessage(chatId, '❌ Invalid percentage. Example: /sell 0x... 50'); return;
+    const coinType = parts[0].startsWith('0x') ? parts[0] : (await resolveSymbol(parts[0]));
+    if (!coinType) { await bot.sendMessage(chatId, '❌ Token not found.'); return; }
+    const meta = await getCoinMeta(coinType) || {};
+    if (parts[1]) {
+      const pctStr = parts[1].toLowerCase().replace('%', '');
+      const pct    = pctStr === 'all' ? 100 : parseFloat(pctStr);
+      if (!isNaN(pct)) { updateUser(chatId, { pendingData: { coinType, symbol: meta.symbol } }); await showSellConfirm(chatId, coinType, pct, null); return; }
     }
-
-    const loadMsg = await bot.sendMessage(chatId, '🔍 Checking balance and state...');
-
-    const coins = await getOwnedCoins(user.walletAddress, coinType).catch(() => []);
-    if (!coins.length) {
-      await bot.editMessageText('❌ No balance of this token.', { chat_id: chatId, message_id: loadMsg.message_id });
-      return;
-    }
-
-    const [state, meta] = await Promise.all([detectTokenState(coinType), getCoinMeta(coinType)]);
-    const symbol = meta?.symbol || truncAddr(coinType);
-
-    const totalBal   = coins.reduce((s, c) => s + BigInt(c.balance), 0n);
-    const sellAmt    = (totalBal * BigInt(Math.floor(pct))) / 100n;
-    const displayAmt = (Number(sellAmt) / Math.pow(10, meta?.decimals || 9)).toFixed(4);
-
-    const stateLabel = state.state === 'bonding_curve'
-      ? `📊 On ${state.launchpadName} — sells to bonding curve contract`
-      : `✅ DEX — best price via 7K aggregator`;
-
-    const quoteText =
-      `💸 *Sell Quote*\n\n` +
-      `Token: *${symbol}*\n` +
-      `Selling: ${pct}% (${displayAmt} ${symbol})\n` +
-      `${stateLabel}\n` +
-      `Slippage: ${user.settings.slippage}%`;
-
-    await bot.editMessageText(quoteText, {
-      chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [[
-          { text: '✅ Confirm Sell', callback_data: `confirm_sell:${chatId}:${coinType}:${pct}` },
-          { text: '❌ Cancel',       callback_data: 'cancel' },
-        ]],
-      },
-    });
+    await startSellFlow(chatId, coinType, meta.symbol || truncAddr(coinType));
   });
 });
 
-async function doConfirmedSell(chatId, coinType, pct) {
-  const execMsg = await bot.sendMessage(chatId, '⚡ Executing sell...');
-  try {
-    const res = await executeSell(chatId, coinType, pct);
-    await bot.editMessageText(
-      `✅ *Sell Executed!*\n\nToken: ${res.symbol}\nSold: ${res.pct}%\nRoute: ${res.route}\nEst. SUI: ${res.estSui}\nFee: ${res.feeSui} SUI\n\n🔗 [View TX](${SUISCAN_TX}${res.digest})`,
-      { chat_id: chatId, message_id: execMsg.message_id, parse_mode: 'Markdown' }
-    );
-  } catch (e) {
-    await bot.editMessageText(`❌ Sell failed: ${e.message?.slice(0, 180)}`, { chat_id: chatId, message_id: execMsg.message_id });
-  }
-}
-
-// /scan
 bot.onText(/\/scan(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const ct = sanitize(match[1] || '');
-  if (!ct) {
-    await bot.sendMessage(chatId, `*Token Scanner*\n\nUsage: /scan [contract address]`, { parse_mode: 'Markdown' });
-    return;
-  }
+  const ct     = sanitize(match[1] || '');
+  if (!ct) { updateUser(chatId, { state: 'awaiting_scan_ca' }); await bot.sendMessage(chatId, `Send the token contract address to scan:`); return; }
+  const coinType = ct.startsWith('0x') ? ct : (await resolveSymbol(ct));
+  if (!coinType) { await bot.sendMessage(chatId, '❌ Token not found.'); return; }
   const m = await bot.sendMessage(chatId, '🔍 Scanning token...');
-  try {
-    const scan = await scanToken(ct);
-    await bot.editMessageText(formatScanReport(scan), { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' });
-  } catch (e) {
-    await bot.editMessageText(`❌ Scan failed: ${e.message?.slice(0, 100)}`, { chat_id: chatId, message_id: m.message_id });
-  }
+  try { const scan = await scanToken(coinType); await bot.editMessageText(formatScanReport(scan), { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' }); }
+  catch (e) { await bot.editMessageText(`❌ Scan failed: ${e.message?.slice(0, 100)}`, { chat_id: chatId, message_id: m.message_id }); }
 });
 
-// /balance
 bot.onText(/\/balance/, async (msg) => {
   const chatId = msg.chat.id;
   await requireUnlocked(chatId, async (user) => {
@@ -1843,141 +1582,108 @@ bot.onText(/\/balance/, async (msg) => {
     try {
       const bals   = await getAllBalances(user.walletAddress);
       const suiBal = bals.find(b => b.coinType === SUI_TYPE);
-      const lines  = [`💼 *Wallet Balances*\n\`${truncAddr(user.walletAddress)}\`\n`];
+      const lines  = [`💼 *Wallet*\n\`${truncAddr(user.walletAddress)}\`\n`];
       lines.push(`🔵 SUI: ${suiBal ? suiFloat(suiBal.totalBalance) : '0.0000'}`);
       const others = bals.filter(b => b.coinType !== SUI_TYPE && Number(b.totalBalance) > 0);
       for (const bal of others.slice(0, 15)) {
         const meta = await getCoinMeta(bal.coinType).catch(() => null);
-        const sym  = meta?.symbol || truncAddr(bal.coinType);
-        const amt  = (Number(bal.totalBalance) / Math.pow(10, meta?.decimals || 9)).toFixed(4);
-        lines.push(`• ${sym}: ${amt}`);
+        lines.push(`• ${meta?.symbol || truncAddr(bal.coinType)}: ${(Number(bal.totalBalance) / Math.pow(10, meta?.decimals || 9)).toFixed(4)}`);
       }
-      if (!others.length) lines.push('\n_No other tokens._');
+      if (!others.length) lines.push('\n_No other tokens_');
       await bot.editMessageText(lines.join('\n'), { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' });
-    } catch (e) {
-      await bot.editMessageText(`❌ ${e.message?.slice(0, 100)}`, { chat_id: chatId, message_id: m.message_id });
-    }
+    } catch (e) { await bot.editMessageText(`❌ ${e.message?.slice(0, 100)}`, { chat_id: chatId, message_id: m.message_id }); }
   });
 });
 
-// /positions
 bot.onText(/\/positions/, async (msg) => {
   const chatId = msg.chat.id;
   await requireUnlocked(chatId, async (user) => {
     if (!user.positions?.length) { await bot.sendMessage(chatId, '📊 No open positions.'); return; }
     const m = await bot.sendMessage(chatId, '📊 Loading positions...');
-    const lines = ['📊 *Open Positions*\n'];
+    await bot.deleteMessage(chatId, m.message_id).catch(() => {});
+
     for (const pos of user.positions) {
-      const pnl    = await getPositionPnl(pos);
-      const pnlStr = pnl ? `${pnl.pnl >= 0 ? '+' : ''}${pnl.pnl.toFixed(4)} SUI (${pnl.pnlPct >= 0 ? '+' : ''}${pnl.pnlPct.toFixed(2)}%)` : 'N/A';
-      const em     = pnl ? (pnl.pnl >= 0 ? '🟢' : '🔴') : (pos.source === 'bonding_curve' ? '📊' : '⚪');
-      lines.push(
-        `${em} *${pos.symbol}*\n` +
-        `  Spent: ${pos.spentSui} SUI\n` +
-        `  P&L: ${pnlStr}\n` +
-        `  TP: ${pos.tp ? pos.tp + '%' : 'None'} | SL: ${pos.sl ? pos.sl + '%' : 'None'}` +
-        (pos.source === 'bonding_curve' ? `\n  📊 ${pos.launchpad}` : '')
-      );
+      try {
+        const pnl = await getPositionPnl(pos);
+        if (pnl) {
+          // Send PnL chart image
+          const imgUrl  = buildPnlChartUrl(pos.symbol, pnl.pnlPct, pos.spentSui, pnl.currentSui);
+          const caption = buildPnlCaption(pos, pnl) +
+            `\n\nTP: ${pos.tp ? pos.tp + '%' : 'None'} | SL: ${pos.sl ? pos.sl + '%' : 'None'}` +
+            (pos.source === 'bonding_curve' ? `\n📊 ${pos.launchpad}` : '');
+          try {
+            await bot.sendPhoto(chatId, imgUrl, { caption, parse_mode: 'Markdown' });
+          } catch {
+            await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
+          }
+        } else {
+          const em = pos.source === 'bonding_curve' ? '📊' : '⚪';
+          await bot.sendMessage(chatId,
+            `${em} *${pos.symbol}*\nSpent: ${pos.spentSui} SUI\n` +
+            (pos.source === 'bonding_curve' ? `📊 ${pos.launchpad} bonding curve\n` : '') +
+            `TP: ${pos.tp || 'None'} | SL: ${pos.sl || 'None'}`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      } catch {
+        await bot.sendMessage(chatId, `⚪ *${pos.symbol}* — ${pos.spentSui} SUI invested`, { parse_mode: 'Markdown' });
+      }
     }
-    await bot.editMessageText(lines.join('\n\n'), { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' });
   });
 });
 
-// /snipe
 bot.onText(/\/snipe(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   await requireUnlocked(chatId, async (user) => {
     const token = sanitize(match[1] || '');
-    if (!token) {
-      await bot.sendMessage(chatId,
-        `⚡ *Sniper*\n\nUsage: /snipe [token address]\n\nBot buys the instant:\n• A bonding curve is created on any launchpad\n• OR a DEX pool appears\n• OR a launchpad token graduates to DEX\n\nExample:\n/snipe 0x1234...5678`,
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
+    if (!token) { await bot.sendMessage(chatId, `⚡ *Sniper*\n\nUsage: /snipe [token address]\n\nBot buys instantly when a pool or bonding curve is created.\n\nExample:\n/snipe 0x1234...5678`, { parse_mode: 'Markdown' }); return; }
     const pd = user.pendingData || {};
-    pd.snipeToken = token;
-    pd.snipeMode  = 'any';
+    pd.snipeToken = token; pd.snipeMode = 'any';
     updateUser(chatId, { state: 'awaiting_snipe_amount', pendingData: pd });
-    await bot.sendMessage(chatId,
-      `Token: \`${truncAddr(token)}\`\n\nHow much SUI to buy when found? (e.g. 0.5)`,
-      { parse_mode: 'Markdown' }
-    );
+    await bot.sendMessage(chatId, `Token: \`${truncAddr(token)}\`\n\nHow much SUI to buy when pool is found?`, { parse_mode: 'Markdown' });
   });
 });
 
-// /copytrader
 bot.onText(/\/copytrader(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   await requireUnlocked(chatId, async (user) => {
     const arg = sanitize(match[1] || '').toLowerCase();
-
-    if (arg === 'stop') {
-      updateUser(chatId, { copyTraders: [] });
-      await bot.sendMessage(chatId, '✅ All copy traders stopped.');
-      return;
-    }
-
+    if (arg === 'stop') { updateUser(chatId, { copyTraders: [] }); await bot.sendMessage(chatId, '✅ All copy traders stopped.'); return; }
     if (!arg || arg === 'list') {
-      if (!user.copyTraders?.length) {
-        await bot.sendMessage(chatId,
-          `🔁 *Copy Trader*\n\nNo wallets tracked.\n\nUsage: /copytrader [wallet address]\nStop all: /copytrader stop`,
-          { parse_mode: 'Markdown' }
-        );
-      } else {
-        const lines = user.copyTraders.map((ct, i) =>
-          `${i + 1}. \`${truncAddr(ct.wallet)}\` — ${ct.amount} SUI/trade`
-        ).join('\n');
-        await bot.sendMessage(chatId,
-          `🔁 *Copy Traders (${user.copyTraders.length}/3)*\n\n${lines}\n\nStop all: /copytrader stop`,
-          { parse_mode: 'Markdown' }
-        );
-      }
+      if (!user.copyTraders?.length) { await bot.sendMessage(chatId, `🔁 *Copy Trader*\n\nNo wallets tracked.\n\nUsage: /copytrader [wallet]\nStop: /copytrader stop`, { parse_mode: 'Markdown' }); return; }
+      const lines = user.copyTraders.map((ct, i) => `${i + 1}. \`${truncAddr(ct.wallet)}\` — ${ct.amount} SUI/trade`).join('\n');
+      await bot.sendMessage(chatId, `🔁 *Copy Traders (${user.copyTraders.length}/3)*\n\n${lines}\n\nStop: /copytrader stop`, { parse_mode: 'Markdown' });
       return;
     }
-
     if (arg.startsWith('0x')) {
       user.copyTraders = user.copyTraders || [];
-      if (user.copyTraders.length >= 3) {
-        await bot.sendMessage(chatId, '❌ Max 3 copy traders. Use /copytrader stop first.'); return;
-      }
+      if (user.copyTraders.length >= 3) { await bot.sendMessage(chatId, '❌ Max 3 copy traders.'); return; }
       user.copyTraders.push({ wallet: arg, amount: user.settings.copyAmount, maxPositions: 5, blacklist: [] });
       updateUser(chatId, { copyTraders: user.copyTraders });
-      await bot.sendMessage(chatId,
-        `✅ Now tracking: \`${truncAddr(arg)}\`\nAmount: ${user.settings.copyAmount} SUI per trade\n\nStop: /copytrader stop`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.sendMessage(chatId, `✅ Tracking \`${truncAddr(arg)}\``, { parse_mode: 'Markdown' });
       return;
     }
-
     updateUser(chatId, { state: 'awaiting_copytrader_wallet' });
     await bot.sendMessage(chatId, 'Enter the wallet address to copy:');
   });
 });
 
-// /settings
 bot.onText(/\/settings/, async (msg) => {
   const chatId = msg.chat.id;
   await requireUnlocked(chatId, async (user) => {
     const s = user.settings;
+    const amounts = (s.buyAmounts || DEFAULT_BUY_AMOUNTS).join(', ');
     await bot.sendMessage(chatId,
-      `⚙️ *Settings*\n\nSlippage: ${s.slippage}%\nConfirm trades ≥: ${s.confirmThreshold} SUI\nCopy amount: ${s.copyAmount} SUI\nTP default: ${s.tpDefault || 'None'}\nSL default: ${s.slDefault || 'None'}`,
+      `⚙️ *Settings*\n\nSlippage: ${s.slippage}%\nConfirm ≥: ${s.confirmThreshold} SUI\nCopy amount: ${s.copyAmount} SUI\nQuick-buy amounts: ${amounts} SUI\nTP default: ${s.tpDefault || 'None'}\nSL default: ${s.slDefault || 'None'}`,
       {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [
-              { text: '0.5% slip', callback_data: 'slip:0.5' },
-              { text: '1% slip',   callback_data: 'slip:1'   },
-              { text: '2% slip',   callback_data: 'slip:2'   },
-              { text: '5% slip',   callback_data: 'slip:5'   },
-            ],
-            [
-              { text: 'Confirm ≥0.1 SUI', callback_data: 'confirm_thresh:0.1' },
-              { text: 'Confirm ≥0.5 SUI', callback_data: 'confirm_thresh:0.5' },
-              { text: 'Confirm ≥1 SUI',   callback_data: 'confirm_thresh:1'   },
-              { text: 'Confirm ≥5 SUI',   callback_data: 'confirm_thresh:5'   },
-            ],
+            [{ text: '📉 Slippage', callback_data: 'ca' }],
+            [{ text: '0.5%', callback_data: 'slip:0.5' }, { text: '1%', callback_data: 'slip:1' }, { text: '2%', callback_data: 'slip:2' }, { text: '5%', callback_data: 'slip:5' }],
+            [{ text: '💰 Edit Quick-Buy Amounts', callback_data: 'edit_buy_amounts' }],
+            [{ text: '🎯 Confirm Threshold', callback_data: 'ca' }],
+            [{ text: '0.1 SUI', callback_data: 'ct:0.1' }, { text: '0.5 SUI', callback_data: 'ct:0.5' }, { text: '1 SUI', callback_data: 'ct:1' }, { text: '5 SUI', callback_data: 'ct:5' }],
           ],
         },
       }
@@ -1985,51 +1691,37 @@ bot.onText(/\/settings/, async (msg) => {
   });
 });
 
-// /referral
 bot.onText(/\/referral/, async (msg) => {
   const chatId = msg.chat.id;
   const user   = getUser(chatId) || createUser(chatId);
   const link   = `https://t.me/AGENTTRADINBOT?start=${user.referralCode}`;
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  const active = Object.values(usersDB).filter(u =>
-    u.referredBy === user.walletAddress && u.lastActivity > cutoff
-  ).length;
+  const active = Object.values(usersDB).filter(u => u.referredBy === user.walletAddress && u.lastActivity > cutoff).length;
   await bot.sendMessage(chatId,
-    `🔗 *Referral Dashboard*\n\n` +
-    `Code: \`${user.referralCode}\`\n` +
-    `Link: \`${link}\`\n\n` +
-    `👥 Total referrals: ${user.referralCount || 0}\n` +
-    `⚡ Active last 30d: ${active}\n` +
-    `💰 Total earned: ${(user.referralEarningsTotal || 0).toFixed(4)} SUI\n\n` +
-    `*Share to earn 25% of all your referrals' fees — forever, paid on-chain in every trade.*`,
+    `🔗 *Referral Dashboard*\n\nCode: \`${user.referralCode}\`\nLink: \`${link}\`\n\n👥 Total: ${user.referralCount || 0}\n⚡ Active 30d: ${active}\n💰 Earned: ${(user.referralEarningsTotal || 0).toFixed(4)} SUI\n\n*Earn 25% of every fee your referrals pay — forever.*`,
     { parse_mode: 'Markdown' }
   );
 });
 
-// /help
 bot.onText(/\/help/, async (msg) => {
   await bot.sendMessage(msg.chat.id,
     `🤖 *AGENT TRADING BOT*\n\n` +
     `*Trading*\n` +
-    `/buy [token] [SUI] — Buy on best DEX or bonding curve\n` +
-    `/sell [token] [% or all] — Sell via best route\n\n` +
+    `/buy [ca] [sui] — Buy any token\n` +
+    `/sell [ca] [%] — Sell with percentage control\n\n` +
     `*Advanced*\n` +
-    `/snipe [token] — Auto-buy on pool creation or launchpad launch\n` +
-    `/copytrader [wallet] — Mirror a wallet's buys\n\n` +
+    `/snipe [ca] — Snipe on pool creation\n` +
+    `/copytrader [wallet] — Copy wallet trades\n\n` +
     `*Info*\n` +
-    `/scan [address] — Full token safety scan\n` +
-    `/balance — All wallet balances\n` +
-    `/positions — Open positions & P&L\n\n` +
+    `/scan [ca] — Full token safety scan\n` +
+    `/balance — Wallet balances\n` +
+    `/positions — Positions with P&L charts\n\n` +
     `*Account*\n` +
-    `/referral — Your referral link & earnings\n` +
-    `/settings — Slippage, confirm threshold\n\n` +
-    `*Supported DEXes (via 7K aggregator)*\n` +
-    `Cetus • Turbos • Aftermath • Kriya • FlowX • DeepBook • BlueMove\n\n` +
-    `*Supported Launchpads (bonding curves)*\n` +
-    `MovePump • hop.fun • moonbags • Turbos.fun • blast.fun\n\n` +
-    `*Fees*\n` +
-    `• 1% on all trades — collected on-chain in same TX\n` +
-    `• Refer friends → earn 25% of their fees forever`,
+    `/referral — Referral earnings\n` +
+    `/settings — Slippage, buy amounts\n\n` +
+    `*DEXes:* Cetus • Turbos • Aftermath • Kriya • FlowX • DeepBook\n` +
+    `*Launchpads:* MovePump • hop.fun • MoonBags • Turbos.fun • blast.fun\n\n` +
+    `*Fee:* 1% per trade — referrers earn 25% forever`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -2044,44 +1736,35 @@ bot.on('polling_error', (e) => {
 });
 
 process.on('uncaughtException', (e) => {
-  console.error('Uncaught exception:', e);
+  console.error('Uncaught:', e);
   if (ADMIN_CHAT_ID) bot.sendMessage(ADMIN_CHAT_ID, `🚨 Crash: ${e.message?.slice(0, 150)}`).catch(() => {});
 });
 
-process.on('unhandledRejection', (r) => console.error('Unhandled rejection:', r));
+process.on('unhandledRejection', r => console.error('Unhandled:', r));
 
 async function main() {
-  if (!TG_BOT_TOKEN)                          throw new Error('TG_BOT_TOKEN is required');
-  if (!ENCRYPT_KEY || ENCRYPT_KEY.length !== 64) throw new Error('ENCRYPT_KEY must be 64 hex chars (32 bytes). Generate: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+  if (!TG_BOT_TOKEN)                              throw new Error('TG_BOT_TOKEN required');
+  if (!ENCRYPT_KEY || ENCRYPT_KEY.length !== 64)  throw new Error('ENCRYPT_KEY must be 64 hex chars');
 
   loadUsers();
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  AGENT TRADING BOT v2 — Starting');
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`Users loaded: ${Object.keys(usersDB).length}`);
-  console.log(`RPC: ${RPC_URL}`);
-  console.log(`Dev wallet: ${truncAddr(DEV_WALLET)}`);
-  console.log(`Fee: ${FEE_BPS / 100}% (referrer share: ${REF_SHARE * 100}%)`);
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('  AGENT TRADING BOT v3 — Starting');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(`Users: ${Object.keys(usersDB).length} | RPC: ${RPC_URL}`);
 
-  // Pre-warm SDKs
-  console.log('Initializing SDKs...');
-  await sdk7k().then(() => console.log('  ✅ 7K Aggregator SDK')).catch(e => console.warn('  ⚠️ 7K SDK:', e.message));
-  await sdkCetus().then(() => console.log('  ✅ Cetus CLMM SDK')).catch(e => console.warn('  ⚠️ Cetus SDK:', e.message));
-  await sdkTurbos().then(() => console.log('  ✅ Turbos SDK')).catch(e => console.warn('  ⚠️ Turbos SDK:', e.message));
+  await sdk7k().then(() => console.log('✅ 7K Aggregator')).catch(e => console.warn('⚠️ 7K:', e.message));
+  await sdkCetus().then(() => console.log('✅ Cetus SDK')).catch(e => console.warn('⚠️ Cetus:', e.message));
+  await sdkTurbos().then(() => console.log('✅ Turbos SDK')).catch(e => console.warn('⚠️ Turbos:', e.message));
 
-  // Background loops
   setInterval(checkInactivity, 60_000);
   positionMonitor().catch(e => console.error('Position monitor crashed:', e));
   sniperEngine().catch(e => console.error('Sniper crashed:', e));
   copyTraderEngine().catch(e => console.error('Copy trader crashed:', e));
 
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  Bot is live. Listening for messages...');
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-
-  if (ADMIN_CHAT_ID) {
-    bot.sendMessage(ADMIN_CHAT_ID, '🟢 AGENT TRADING BOT v2 is online.').catch(() => {});
-  }
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('  Bot is live!');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  if (ADMIN_CHAT_ID) bot.sendMessage(ADMIN_CHAT_ID, '🟢 AGENT TRADING BOT v3 online.').catch(() => {});
 }
 
-main().catch(e => { console.error('Fatal startup error:', e); process.exit(1); });
+main().catch(e => { console.error('Fatal:', e); process.exit(1); });
