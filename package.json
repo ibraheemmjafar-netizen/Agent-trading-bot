@@ -11,7 +11,7 @@
   "dependencies": {
     "@7kprotocol/sdk-ts": "latest",
     "@cetusprotocol/cetus-sui-clmm-sdk": "latest",
-    "@mysten/sui": "^2.0.0",
+    "@mysten/sui": "1.21.2",
     "aftermath-ts-sdk": "latest",
     "bn.js": "^5.2.1",
     "node-telegram-bot-api": "^0.66.0",
