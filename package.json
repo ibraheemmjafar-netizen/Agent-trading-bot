@@ -11,11 +11,13 @@
   "dependencies": {
     "@7kprotocol/sdk-ts": "latest",
     "@cetusprotocol/cetus-sui-clmm-sdk": "latest",
-    "@mysten/sui": "^1.0.0",
+    "@mysten/sui": "^2.0.0",
     "aftermath-ts-sdk": "latest",
     "bn.js": "^5.2.1",
     "node-telegram-bot-api": "^0.66.0",
     "turbos-clmm-sdk": "latest"
   },
-  "engines": { "node": ">=18.0.0" }
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
