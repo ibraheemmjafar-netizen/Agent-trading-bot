@@ -197,8 +197,16 @@ let _7k = null;
 async function sdk7k() {
   if (_7k) return _7k;
   const mod = await import('@7kprotocol/sdk-ts');
-  mod.setSuiClient(suiClient);
-  _7k = { getQuote: mod.getQuote, buildTx: mod.buildTx };
+  // Handle CJS interop — named exports may be on mod or mod.default
+  const lib = (mod.default && typeof mod.default === 'object') ? mod.default : mod;
+  const setSC  = typeof mod.setSuiClient === 'function' ? mod.setSuiClient
+               : typeof lib.setSuiClient === 'function' ? lib.setSuiClient
+               : null;
+  if (setSC) setSC(suiClient);
+  const getQuote = mod.getQuote ?? lib.getQuote;
+  const buildTx  = mod.buildTx  ?? lib.buildTx;
+  if (!getQuote) throw new Error('7K SDK: getQuote not found — check package version');
+  _7k = { getQuote, buildTx };
   return _7k;
 }
 
@@ -1086,6 +1094,208 @@ function fmt(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
   if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
   return n.toFixed(0);
+}
+
+// ─────────────────────────────────────────────
+// POSITIONS — add, PnL calculation
+// ─────────────────────────────────────────────
+
+function addPosition(chatId, pos) {
+  const user = getUser(chatId);
+  if (!user) return;
+  user.positions = user.positions || [];
+  user.positions.push({
+    id: randomBytes(4).toString('hex'),
+    coinType: pos.coinType, symbol: pos.symbol,
+    entryPriceSui: pos.entryPriceSui || 0,
+    amountTokens: pos.amountTokens || 0,
+    decimals: pos.decimals || 9,
+    spentSui: pos.spentSui,
+    tp: pos.tp || null, sl: pos.sl || null,
+    source: pos.source || 'dex',
+    launchpad: pos.launchpad || null,
+    openedAt: Date.now(),
+  });
+  saveUsers();
+}
+
+async function getPositionPnl(pos) {
+  if (pos.source === 'bonding_curve' || !pos.amountTokens || pos.amountTokens <= 0) return null;
+  try {
+    const k   = await sdk7k();
+    const dec = pos.decimals || 9;
+    const amt = BigInt(Math.floor(pos.amountTokens * Math.pow(10, dec)));
+    const q   = await k.getQuote({ tokenIn: pos.coinType, tokenOut: SUI_TYPE, amountIn: amt.toString() });
+    if (!q || !q.outAmount) return null;
+    const currentSui = Number(q.outAmount) / 1e9;
+    const pnl        = currentSui - pos.spentSui;
+    return { currentSui, pnl, pnlPct: (pnl / pos.spentSui) * 100 };
+  } catch { return null; }
+}
+
+// ─────────────────────────────────────────────
+// PnL IMAGE — QuickChart.io
+// ─────────────────────────────────────────────
+
+function buildPnlChartUrl(symbol, pnlPct, spentSui, currentSui) {
+  const isProfit = pnlPct >= 0;
+  const color    = isProfit ? '#00e676' : '#ff1744';
+  const bgColor  = isProfit ? '#0d1f14' : '#1f0d0d';
+  const pts = 24; const data = [];
+  for (let i = 0; i <= pts; i++) {
+    const t = i / pts;
+    const noise = (Math.sin(i * 1.3) * 0.15 + Math.cos(i * 2.7) * 0.1) * Math.abs(pnlPct) / 200;
+    data.push(+(1 + (pnlPct / 100) * t + noise * Math.sqrt(t)).toFixed(4));
+  }
+  const config = {
+    type: 'line',
+    data: { labels: data.map((_, i) => i), datasets: [{ data, borderColor: color, backgroundColor: `${color}20`, fill: true, tension: 0.5, borderWidth: 3, pointRadius: 0 }] },
+    options: { animation: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false, min: Math.min(...data) * 0.97, max: Math.max(...data) * 1.03 } } },
+  };
+  return `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(config))}&w=600&h=250&bkg=${encodeURIComponent(bgColor)}&f=png`;
+}
+
+function buildPnlBar(pct) {
+  const f = Math.min(10, Math.round(Math.abs(Math.max(-100, Math.min(200, pct))) / 20));
+  return (pct >= 0 ? '🟩' : '🟥').repeat(f) + '⬛'.repeat(10 - f);
+}
+
+function buildPnlCaption(pos, pnl) {
+  const sign = pnl.pnl >= 0 ? '+' : '';
+  return (
+    `${pnl.pnl >= 0 ? '🚀' : '📉'} *${pos.symbol}*\n\n` +
+    `Entry:    ${(pos.entryPriceSui || 0).toFixed(8)} SUI\n` +
+    `Invested: ${pos.spentSui} SUI\n` +
+    `Value:    ${pnl.currentSui.toFixed(4)} SUI\n\n` +
+    `P&L: *${sign}${pnl.pnl.toFixed(4)} SUI  (${sign}${pnl.pnlPct.toFixed(2)}%)*\n` +
+    buildPnlBar(pnl.pnlPct)
+  );
+}
+
+// ─────────────────────────────────────────────
+// AUTO TP/SL MONITOR
+// ─────────────────────────────────────────────
+
+async function positionMonitor() {
+  while (true) {
+    await sleep(30_000);
+    for (const [uid, user] of Object.entries(usersDB)) {
+      if (!user.walletAddress || !user.positions?.length || isLocked(user)) continue;
+      for (const pos of [...user.positions]) {
+        if (pos.source === 'bonding_curve') continue;
+        try {
+          const pnl = await getPositionPnl(pos);
+          if (!pnl) continue;
+          let reason = '';
+          if (pos.tp && pnl.pnlPct >= pos.tp)      reason = `✅ Take Profit! +${pnl.pnlPct.toFixed(2)}%`;
+          else if (pos.sl && pnl.pnlPct <= -pos.sl) reason = `🛑 Stop Loss! ${pnl.pnlPct.toFixed(2)}%`;
+          if (!reason) continue;
+          try {
+            const res     = await executeSell(uid, pos.coinType, 100);
+            const caption = `${reason}\n\n${buildPnlCaption(pos, pnl)}\n\n🔗 [View TX](${SUISCAN_TX}${res.digest})`;
+            try { await bot.sendPhoto(uid, buildPnlChartUrl(pos.symbol, pnl.pnlPct, pos.spentSui, pnl.currentSui), { caption, parse_mode: 'Markdown' }); }
+            catch { await bot.sendMessage(uid, caption, { parse_mode: 'Markdown' }); }
+          } catch (e) { bot.sendMessage(uid, `⚠️ Auto-sell failed for ${pos.symbol}: ${e.message?.slice(0, 80)}`); }
+        } catch {}
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// SNIPER ENGINE
+// ─────────────────────────────────────────────
+
+async function sniperEngine() {
+  while (true) {
+    await sleep(2_000);
+    for (const [uid, user] of Object.entries(usersDB)) {
+      if (!user.snipeWatches?.length || isLocked(user)) continue;
+      for (const watch of [...user.snipeWatches]) {
+        if (watch.triggered) continue;
+        try {
+          stateCache.delete(watch.coinType);
+          const state = await detectTokenState(watch.coinType);
+          const fire  = watch.mode === 'graduation'
+            ? state.state === 'graduated'
+            : (state.state === 'graduated' || state.state === 'bonding_curve');
+          if (!fire) continue;
+          watch.triggered = true; saveUsers();
+          const lbl = state.state === 'bonding_curve' ? `📊 ${state.launchpadName}` : `✅ DEX pool detected`;
+          bot.sendMessage(uid, `⚡ *Snipe triggered!*\n\nToken: \`${truncAddr(watch.coinType)}\`\n${lbl}\n\nBuying ${watch.buyAmount} SUI...`, { parse_mode: 'Markdown' });
+          try {
+            const res = await executeBuy(uid, watch.coinType, watch.buyAmount);
+            bot.sendMessage(uid, `⚡ *Sniped!*\n\nToken: ${res.symbol}\nSpent: ${watch.buyAmount} SUI\nFee: ${res.feeSui} SUI\n\n🔗 [View TX](${SUISCAN_TX}${res.digest})`, { parse_mode: 'Markdown' });
+          } catch (e) { bot.sendMessage(uid, `❌ Snipe failed: ${e.message?.slice(0, 120)}`); }
+        } catch {}
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// COPY TRADER ENGINE
+// ─────────────────────────────────────────────
+
+const copyLastSeen = {};
+
+async function copyTraderEngine() {
+  while (true) {
+    await sleep(5_000);
+    const watchMap = new Map();
+    for (const [uid, user] of Object.entries(usersDB)) {
+      if (!user.copyTraders?.length || isLocked(user)) continue;
+      for (const ct of user.copyTraders) {
+        if (!watchMap.has(ct.wallet)) watchMap.set(ct.wallet, []);
+        watchMap.get(ct.wallet).push({ user, config: ct, uid });
+      }
+    }
+    for (const [wallet, watchers] of watchMap) {
+      try {
+        const txs = await suiClient.queryTransactionBlocks({
+          filter: { FromAddress: wallet }, limit: 5, order: 'descending',
+          options: { showEffects: true, showEvents: true },
+        });
+        const lastSeen = copyLastSeen[wallet];
+        const newTxs   = lastSeen ? txs.data.filter(t => t.digest !== lastSeen) : txs.data.slice(0, 1);
+        if (txs.data.length > 0) copyLastSeen[wallet] = txs.data[0].digest;
+        for (const tx of newTxs.reverse()) {
+          const swapEv = (tx.events || []).find(e =>
+            e.type?.toLowerCase().includes('swap') || e.type?.toLowerCase().includes('trade')
+          );
+          if (!swapEv) continue;
+          const pj = swapEv.parsedJson || {};
+          const boughtCoin = pj.coin_type_out || pj.token_out || pj.coin_b_type || pj.coinTypeOut || null;
+          if (!boughtCoin || boughtCoin === SUI_TYPE) continue;
+          for (const { user, config, uid } of watchers) {
+            try {
+              if (config.blacklist?.includes(boughtCoin)) continue;
+              const holding = await getOwnedCoins(user.walletAddress, boughtCoin);
+              if (holding.length > 0) continue;
+              if ((user.positions || []).length >= (config.maxPositions || 5)) continue;
+              const copyAmt = config.amount || user.settings.copyAmount;
+              bot.sendMessage(uid, `🔁 *Copy Trade*\n\nWallet: \`${truncAddr(wallet)}\`\nBuying: \`${truncAddr(boughtCoin)}\`\nAmount: ${copyAmt} SUI`, { parse_mode: 'Markdown' });
+              const res = await executeBuy(uid, boughtCoin, copyAmt);
+              bot.sendMessage(uid, `✅ *Copied!*\n\nToken: ${res.symbol}\nFee: ${res.feeSui} SUI\n\n🔗 [TX](${SUISCAN_TX}${res.digest})`, { parse_mode: 'Markdown' });
+            } catch (e) { bot.sendMessage(uid, `❌ Copy failed: ${e.message?.slice(0, 100)}`); }
+          }
+        }
+      } catch {}
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// SYMBOL RESOLVER ($TICKER → coinType)
+// ─────────────────────────────────────────────
+
+async function resolveSymbol(ticker) {
+  const sym = ticker.replace(/^\$/, '').toUpperCase();
+  try {
+    const r = await fetchTimeout(`https://api-sui.cetus.zone/v2/sui/tokens?symbol=${sym}`, {}, 5000);
+    if (r.ok) { const d = await r.json(); if (d.data?.[0]?.coin_type) return d.data[0].coin_type; }
+  } catch {}
+  return null;
 }
 
 // ─────────────────────────────────────────────
