@@ -60,21 +60,7 @@ function encryptKey(privateKey) {
   return iv.toString('hex') + ':' + enc.toString('hex');
 }
 
-function decryptKey(stored) {
-  const [ivHex, encHex] = stored.split(':');
-  const keyBuf   = Buffer.from(ENCRYPT_KEY, 'hex');
-  const decipher = createDecipheriv('aes-256-cbc', Buffer.from(ivHex, 'hex'), Buffer.from(encHex, 'hex'));
-  return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8');
-}
-
-function decryptKeyFixed(stored) {
-  const parts  = stored.split(':');
-  const ivHex  = parts[0];
-  const encHex = parts[1];
-  const keyBuf   = Buffer.from(ENCRYPT_KEY, 'hex');
-  const decipher = createDecipheriv('aes-256-cbc', keyBuf, Buffer.from(ivHex, 'hex'));
-  return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8');
-}
+// NOTE: decryptKey is handled inline in getKeypair below (correct param order: key then iv)
 
 function hashPin(pin) { return createHash('sha256').update(pin + ENCRYPT_KEY).digest('hex'); }
 
@@ -449,7 +435,7 @@ async function executeBuy(chatId, coinType, amountSui) {
     const res = await swapVia7K({ keypair, walletAddress: user.walletAddress, tokenIn: SUI_TYPE, tokenOut: coinType, amountIn: amountMist, slippagePct: user.settings.slippage, user });
     const estTokens  = Number(res.estimatedOut) / Math.pow(10, meta.decimals || 9);
     const entryPrice = Number(amountMist - res.feeMist) / 1e9 / (estTokens || 1);
-    addPosition(chatId, { coinType, symbol, entryPriceSui: entryPrice, amountTokens: estTokens, spentSui: amountSui, source: 'dex', tp: user.settings.tpDefault, sl: user.settings.slDefault });
+    addPosition(chatId, { coinType, symbol, entryPriceSui: entryPrice, amountTokens: estTokens, decimals: meta.decimals || 9, spentSui: amountSui, source: 'dex', tp: user.settings.tpDefault, sl: user.settings.slDefault });
     return { digest: res.digest, feeSui: suiFloat(res.feeMist), route: res.route, estOut: estTokens.toFixed(4), symbol, state: 'graduated' };
   }
 
@@ -501,12 +487,19 @@ async function executeSell(chatId, coinType, pct) {
 async function getPoolsFromGecko(coinType) {
   const pools = [];
   try {
-    // GeckoTerminal expects the address without the module::SYMBOL suffix for known tokens
-    // but for Sui, the full coinType is the identifier
-    const addr = encodeURIComponent(coinType);
-    const r = await fetchTimeout(`${GECKO_BASE}/networks/${GECKO_NET}/tokens/${addr}/pools?page=1`, { headers: { 'Accept': 'application/json;version=20230302' } }, 8000);
-    if (!r.ok) return pools;
-    const data = await r.json();
+    // GeckoTerminal on Sui accepts the full coinType OR just the package address.
+    // We try the full coinType first, then fall back to the package address.
+    const tryAddresses = [coinType];
+    const pkgAddr = packageFromCoinType(coinType);
+    if (pkgAddr !== coinType) tryAddresses.push(pkgAddr);
+
+    let data = null;
+    for (const addr of tryAddresses) {
+      const enc = encodeURIComponent(addr);
+      const r = await fetchTimeout(`${GECKO_BASE}/networks/${GECKO_NET}/tokens/${enc}/pools?page=1`, { headers: { 'Accept': 'application/json;version=20230302' } }, 8000);
+      if (r.ok) { const d = await r.json(); if ((d.data || []).length > 0) { data = d; break; } }
+    }
+    if (!data) return pools;
     for (const p of (data.data || []).slice(0, 5)) {
       const attr = p.attributes || {};
       const suiLiq = parseFloat(attr.reserve_in_usd || 0) / 3; // rough SUI estimate
@@ -531,39 +524,72 @@ async function getPoolsFromGecko(coinType) {
 
 async function getTokenInfoFromGecko(coinType) {
   try {
-    const addr = encodeURIComponent(coinType);
-    const r = await fetchTimeout(`${GECKO_BASE}/networks/${GECKO_NET}/tokens/${addr}`, { headers: { 'Accept': 'application/json;version=20230302' } }, 8000);
-    if (!r.ok) return null;
-    const data = await r.json();
-    const attr = data.data?.attributes || {};
-    return {
-      name: attr.name || null,
-      symbol: attr.symbol || null,
-      decimals: attr.decimals || 9,
-      totalSupply: parseFloat(attr.total_supply || 0),
-      priceUsd: parseFloat(attr.price_usd || 0),
-      fdvUsd: parseFloat(attr.fdv_usd || 0),
-      marketCapUsd: parseFloat(attr.market_cap_usd || 0),
-      volume24h: parseFloat(attr.volume_usd?.h24 || 0),
-      priceChange24h: parseFloat(attr.price_change_percentage?.h24 || 0),
-      coingeckoId: attr.coingecko_coin_id || null,
-    };
+    // Try full coinType first, then package address as fallback
+    const tryAddresses = [coinType];
+    const pkgAddr = packageFromCoinType(coinType);
+    if (pkgAddr !== coinType) tryAddresses.push(pkgAddr);
+
+    for (const addr of tryAddresses) {
+      const enc = encodeURIComponent(addr);
+      const r = await fetchTimeout(`${GECKO_BASE}/networks/${GECKO_NET}/tokens/${enc}`, { headers: { 'Accept': 'application/json;version=20230302' } }, 8000);
+      if (!r.ok) continue;
+      const data = await r.json();
+      const attr = data.data?.attributes || {};
+      if (!attr.name && !attr.symbol) continue; // empty response, try next
+      return {
+        name: attr.name || null,
+        symbol: attr.symbol || null,
+        decimals: attr.decimals || 9,
+        totalSupply: parseFloat(attr.total_supply || 0),
+        priceUsd: parseFloat(attr.price_usd || 0),
+        fdvUsd: parseFloat(attr.fdv_usd || 0),
+        marketCapUsd: parseFloat(attr.market_cap_usd || 0),
+        volume24h: parseFloat(attr.volume_usd?.h24 || 0),
+        priceChange24h: parseFloat(attr.price_change_percentage?.h24 || 0),
+      };
+    }
+    return null;
   } catch { return null; }
 }
 
 async function getHoldersFromSuiscan(coinType) {
+  // Try Blockberry API (powers Suiscan) — more reliable
   try {
+    const enc = encodeURIComponent(coinType);
     const r = await fetchTimeout(
-      `https://suiscan.xyz/api/sui/mainnet/coin/${encodeURIComponent(coinType)}/holders?limit=20`,
+      `https://api.blockberry.one/sui/v1/coins/${enc}/holders?page=0&size=10&orderBy=DESC&sortBy=AMOUNT`,
       { headers: { 'Accept': 'application/json' } }, 8000
     );
-    if (!r.ok) return { total: 0, topHolders: [] };
-    const d = await r.json();
-    return {
-      total: d.total || 0,
-      topHolders: (d.data || []).slice(0, 10).map(h => ({ address: h.address, pct: parseFloat(h.percentage || 0) })),
-    };
-  } catch { return { total: 0, topHolders: [] }; }
+    if (r.ok) {
+      const d = await r.json();
+      const holders = d.content || d.data || [];
+      return {
+        total: d.totalElements || d.total || holders.length,
+        topHolders: holders.slice(0, 10).map(h => ({
+          address: h.address || h.owner || '',
+          pct: parseFloat(h.percentage || h.pct || 0),
+        })),
+      };
+    }
+  } catch {}
+
+  // Fallback: Suiscan API
+  try {
+    const enc = encodeURIComponent(coinType);
+    const r = await fetchTimeout(
+      `https://suiscan.xyz/api/sui/mainnet/coin/${enc}/holders?limit=20`,
+      { headers: { 'Accept': 'application/json' } }, 8000
+    );
+    if (r.ok) {
+      const d = await r.json();
+      return {
+        total: d.total || 0,
+        topHolders: (d.data || []).slice(0, 10).map(h => ({ address: h.address, pct: parseFloat(h.percentage || 0) })),
+      };
+    }
+  } catch {}
+
+  return { total: 0, topHolders: [] };
 }
 
 // ─────────────────────────────────────────────
@@ -804,6 +830,7 @@ function addPosition(chatId, pos) {
   user.positions.push({
     id: randomBytes(4).toString('hex'), coinType: pos.coinType, symbol: pos.symbol,
     entryPriceSui: pos.entryPriceSui || 0, amountTokens: pos.amountTokens || 0,
+    decimals: pos.decimals || 9,   // store decimals to avoid wrong scaling in PnL
     spentSui: pos.spentSui, tp: pos.tp || null, sl: pos.sl || null,
     source: pos.source || 'dex', launchpad: pos.launchpad || null, openedAt: Date.now(),
   });
@@ -814,7 +841,9 @@ async function getPositionPnl(pos) {
   if (pos.source === 'bonding_curve' || pos.amountTokens <= 0) return null;
   try {
     const k = await sdk7k();
-    const tokenAmt = BigInt(Math.floor(pos.amountTokens * 1e9));
+    // Use stored decimals (default 9 for tokens that predate this fix)
+    const dec      = pos.decimals || 9;
+    const tokenAmt = BigInt(Math.floor(pos.amountTokens * Math.pow(10, dec)));
     const q = await k.getQuote({ tokenIn: pos.coinType, tokenOut: SUI_TYPE, amountIn: tokenAmt.toString() });
     if (!q || !q.outAmount) return null;
     const currentSui = Number(q.outAmount) / 1e9;
@@ -1153,22 +1182,58 @@ bot.on('callback_query', async (query) => {
 
     // ── Settings callbacks
     if (data.startsWith('slip:')) {
+      const val = parseFloat(data.split(':')[1]);
       const u = getUser(chatId);
-      if (u) { u.settings.slippage = parseFloat(data.split(':')[1]); saveUsers(); }
-      await bot.answerCallbackQuery(query.id, { text: `✅ Slippage set to ${data.split(':')[1]}%` });
+      if (u) { u.settings.slippage = val; saveUsers(); }
+      await bot.sendMessage(chatId, `✅ Slippage set to ${val}%`);
       return;
     }
 
     if (data.startsWith('ct:')) {
+      const val = parseFloat(data.split(':')[1]);
       const u = getUser(chatId);
-      if (u) { u.settings.confirmThreshold = parseFloat(data.split(':')[1]); saveUsers(); }
-      await bot.answerCallbackQuery(query.id, { text: `✅ Threshold set` });
+      if (u) { u.settings.confirmThreshold = val; saveUsers(); }
+      await bot.sendMessage(chatId, `✅ Confirm threshold set to ${val} SUI`);
       return;
     }
 
     if (data === 'edit_buy_amounts') {
       updateUser(chatId, { state: 'awaiting_buy_amounts_edit' });
       await bot.sendMessage(chatId, `⚙️ Enter your 4 quick-buy amounts separated by spaces:\n\n_Example: 0.5 1 3 5_`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    // ── Raw CA paste flow callbacks
+    if (data === 'bfs') {
+      // Buy flow start — coinType already in pendingData
+      const user = getUser(chatId);
+      if (!user?.pendingData?.coinType) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      await requireUnlocked(chatId, async () => { await startBuyFlow(chatId, user.pendingData.coinType); });
+      return;
+    }
+
+    if (data === 'sfs') {
+      // Sell flow start — coinType already in pendingData
+      const user = getUser(chatId);
+      if (!user?.pendingData?.coinType) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      const meta = await getCoinMeta(user.pendingData.coinType) || {};
+      await requireUnlocked(chatId, async () => {
+        await startSellFlow(chatId, user.pendingData.coinType, meta.symbol || truncAddr(user.pendingData.coinType));
+      });
+      return;
+    }
+
+    if (data === 'sct') {
+      // Scan pending token
+      const user = getUser(chatId);
+      if (!user?.pendingData?.coinType) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+      const m = await bot.sendMessage(chatId, '🔍 Scanning...');
+      try {
+        const scan = await scanToken(user.pendingData.coinType);
+        await bot.editMessageText(formatScanReport(scan), { chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown' });
+      } catch (e) {
+        await bot.editMessageText(`❌ Scan failed: ${e.message?.slice(0, 100)}`, { chat_id: chatId, message_id: m.message_id });
+      }
       return;
     }
 
@@ -1480,20 +1545,18 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    // Raw CA paste detection — if user pastes 0x address, offer buy/sell
+    // Raw CA paste detection — if user pastes 0x address, offer buy/sell/scan
     if (text.startsWith('0x') && text.length > 40) {
       updateUser(chatId, { pendingData: { coinType: text } });
-      await bot.sendMessage(chatId, `Contract detected: \`${truncAddr(text)}\`\n\nWhat do you want to do?`, {
+      await bot.sendMessage(chatId, `📋 Contract detected:\n\`${truncAddr(text)}\`\n\nWhat do you want to do?`, {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '💰 Buy', callback_data: 'ba:0' }, { text: '💸 Sell', callback_data: 'sp:50' }],
-            [{ text: '🔍 Scan Token', callback_data: 'ca' }],
+            [{ text: '💰 Buy', callback_data: 'bfs' }, { text: '💸 Sell', callback_data: 'sfs' }],
+            [{ text: '🔍 Scan Token', callback_data: 'sct' }, { text: '❌ Cancel', callback_data: 'ca' }],
           ],
         },
       });
-      // Start buy flow on paste
-      await requireUnlocked(chatId, async () => { await startBuyFlow(chatId, text); });
       return;
     }
   }
