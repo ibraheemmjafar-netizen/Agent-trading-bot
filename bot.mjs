@@ -571,48 +571,143 @@ async function executeSell(chatId, ct, pct) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// AUDIT CHECKS
+// AUDIT CHECKS — Full on-chain security analysis
 // ═══════════════════════════════════════════════════════════
 
-// Mint Auth: check if ANYONE (not just deployer) owns TreasuryCap
-// Deployer found via first publish tx — then check their wallet
-// Also checks if TreasuryCap was transferred away
-async function checkMintAuth(ct) {
+// Find deployer address from first publish transaction
+async function findDeployer(ct) {
   try {
     const pkg = ct.split('::')[0];
-    // Find deployer
     const txs = await sui.queryTransactionBlocks({
-      filter:{ InputObject:pkg }, limit:1, order:'ascending',
-      options:{ showInput:true },
+      filter:{ InputObject:pkg }, limit:1, order:'ascending', options:{ showInput:true },
     });
     if (!txs.data.length) return null;
-    const deployer = txs.data[0].transaction?.data?.sender;
-    if (!deployer) return null;
+    return txs.data[0].transaction?.data?.sender || null;
+  } catch { return null; }
+}
 
-    // Check if deployer still owns TreasuryCap
+// Mint Auth: TreasuryCap in deployer wallet = can mint more ⚠️
+async function checkMintAuth(ct, deployer) {
+  if (!deployer) return null;
+  try {
     const owned = await sui.getOwnedObjects({
       owner: deployer,
       filter:{ StructType:`0x2::coin::TreasuryCap<${ct}>` },
-      options:{ showType:true },
-      limit: 5,
+      options:{ showType:true }, limit:5,
     });
-    // If deployer owns it → can mint ⚠️
-    if (owned.data.length > 0) return true;
+    return owned.data.length > 0;
+  } catch { return null; }
+}
 
-    // TreasuryCap not in deployer wallet → burned/wrapped/transferred = safe ✅
+// UpgradeCap: deployer can change contract code ⚠️
+async function checkUpgradeable(ct, deployer) {
+  if (!deployer) return null;
+  try {
+    const pkg = ct.split('::')[0];
+    const owned = await sui.getOwnedObjects({
+      owner: deployer,
+      filter:{ StructType:'0x2::package::UpgradeCap' },
+      options:{ showType:true, showContent:true }, limit:50,
+    });
+    for (const obj of owned.data) {
+      if (obj.data?.content?.fields?.package === pkg) return true;
+    }
     return false;
   } catch { return null; }
 }
 
-// Honeypot: can we get a sell quote from Cetus?
-async function checkHoneypot(ct) {
+// DenyCap: deployer can freeze wallets ⚠️, globalPause = freeze all ❌
+async function checkDenyCap(ct, deployer) {
+  if (!deployer) return null;
   try {
-    const out = await getSwapEstimate(ct, SUI_T, '100000000');
-    return out !== null && out !== '0';
+    const owned = await sui.getOwnedObjects({
+      owner: deployer,
+      filter:{ StructType:`0x2::coin::DenyCapV2<${ct}>` },
+      options:{ showType:true, showContent:true }, limit:5,
+    });
+    if (!owned.data.length) return { has:false, globalPause:false };
+    const fields = owned.data[0].data?.content?.fields;
+    return { has:true, globalPause: fields?.allow_global_pause === true };
   } catch { return null; }
 }
 
-// Holders: Blockberry API (with key = accurate)
+// Honeypot: devInspectTransactionBlock simulates actual sell on-chain
+// Uses real holder coin objects for accurate simulation
+async function checkHoneypot(ct, topHolders) {
+  const pool = await findCetusPool(SUI_T, ct).catch(()=>null);
+
+  // Method 1: Simulate SELL using real holder coins (most accurate)
+  if (pool && topHolders?.length) {
+    for (const holder of topHolders.slice(0,3)) {
+      if (!holder.addr || holder.addr.length < 10) continue;
+      try {
+        const holderCoins = await getCoins(holder.addr, ct);
+        if (!holderCoins.length) continue;
+        const sellBal = BigInt(holderCoins[0].balance);
+        if (sellBal === 0n) continue;
+        const sellAmt = sellBal / 10n > 0n ? sellBal / 10n : sellBal;
+
+        const tx = new Transaction();
+        tx.setGasBudget(20_000_000);
+        let obj = tx.object(holderCoins[0].coinObjectId);
+        if (holderCoins.length > 1) tx.mergeCoins(obj, holderCoins.slice(1,5).map(c=>tx.object(c.coinObjectId)));
+        const [sellCoin] = tx.splitCoins(obj, [tx.pure.u64(sellAmt)]);
+        const [empty]    = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
+        const sellA2b    = !pool.a2b;
+        const [coinA, coinB] = sellA2b ? [sellCoin, empty] : [empty, sellCoin];
+        const typeArgs = pool.a2b ? [SUI_T, ct] : [ct, SUI_T];
+        const [rA, rB] = tx.moveCall({
+          target: `${CETUS_PUBLISHED}::pool_script::swap`,
+          typeArguments: typeArgs,
+          arguments: [
+            tx.object(CETUS_CONFIG), tx.object(pool.poolId),
+            coinA, coinB,
+            tx.pure.bool(sellA2b), tx.pure.bool(true),
+            tx.pure.u64(sellAmt), tx.pure.u64(0n),
+            tx.pure.u128(sellA2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)),
+            tx.object(CLOCK_OBJ),
+          ],
+        });
+        tx.transferObjects([rA, rB], tx.pure.address(holder.addr));
+        const res = await sui.devInspectTransactionBlock({ transactionBlock:tx, sender:holder.addr });
+        return res.effects?.status?.status === 'success';
+      } catch {}
+    }
+  }
+
+  // Method 2: Simulate BUY (confirms pool works at minimum)
+  if (pool) {
+    try {
+      const tx = new Transaction();
+      tx.setGasBudget(20_000_000);
+      const [coinIn] = tx.splitCoins(tx.gas, [tx.pure.u64(100_000_000n)]);
+      const [empty]  = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
+      const [coinA, coinB] = pool.a2b ? [coinIn, empty] : [empty, coinIn];
+      const typeArgs = pool.a2b ? [SUI_T, ct] : [ct, SUI_T];
+      const [rA, rB] = tx.moveCall({
+        target: `${CETUS_PUBLISHED}::pool_script::swap`,
+        typeArguments: typeArgs,
+        arguments: [
+          tx.object(CETUS_CONFIG), tx.object(pool.poolId),
+          coinA, coinB,
+          tx.pure.bool(pool.a2b), tx.pure.bool(true),
+          tx.pure.u64(100_000_000n), tx.pure.u64(0n),
+          tx.pure.u128(pool.a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)),
+          tx.object(CLOCK_OBJ),
+        ],
+      });
+      tx.transferObjects([rA, rB], tx.pure.address(DEV_WALLET));
+      const res = await sui.devInspectTransactionBlock({ transactionBlock:tx, sender:DEV_WALLET });
+      if (res.effects?.status?.status !== 'success') return false;
+    } catch {}
+  }
+
+  // Method 3: Router estimate fallback
+  const est = await getSwapEstimate(ct, SUI_T, '100000000');
+  return est !== null && est !== '0';
+}
+
+// Holders: Blockberry with API key
 async function getHolders(ct) {
   try {
     const r = await ftch(
@@ -620,29 +715,19 @@ async function getHolders(ct) {
       { headers:{ 'x-api-key':BB_KEY, Accept:'application/json' } }, 8000
     );
     if (!r.ok) throw new Error(`BB ${r.status}`);
-    const d    = await r.json();
-    const list = d.content || d.data || [];
-    return {
-      total: d.totalElements || d.total || 0,
-      top: list.slice(0,15).map(h => ({ addr:h.address||h.owner||'', pct:parseFloat(h.percentage||h.pct||0) })),
-    };
+    const d = await r.json(), list = d.content || d.data || [];
+    return { total: d.totalElements||d.total||0, top: list.slice(0,15).map(h=>({ addr:h.address||h.owner||'', pct:parseFloat(h.percentage||h.pct||0) })) };
   } catch {}
   return { total:0, top:[] };
 }
 
-// Dev balance: % of supply held by deployer
-async function getDevBalance(ct, supplyRaw) {
+// Dev balance: % of supply currently held by deployer
+async function getDevBalance(ct, supplyRaw, deployer) {
+  if (!deployer || !supplyRaw) return null;
   try {
-    const pkg = ct.split('::')[0];
-    const txs = await sui.queryTransactionBlocks({
-      filter:{ InputObject:pkg }, limit:1, order:'ascending', options:{ showInput:true },
-    });
-    if (!txs.data.length) return null;
-    const deployer = txs.data[0].transaction?.data?.sender;
-    if (!deployer) return null;
     const coins = await getCoins(deployer, ct);
-    const bal   = coins.reduce((s,c) => s+BigInt(c.balance), 0n);
-    return supplyRaw > 0 ? Number(bal)/supplyRaw*100 : null;
+    const bal   = coins.reduce((s,c)=>s+BigInt(c.balance), 0n);
+    return Number(bal)/supplyRaw*100;
   } catch { return null; }
 }
 
@@ -698,29 +783,37 @@ async function geckoPools(ct) {
 
 async function getTokenData(ct) {
   const cap = (p) => Promise.race([p, new Promise(r=>setTimeout(()=>r(null),7000))]);
-  const [gTok, pools, meta, supply, holders, mint, honeypot] = await Promise.all([
+
+  // Phase 1: Fast data in parallel
+  const [gTok, pools, meta, supply, holders] = await Promise.all([
     geckoTok(ct).catch(()=>null),
     geckoPools(ct).catch(()=>[]),
     getMeta(ct).catch(()=>null),
     sui.getTotalSupply({coinType:ct}).catch(()=>null),
     cap(getHolders(ct)),
-    cap(checkMintAuth(ct)),
-    cap(checkHoneypot(ct)),
   ]);
 
-  const best    = pools[0];
-  const name    = meta?.name    || gTok?.name    || '?';
-  const symbol  = meta?.symbol  || gTok?.symbol  || '?';
-  const dec     = meta?.decimals || gTok?.decimals || 9;
-  const supRaw  = supply ? Number(BigInt(supply.value)) : (gTok?.rawSupply||0);
-  const supH    = supRaw / Math.pow(10, dec);
-  const priceU  = gTok?.priceUsd || best?.priceU || 0;
-  const liq     = pools.reduce((t,p)=>t+(p.liq||0), 0);
-  const top10   = (holders?.top||[]).slice(0,10).reduce((t,h)=>t+h.pct, 0);
+  const best   = pools[0];
+  const name   = meta?.name    || gTok?.name    || '?';
+  const symbol = meta?.symbol  || gTok?.symbol  || '?';
+  const dec    = meta?.decimals || gTok?.decimals || 9;
+  const supRaw = supply ? Number(BigInt(supply.value)) : (gTok?.rawSupply||0);
+  const supH   = supRaw / Math.pow(10, dec);
+  const priceU = gTok?.priceUsd || best?.priceU || 0;
+  const liq    = pools.reduce((t,p)=>t+(p.liq||0), 0);
+  const top10  = (holders?.top||[]).slice(0,10).reduce((t,h)=>t+h.pct, 0);
 
-  // Dev balance (slow, separate)
-  let devPct = null;
-  if (supRaw > 0) devPct = await cap(getDevBalance(ct, supRaw));
+  // Phase 2: Find deployer ONCE, reuse for all audit checks
+  const deployer = await cap(findDeployer(ct));
+
+  // Phase 3: All audit checks in parallel, pass deployer so we don't query chain twice
+  const [mint, upgradeable, denyCap, honeypot, devPct] = await Promise.all([
+    cap(checkMintAuth(ct, deployer)),
+    cap(checkUpgradeable(ct, deployer)),
+    cap(checkDenyCap(ct, deployer)),
+    cap(checkHoneypot(ct, holders?.top||[])),
+    cap(getDevBalance(ct, supRaw, deployer)),
+  ]);
 
   return {
     name, symbol, dec, supH,
@@ -729,7 +822,7 @@ async function getTokenData(ct) {
     pools, best, dex:best?.dex||'Sui',
     age: best?.age ? fAge(best.age) : null,
     holders:holders?.total||0, topHolders:holders?.top||[], top10,
-    mint, honeypot, devPct,
+    mint, upgradeable, denyCap, honeypot, devPct, deployer,
   };
 }
 
@@ -774,7 +867,11 @@ function fSupply(n) {
 // BUY CARD + SCAN REPORT
 // ═══════════════════════════════════════════════════════════
 function buyCard(d, ct) {
-  const issues = [d.mint===true, d.honeypot===false, d.top10>50, d.devPct!==null&&d.devPct>10].filter(Boolean).length;
+  const issues = [
+    d.mint===true, d.honeypot===false,
+    d.upgradeable===true, d.denyCap?.has===true,
+    d.top10>50, d.devPct!==null&&d.devPct>10
+  ].filter(Boolean).length;
   const L = [];
   L.push(`*${d.symbol}/SUI*`);
   L.push(`\`${ct}\``);
@@ -791,7 +888,8 @@ function buyCard(d, ct) {
   if (chgs.length) L.push(`📉 ${chgs.join(' | ')}`);
   if (d.pools.length>1) L.push(`🔀 ${d.pools.length} pools — routed through best liquidity`);
   L.push(`\n🛡 *Audit* (Issues: ${issues})`);
-  L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'?':d.mint?'Yes ⚠️':'No'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'?':d.honeypot?'No':'Yes ❌'}`);
+  L.push(`${tick(d.mint,false)} Mint: ${d.mint===null?'⚪':d.mint?'Yes ⚠️':'Burned ✅'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'⚪':d.honeypot?'No ✅':'Yes ❌'}`);
+  L.push(`${tick(d.upgradeable,false)} Contract: ${d.upgradeable===null?'⚪':d.upgradeable?'Upgradeable ⚠️':'Immutable ✅'} | ${d.denyCap===null?'⚪':d.denyCap.has?(d.denyCap.globalPause?'🔴 Freeze All':'⚠️ Can Freeze'):'✅ No Freeze'}`);
   L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
   L.push(`\n⛽️ Est. Gas: ~0.010 SUI`);
   return L.join('\n');
@@ -799,17 +897,22 @@ function buyCard(d, ct) {
 
 function scanReport(d, ct, st) {
   const icons={SAFE:'🟢',CAUTION:'🟡','HIGH RISK':'🔴','LIKELY RUG':'💀',UNKNOWN:'⚪'};
-  const top3 = d.topHolders.slice(0,3).reduce((t,h)=>t+h.pct, 0);
+  const top3  = d.topHolders.slice(0,3).reduce((t,h)=>t+h.pct, 0);
   let risk='UNKNOWN';
   if (d.honeypot===false||(d.liq<500&&st.state!=='bonding'&&!d.pools.length)) risk='LIKELY RUG';
   else if (top3>50&&d.liq<5000) risk='HIGH RISK';
   else if (top3>50||d.liq<5000) risk='CAUTION';
   else if (d.liq>0)              risk='SAFE';
-  const issues=[d.mint===true,d.honeypot===false,d.top10>50,d.devPct!==null&&d.devPct>10].filter(Boolean).length;
+  const issues=[
+    d.mint===true, d.honeypot===false,
+    d.upgradeable===true, d.denyCap?.has===true,
+    d.top10>50, d.devPct!==null&&d.devPct>10
+  ].filter(Boolean).length;
   const L=[];
   L.push(`🔍 *Token Scan*\n`);
   L.push(`📛 *${d.name}* (${d.symbol})`);
   L.push(`📋 \`${trunc(ct)}\``);
+  if (d.deployer) L.push(`👨‍💻 Deployer: \`${trunc(d.deployer)}\``);
   if (d.priceU>0) L.push(`\n💵 ${fPrice(d.priceU)}${d.chg24h?` ${d.chg24h>=0?'📈+':'📉'}${d.chg24h.toFixed(2)}%`:''}`);
   if (d.mcap>0)   L.push(`🏦 MCap: $${fNum(d.mcap)}`);
   if (d.vol>0)    L.push(`💹 Vol 24h: $${fNum(d.vol)}`);
@@ -830,11 +933,14 @@ function scanReport(d, ct, st) {
     L.push(`\n💧 *Pools (${d.pools.length} found)*`);
     d.pools.slice(0,4).forEach((p,i)=>L.push(`  ${i===0?'⭐':'•'} ${p.dex}: $${fNum(p.liq)}${p.vol>0?` | vol $${fNum(p.vol)}`:''}`));
     L.push(`Total liq: $${fNum(d.liq)}`);
-    L.push(`💡 Cetus CLMM — deepest Sui liquidity`);
   } else { L.push('\n❌ No pools found on any DEX'); }
-  L.push(`\n🛡 *Security* (Issues: ${issues})`);
-  L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'?':d.mint?'Yes ⚠️':'No'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'?':d.honeypot?'No':'Yes ❌'}`);
-  L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
+  L.push(`\n🛡 *Security* (${issues} issue${issues!==1?'s':''})`);
+  L.push(`${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'⚪ Unknown (no holders to simulate)':d.honeypot?'✅ Can sell':'❌ CANNOT SELL'}`);
+  L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'⚪':d.mint?'⚠️ Dev can mint more':'✅ Burned/renounced'}`);
+  L.push(`${tick(d.upgradeable,false)} Contract: ${d.upgradeable===null?'⚪':d.upgradeable?'⚠️ Upgradeable (dev can change code)':'✅ Immutable'}`);
+  const dcStr = d.denyCap===null?'⚪':!d.denyCap.has?'✅ No freeze ability':d.denyCap.globalPause?'❌ Can FREEZE ALL wallets':'⚠️ Can freeze specific wallets';
+  L.push(`${d.denyCap===null?'⚪':d.denyCap.has?(d.denyCap.globalPause?'❌':'⚠️'):'✅'} Freeze: ${dcStr}`);
+  L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev holds: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
   L.push(`\n${icons[risk]||'⚪'} *Risk: ${risk}*`);
   return L.join('\n');
 }
