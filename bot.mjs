@@ -125,30 +125,40 @@ async function getAllBals(addr)   { return sui.getAllBalances({ owner:addr }); }
 // Fee collection: 7K takes commissionBps% from input and sends to partner atomically
 // This is the ONLY correct way to collect fees without modifying 7K's PTB
 // ═══════════════════════════════════════════════════════════
+// 7K REST API — tries multiple endpoint formats with 25s timeout
+// "this operation was aborted" = timeout → increased from 8s to 25s
 async function get7KQuote(tokenIn, tokenOut, amountIn) {
-  const url = `${API_7K}/quote?tokenIn=${encodeURIComponent(tokenIn)}&tokenOut=${encodeURIComponent(tokenOut)}&amountIn=${amountIn}&slippage=0.01`;
-  const r   = await ftch(url, { headers:{ Accept:'application/json' } }, 8000);
-  if (!r.ok) { const t=await r.text().catch(()=>''); throw new Error(`7K quote ${r.status}: ${t.slice(0,80)}`); }
-  const d = await r.json();
-  if (!d.outAmount || d.outAmount === '0') throw new Error('No route found — token may have no liquidity.');
-  return d;
+  const params = `tokenIn=${encodeURIComponent(tokenIn)}&tokenOut=${encodeURIComponent(tokenOut)}&amountIn=${amountIn}&slippage=0.01`;
+  const urls = [
+    `${API_7K}/quote?${params}`,
+    `${API_7K}/v1/quote?${params}`,
+    `${API_7K}/swap/quote?${params}`,
+  ];
+  let lastErr = 'All 7K endpoints unreachable. Check Railway network settings.';
+  for (const url of urls) {
+    try {
+      const r = await ftch(url, { headers:{ Accept:'application/json' } }, 25000);
+      if (!r.ok) { const t=await r.text().catch(()=>''); lastErr=`7K HTTP ${r.status}: ${t.slice(0,60)}`; continue; }
+      const d = await r.json();
+      if (!d.outAmount || d.outAmount === '0') { lastErr='No route — token has no liquidity.'; continue; }
+      return d;
+    } catch(e) { lastErr = e.message?.includes('aborted') ? '7K API timeout — slow network, try again.' : e.message; }
+  }
+  throw new Error(lastErr);
 }
 
 async function build7KTx(quote, wallet, slippage) {
-  // commissionBps:100 = 7K atomically sends 1% of input to DEV_WALLET
-  // This is the correct way — no manual tx modification needed
-  const r = await ftch(`${API_7K}/build-tx`, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json', Accept:'application/json' },
-    body: JSON.stringify({
-      quoteResponse: quote,
-      accountAddress: wallet,
-      slippage: slippage / 100,
-      commission: { partner: DEV_WALLET, commissionBps: FEE_BPS },
-    }),
-  }, 10000);
-  if (!r.ok) { const t=await r.text().catch(()=>''); throw new Error(`7K build-tx ${r.status}: ${t.slice(0,100)}`); }
-  return r.json();
+  const body = JSON.stringify({ quoteResponse:quote, accountAddress:wallet, slippage:slippage/100, commission:{ partner:DEV_WALLET, commissionBps:FEE_BPS } });
+  const urls = [`${API_7K}/build-tx`, `${API_7K}/v1/build-tx`];
+  let lastErr = '7K build-tx unreachable.';
+  for (const url of urls) {
+    try {
+      const r = await ftch(url, { method:'POST', headers:{ 'Content-Type':'application/json', Accept:'application/json' }, body }, 30000);
+      if (!r.ok) { const t=await r.text().catch(()=>''); lastErr=`7K build-tx ${r.status}: ${t.slice(0,80)}`; continue; }
+      return await r.json();
+    } catch(e) { lastErr = e.message?.includes('aborted') ? '7K build-tx timeout — try again.' : e.message; }
+  }
+  throw new Error(lastErr);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -782,7 +792,13 @@ const MAIN_KB={
   resize_keyboard:true, persistent:true,
 };
 
-const bot = new TelegramBot(TG_TOKEN, { polling:true });
+const bot = new TelegramBot(TG_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: { timeout: 10, allowed_updates: ['message','callback_query'] },
+  },
+});
 
 async function guard(chatId, fn) {
   const u=getU(chatId);
@@ -1365,22 +1381,37 @@ async function main() {
 
   loadDB();
 
+  // Kill any existing webhook or other bot instances claiming this token
+  try {
+    await bot.deleteWebhook({ drop_pending_updates: true });
+    console.log('✅ Webhook cleared, pending updates dropped');
+  } catch(e) { console.warn('Webhook clear:', e.message); }
+
   // Get real bot username for referral links
   try {
     const me = await bot.getMe();
     BOT_USERNAME = me.username || BOT_USERNAME;
-    console.log(`Bot username: @${BOT_USERNAME}`);
-  } catch(e) { console.warn('Could not get bot username:', e.message); }
+    console.log(`Bot: @${BOT_USERNAME}`);
+  } catch(e) { console.warn('getMe failed:', e.message); }
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('  AGENT TRADING BOT — Final v5');
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
 
-  // Test 7K API connectivity
+  // Test 7K API with the actual quote endpoint (not just health)
+  console.log('Testing 7K API...');
   try {
-    const r = await ftch(`${API_7K}/health`, {}, 5000).catch(()=>null);
-    console.log(r?.ok ? '✅ 7K REST API reachable' : '⚠️ 7K REST API may be slow');
-  } catch { console.warn('⚠️ Could not reach 7K API'); }
+    // Try a real quote: 1 SUI → USDC (fast test)
+    const testQ = await get7KQuote(
+      '0x2::sui::SUI',
+      '0x5d4b302506645c37ff133b98c4b50a5ae14841659738d6d733d59d0d217a93bf::coin::COIN',
+      '1000000000'
+    );
+    console.log(`✅ 7K API working — outAmount: ${testQ.outAmount?.slice(0,8)}`);
+  } catch(e) {
+    console.warn(`⚠️ 7K API: ${e.message}`);
+    console.warn('   Buys/sells may fail until 7K is reachable from Railway network');
+  }
 
   // Start background engines
   positionMonitor().catch(e=>console.error('Monitor:', e));
