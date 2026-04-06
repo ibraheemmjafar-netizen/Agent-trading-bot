@@ -1381,10 +1381,11 @@ async function main() {
 
   loadDB();
 
-  // Kill any existing webhook or other bot instances claiming this token
+  // Kill old polling sessions — use direct Telegram API (library method doesn't exist)
   try {
-    await bot.deleteWebhook({ drop_pending_updates: true });
-    console.log('✅ Webhook cleared, pending updates dropped');
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/deleteWebhook?drop_pending_updates=true`);
+    const d = await r.json();
+    console.log(d.ok ? '✅ Old sessions cleared' : `Webhook clear: ${d.description}`);
   } catch(e) { console.warn('Webhook clear:', e.message); }
 
   // Get real bot username for referral links
