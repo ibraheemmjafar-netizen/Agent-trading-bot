@@ -132,8 +132,9 @@ async function getAfRouter() {
   if (_afRouter) return _afRouter;
   const { Aftermath } = await import('aftermath-ts-sdk');
   _af = new Aftermath('MAINNET');
-  // init() is optional — SDK works without it but init fetches pool data
-  try { await Promise.race([_af.init(), new Promise(r=>setTimeout(r,5000))]); } catch {}
+  // Fire init in background — SDK fetches pool data. Don't block on it.
+  // Routes still work without init (SDK fetches on-demand), just may be slower first call.
+  _af.init().catch(() => {});
   _afRouter = _af.Router();
   return _afRouter;
 }
@@ -1393,18 +1394,8 @@ async function main() {
   console.log('  AGENT TRADING BOT — Final v5');
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
 
-  // Test Aftermath aggregator connectivity
-  console.log('Testing Aftermath aggregator...');
-  try {
-    const out = await getSwapEstimate(
-      '0x2::sui::SUI',
-      '0x5d4b302506645c37ff133b98c4b50a5ae14841659738d6d733d59d0d217a93bf::coin::COIN',
-      '1000000000'
-    );
-    console.log(out && out !== '0' ? `✅ Aftermath working — estimated out: ${out.slice(0,8)}` : '⚠️ Aftermath: no route for test pair');
-  } catch(e) {
-    console.warn(`⚠️ Aftermath: ${e.message}`);
-  }
+  // Pre-load Aftermath router in background (first trade will be faster)
+  getAfRouter().then(() => console.log('✅ Aftermath SDK loaded')).catch(e => console.warn('⚠️ Aftermath SDK:', e.message));
 
   // Start background engines
   positionMonitor().catch(e=>console.error('Monitor:', e));
