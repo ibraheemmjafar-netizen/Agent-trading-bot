@@ -7,6 +7,7 @@
   "dependencies": {
     "@mysten/sui": "^1.0.0",
     "aftermath-ts-sdk": "latest",
+    "dayjs": "latest",
     "bn.js": "^5.2.1",
     "node-telegram-bot-api": "^0.66.0",
     "tslib": "^2.6.2"
