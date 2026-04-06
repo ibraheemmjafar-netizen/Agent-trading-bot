@@ -126,37 +126,67 @@ async function getAllBals(addr)   { return sui.getAllBalances({ owner:addr }); }
 // ═══════════════════════════════════════════════════════════
 
 // Cetus CLMM known addresses (stable, from official Cetus docs)
-// Cetus CLMM — addresses from official Cetus SDK mainnet.ts
-const CETUS_PKG        = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb'; // clmm_pool.package_id
-const CETUS_PUBLISHED  = '0xc6faf3703b0e8ba9ed06b7851134bbbe7565eb35ff823fd78432baa4cbeaa12e'; // clmm_pool.published_at (use for Move calls)
-const CETUS_INTEGRATE  = '0x2d8c2e0fc6dd25b0214b3fa747e0fd27fd54608142cd2e4f64c1cd350cc4add4'; // integrate.published_at (multi-DEX router)
-const CETUS_CONFIG     = '0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f'; // global_config_id — WAS MISSING TRAILING f
+// ── Cetus CLMM addresses (verified from real mainnet transactions on SuiScan)
+const CETUS_CONFIG     = '0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f'; // global_config (shared, immutable)
+// pool_script::swap lives in the INTEGRATE package, NOT clmm_pool package
+const CETUS_INTEGRATE  = '0x2d8c2e0fc6dd25b0214b3fa747e0fd27fd54608142cd2e4f64c1cd350cc4add4'; // integrate.published_at → pool_script module
 const CETUS_ROUTER_URL = 'https://api-sui.cetus.zone/router';
+
+// ── Turbos CLMM addresses (verified from real mainnet transactions on SuiScan)
+// TX: 9GadBDwwrGikdFCpdaPD4QbdPik5ET19Y97kpVzHmWch
+const TURBOS_PKG       = '0x801d5d826e693cbcabe0535f02a91abc6052096e86c9de43f2b05579dc57144b'; // turbos swap package
+const TURBOS_VERSIONED = '0xf1cf0e81048df168ebeb1b8030fad24b3e0b53ae827c25053fff0779c1445b6f'; // versioned object (shared, immutable)
+
 const CLOCK_OBJ        = '0x6';
+const U64_MAX          = '18446744073709551615'; // used as amount_limit for unlimited slippage
 
-// Cetus sqrt_price_limit constants (from Cetus SDK magic-numbers)
-const CETUS_MIN_SQRT = '4295048016';               // a2b = true  (selling coinA)
-const CETUS_MAX_SQRT = '79226673515401279992447579055'; // a2b = false (selling coinB)
+// Cetus sqrt_price_limit constants
+const CETUS_MIN_SQRT = '4295048016';
+const CETUS_MAX_SQRT = '79226673515401279992447579055';
 
-// Find best Cetus pool for a token pair
-// Queries both orderings since Cetus stores pools as CoinA/CoinB pairs
+// Find best Cetus pool — queries both coin orderings
 async function findCetusPool(coinA, coinB) {
-  // Normalize — SUI is always the base in most pools
   for (const [ca, cb, isA2b] of [[coinA, coinB, true], [coinB, coinA, false]]) {
     try {
       const r = await ftch(
         `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type_a=${encodeURIComponent(ca)}&coin_type_b=${encodeURIComponent(cb)}&limit=5&order_by=tvl&order=desc`,
-        { headers: { Accept: 'application/json' } }, 8000
+        { headers:{ Accept:'application/json' } }, 8000
       );
       if (!r.ok) continue;
       const d = await r.json();
       const pools = d.data?.list || [];
       if (!pools.length) continue;
-      // Pick highest TVL pool
       const p = pools[0];
       const poolId = p.pool_address || p.id;
       if (!poolId) continue;
-      return { poolId, a2b: isA2b, coinA: ca, coinB: cb, liq: parseFloat(p.tvl || p.liquidity_usd || 0) };
+      return { poolId, a2b:isA2b, coinA:ca, coinB:cb, liq:parseFloat(p.tvl||p.liquidity_usd||0), dex:'Cetus' };
+    } catch {}
+  }
+  return null;
+}
+
+// Find Turbos pool — returns poolId + feeType (needed for type argument)
+async function findTurbosPool(coinA, coinB) {
+  // Turbos pools API — search by both coin orderings
+  for (const [ca, cb] of [[coinA, coinB], [coinB, coinA]]) {
+    try {
+      // Get pool from Cetus aggregator (it indexes Turbos pools too)
+      const r = await ftch(
+        `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type_a=${encodeURIComponent(ca)}&coin_type_b=${encodeURIComponent(cb)}&dex=turbos&limit=5&order_by=tvl&order=desc`,
+        { headers:{ Accept:'application/json' } }, 8000
+      );
+      if (!r.ok) continue;
+      const d = await r.json();
+      const pools = d.data?.list || [];
+      if (!pools.length) continue;
+      const p = pools[0];
+      const poolId = p.pool_address || p.id;
+      if (!poolId) continue;
+      // feeType from pool struct — e.g. "fee3000bps"
+      const feeType = p.fee_protocol || p.fee_type ||
+        `0x91bfbc386a41afcfd9b2533058d7e9154d6339ca1::fee${p.fee_rate||3000}bps::FEE${p.fee_rate||3000}BPS`;
+      const a2b = ca === coinA;
+      return { poolId, feeType, a2b, coinA:ca, coinB:cb, dex:'Turbos' };
     } catch {}
   }
   return null;
@@ -195,68 +225,112 @@ async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
   return null;
 }
 
-// Build Cetus swap PTB — direct Move call, no SDK needed
+// Build Cetus swap PTB
+// Uses CETUS_INTEGRATE package → pool_script module (verified from mainnet txs)
+// Signature: pool_script::swap(config, pool, coin_a, coin_b, a2b, by_amount_in, amount, amount_limit, sqrt_price_limit, clock)
 async function buildCetusSwapTx({ wallet, poolId, coinInType, coinOutType, a2b, amountIn, minAmountOut }) {
   const tx = new Transaction();
   tx.setGasBudget(50_000_000);
   tx.setSender(wallet);
 
-  // Split the input coin from gas (for SUI → token swaps)
-  // For token → SUI, we need to use the actual token coin objects
+  // Prepare input coin
   let coinIn;
   if (coinInType === SUI_T) {
-    [coinIn] = tx.splitCoins(tx.gas, [tx.pure.u64(amountIn)]);
+    // SUI buy: split exact amount from gas
+    [coinIn] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
   } else {
-    // For token sells: get coin objects and merge if needed
+    // Token sell: use actual coin objects from wallet
     const coins = await getCoins(wallet, coinInType);
-    if (!coins.length) throw new Error('No token balance found');
+    if (!coins.length) throw new Error('No token balance found in wallet');
     let obj = tx.object(coins[0].coinObjectId);
-    if (coins.length > 1) {
-      tx.mergeCoins(obj, coins.slice(1).map(c => tx.object(c.coinObjectId)));
-    }
-    const total = coins.reduce((s,c) => s + BigInt(c.balance), 0n);
+    if (coins.length > 1) tx.mergeCoins(obj, coins.slice(1).map(c => tx.object(c.coinObjectId)));
+    const total = coins.reduce((s,c) => s+BigInt(c.balance), 0n);
     if (BigInt(amountIn) < total) {
-      [coinIn] = tx.splitCoins(obj, [tx.pure.u64(amountIn)]);
+      [coinIn] = tx.splitCoins(obj, [tx.pure.u64(BigInt(amountIn))]);
     } else {
       coinIn = obj;
     }
   }
 
-  // Create an empty coin for the output side (Cetus requires both coins as input)
-  // For SUI→token: coin_a = SUI (split), coin_b = empty token coin
-  // For token→SUI: coin_a = empty SUI coin (0), coin_b = token coin
+  // Cetus pool_script::swap requires BOTH coin_a and coin_b as inputs
+  // The one being received starts as an empty zero-balance coin
   let coinA, coinB;
   if (a2b) {
-    // Swapping coinA → coinB
+    // a2b = true: swapping coinA → coinB (e.g. SUI → TOKEN)
     coinA = coinIn;
-    const [empty] = tx.splitCoins(tx.gas, [tx.pure.u64(0)]);
-    coinB = empty;
+    [coinB] = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
   } else {
-    const [empty] = tx.splitCoins(tx.gas, [tx.pure.u64(0)]);
-    coinA = empty;
+    // a2b = false: swapping coinB → coinA (e.g. TOKEN → SUI)
+    [coinA] = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
     coinB = coinIn;
   }
 
-  // Call Cetus swap
+  // pool_script::swap — in CETUS_INTEGRATE package
+  // Type args: always (CoinA_type, CoinB_type) based on pool ordering, not swap direction
+  const poolCoinA = a2b ? coinInType  : coinOutType;
+  const poolCoinB = a2b ? coinOutType : coinInType;
+
   const [resultA, resultB] = tx.moveCall({
-    target: `${CETUS_PUBLISHED}::pool_script::swap`,
-    typeArguments: a2b ? [coinInType, coinOutType] : [coinOutType, coinInType],
+    target: `${CETUS_INTEGRATE}::pool_script::swap`,
+    typeArguments: [poolCoinA, poolCoinB],
     arguments: [
-      tx.object(CETUS_CONFIG),
-      tx.object(poolId),
+      tx.object(CETUS_CONFIG),                // global config (shared, immutable)
+      tx.object(poolId),                       // pool (shared, mutable)
       coinA,
       coinB,
-      tx.pure.bool(a2b),
-      tx.pure.bool(true),              // by_amount_in = true
-      tx.pure.u64(BigInt(amountIn)),
-      tx.pure.u64(BigInt(minAmountOut || '0')),
-      tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)),
-      tx.object(CLOCK_OBJ),
+      tx.pure.bool(a2b),                      // a2b direction
+      tx.pure.bool(true),                      // by_amount_in = true
+      tx.pure.u64(BigInt(amountIn)),           // amount in
+      tx.pure.u64(BigInt(minAmountOut||'0')), // min amount out (slippage protection)
+      tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)), // sqrt price limit
+      tx.object(CLOCK_OBJ),                    // clock 0x6
     ],
   });
 
-  // Transfer results to wallet
+  // Must transfer both result coins back to wallet
   tx.transferObjects([resultA, resultB], tx.pure.address(wallet));
+  return tx;
+}
+
+// Build Turbos swap PTB
+// Verified from real mainnet tx: 9GadBDwwrGikdFCpdaPD4QbdPik5ET19Y97kpVzHmWch
+// Signature: turbos::swap(ctx, pool, versioned, a2b, amount, clock)
+// NOTE: Turbos requires FeeType as 3rd type argument — get from pool object
+async function buildTurbosSwapTx({ wallet, poolId, feeType, coinInType, coinOutType, a2b, amountIn }) {
+  const tx = new Transaction();
+  tx.setGasBudget(50_000_000);
+  tx.setSender(wallet);
+
+  // Prepare input coin same as Cetus
+  let coinIn;
+  if (coinInType === SUI_T) {
+    [coinIn] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
+  } else {
+    const coins = await getCoins(wallet, coinInType);
+    if (!coins.length) throw new Error('No token balance found in wallet');
+    let obj = tx.object(coins[0].coinObjectId);
+    if (coins.length > 1) tx.mergeCoins(obj, coins.slice(1).map(c=>tx.object(c.coinObjectId)));
+    const total = coins.reduce((s,c)=>s+BigInt(c.balance),0n);
+    if (BigInt(amountIn) < total) { [coinIn] = tx.splitCoins(obj,[tx.pure.u64(BigInt(amountIn))]); }
+    else { coinIn = obj; }
+  }
+
+  // Turbos swap — receives coin back via return value
+  const [resultCoin] = tx.moveCall({
+    target: `${TURBOS_PKG}::pool_script::swap_a_b`,
+    typeArguments: [coinInType, coinOutType, feeType],
+    arguments: [
+      tx.object(poolId),                                // pool (shared, mutable)
+      coinIn,                                            // coin in
+      tx.pure.u64(BigInt(amountIn)),                   // amount
+      tx.pure.bool(true),                               // by_amount_in
+      tx.pure.u64(0n),                                  // min_receive
+      tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)), // sqrt price limit
+      tx.object(TURBOS_VERSIONED),                      // versioned (shared, immutable)
+      tx.object(CLOCK_OBJ),                             // clock 0x6
+    ],
+  });
+  tx.transferObjects([resultCoin], tx.pure.address(wallet));
   return tx;
 }
 
@@ -302,7 +376,16 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 3. GeckoTerminal — identify which DEX the token lives on
+  // 3. Turbos pool check (now that we have correct API)
+  try {
+    const tPool = await findTurbosPool(SUI_T, ct);
+    if (tPool) {
+      const res = { state:'turbos', dex:'Turbos', poolId:tPool.poolId, feeType:tPool.feeType, a2b:tPool.a2b, coinA:tPool.coinA, coinB:tPool.coinB, ts:Date.now() };
+      stateCache.set(ct, res); return res;
+    }
+  } catch {}
+
+  // 4. GeckoTerminal — identify DEX for display purposes
   try {
     for (const addr of [ct, ct.split('::')[0]]) {
       const r = await ftch(
@@ -315,14 +398,13 @@ async function detectState(ct) {
         const dexRaw = d.data[0].relationships?.dex?.data?.id || 'dex';
         const dex = dexRaw[0].toUpperCase() + dexRaw.slice(1);
         const liq = parseFloat(d.data[0].attributes?.reserve_in_usd || 0);
-        // Return unsupported_dex so executeBuy/Sell can show a helpful error
         const res = { state:'unsupported_dex', dex, liq, ts: Date.now() };
         stateCache.set(ct, res); return res;
       }
     }
   } catch {}
 
-  // 4. Launchpad bonding curves
+  // 5. Launchpad bonding curves
   for (const [key, lp] of Object.entries(LAUNCHPADS)) {
     try {
       const enc = encodeURIComponent(ct);
@@ -437,8 +519,29 @@ async function executeBuy(chatId, ct, amtSui) {
 
 
 
+  if (st.state === 'turbos') {
+    // Turbos CLMM — direct swap using verified mainnet package
+    const tx = await buildTurbosSwapTx({ wallet:u.walletAddress, poolId:st.poolId, feeType:st.feeType, coinInType:SUI_T, coinOutType:ct, a2b:st.a2b, amountIn:tradeAmt.toString() });
+    const refMistT = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE*100))) / 100n : 0n;
+    const devMistT = feeMist - refMistT;
+    const [fcT] = tx.splitCoins(tx.gas, [tx.pure.u64(devMistT)]);
+    tx.transferObjects([fcT], tx.pure.address(DEV_WALLET));
+    if (refMistT > 0n && u.referredBy) {
+      const [rcT] = tx.splitCoins(tx.gas, [tx.pure.u64(refMistT)]);
+      tx.transferObjects([rcT], tx.pure.address(u.referredBy));
+      const ruT = Object.values(DB).find(x=>x.walletAddress===u.referredBy);
+      if (ruT) { ruT.referralEarned=(ruT.referralEarned||0)+Number(refMistT)/1e9; saveDB(); }
+    }
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos TX failed');
+    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
+    const tok = est ? Number(est)/Math.pow(10,meta.decimals||9) : 0;
+    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'Turbos CLMM', out:tok.toFixed(4), sym, bonding:false };
+  }
+
   if (st.state === 'unsupported_dex') {
-    throw new Error(`${sym} is on ${st.dex} (liq $${fNum(st.liq)}). Direct ${st.dex} swaps coming soon — trade there directly.`);
+    throw new Error(`${sym} is on ${st.dex}. Not yet supported — trade there directly.`);
   }
 
   if (st.state === 'bonding') {
@@ -488,6 +591,26 @@ async function executeSell(chatId, ct, pct) {
     if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p=>p.ct!==ct) });
     const suiOut = est ? (Number(est)/1e9).toFixed(4) : '?';
     return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus CLMM', sui:suiOut, sym, pct };
+  }
+
+  if (st.state === 'turbos') {
+    const tx = await buildTurbosSwapTx({ wallet:u.walletAddress, poolId:st.poolId, feeType:st.feeType, coinInType:ct, coinOutType:SUI_T, a2b:!st.a2b, amountIn:sell.toString() });
+    const sellRefMistT = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE*100))) / 100n : 0n;
+    const sellDevMistT = feeMist - sellRefMistT;
+    const [sfcT] = tx.splitCoins(tx.gas, [tx.pure.u64(sellDevMistT)]);
+    tx.transferObjects([sfcT], tx.pure.address(DEV_WALLET));
+    if (sellRefMistT > 0n && u.referredBy) {
+      const [srcT] = tx.splitCoins(tx.gas, [tx.pure.u64(sellRefMistT)]);
+      tx.transferObjects([srcT], tx.pure.address(u.referredBy));
+      const ruT=Object.values(DB).find(x=>x.walletAddress===u.referredBy);
+      if(ruT){ruT.referralEarned=(ruT.referralEarned||0)+Number(sellRefMistT)/1e9;saveDB();}
+    }
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos sell TX failed');
+    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p=>p.ct!==ct) });
+    const est = await getSwapEstimate(ct, SUI_T, sell.toString());
+    const suiOut = est ? (Number(est)/1e9).toFixed(4) : '?';
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'Turbos CLMM', sui:suiOut, sym, pct };
   }
 
   if (st.state === 'unsupported_dex') {
