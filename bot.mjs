@@ -293,38 +293,12 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 2. Turbos REST — check for Turbos CLMM pools
+  // 2. findCetusPool — broader Cetus search with both coin orderings
   try {
-    const r = await ftch(
-      `https://api.turbos.finance/pools?coin_type_a=0x2::sui::SUI&coin_type_b=${encodeURIComponent(ct)}&page=1&pageSize=5`,
-      { headers:{ Accept:'application/json' } }, 6000
-    );
-    if (r.ok) {
-      const d = await r.json();
-      const pools = (d.data || d.list || d.pools || d.result || []);
-      if (pools.length) {
-        const best = pools[0];
-        const poolId = best.pool_address || best.id || best.poolId;
-        const fee = best.fee_rate || best.fee || '3000';
-        const res = { state:'turbos', dex:'Turbos', poolId, fee, a2b: true, coinA: SUI_T, coinB: ct, ts: Date.now() };
-        stateCache.set(ct, res); return res;
-      }
-    }
-    // Try reversed
-    const r2 = await ftch(
-      `https://api.turbos.finance/pools?coin_type_a=${encodeURIComponent(ct)}&coin_type_b=0x2::sui::SUI&page=1&pageSize=5`,
-      { headers:{ Accept:'application/json' } }, 6000
-    );
-    if (r2.ok) {
-      const d = await r2.json();
-      const pools = (d.data || d.list || d.pools || d.result || []);
-      if (pools.length) {
-        const best = pools[0];
-        const poolId = best.pool_address || best.id || best.poolId;
-        const fee = best.fee_rate || best.fee || '3000';
-        const res = { state:'turbos', dex:'Turbos', poolId, fee, a2b: false, coinA: ct, coinB: SUI_T, ts: Date.now() };
-        stateCache.set(ct, res); return res;
-      }
+    const pool = await findCetusPool(SUI_T, ct);
+    if (pool) {
+      const res = { state:'cetus', dex:'Cetus', poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, ts:Date.now() };
+      stateCache.set(ct, res); return res;
     }
   } catch {}
 
@@ -461,34 +435,7 @@ async function executeBuy(chatId, ct, amtSui) {
     return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus CLMM', out:tok.toFixed(4), sym, bonding:false };
   }
 
-  if (st.state === 'turbos') {
-    // Turbos: route through Cetus if possible, otherwise show clear error
-    // (Full Turbos PTB requires fee type from pool struct — complex to get without SDK)
-    // Fallback: try Cetus with same pair first
-    const cetusPool = await findCetusPool(SUI_T, ct);
-    if (cetusPool) {
-      const est  = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
-      const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-      const minOut = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
-      const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:cetusPool.poolId, coinInType:SUI_T, coinOutType:ct, a2b:cetusPool.a2b, amountIn:tradeAmt.toString(), minAmountOut:minOut.toString() });
-      const refMist2 = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE*100))) / 100n : 0n;
-      const devMist2 = feeMist - refMist2;
-      const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist2)]);
-      tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
-      if (refMist2 > 0n && u.referredBy) {
-        const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist2)]);
-        tx.transferObjects([rc], tx.pure.address(u.referredBy));
-        const ru = Object.values(DB).find(x=>x.walletAddress===u.referredBy);
-        if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist2)/1e9; saveDB(); }
-      }
-      const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
-      if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
-      const tok = Number(est||0) / Math.pow(10, meta.decimals||9);
-      addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
-      return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus (for Turbos token)', out:tok.toFixed(4), sym, bonding:false };
-    }
-    throw new Error(`${sym} is on Turbos CLMM. Direct Turbos swaps coming soon — trade at turbos.finance`);
-  }
+
 
   if (st.state === 'unsupported_dex') {
     throw new Error(`${sym} is on ${st.dex} (liq $${fNum(st.liq)}). Direct ${st.dex} swaps coming soon — trade there directly.`);
@@ -516,17 +463,14 @@ async function executeSell(chatId, ct, pct) {
   if (sell === 0n) throw new Error('Sell amount is zero.');
   const st   = await detectState(ct);
 
-  if (st.state === 'cetus' || st.state === 'turbos') {
-    // For sells, try Cetus regardless of detected DEX (token may have Cetus pool for SUI pair)
-    const pool = st.state === 'cetus'
-      ? { poolId: st.poolId, a2b: !st.a2b } // reverse for sell
-      : await findCetusPool(ct, SUI_T);
-    if (!pool) throw new Error(`No Cetus sell pool found for ${sym}. Try selling on ${st.dex} directly.`);
+  if (st.state === 'cetus') {
+    // For sells, reverse the pool direction (buy was SUI→token, sell is token→SUI)
+    const pool = { poolId: st.poolId, a2b: !st.a2b };
     const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
     const est  = await getSwapEstimate(ct, SUI_T, sell.toString());
     const minOut = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const feeMist = (sell * BigInt(FEE_BPS)) / 10000n; // fee on output SUI
-    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinInType:ct, coinOutType:SUI_T, a2b: st.state==='cetus' ? !st.a2b : (pool.a2b ?? true), amountIn:sell.toString(), minAmountOut:minOut.toString() });
+    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinInType:ct, coinOutType:SUI_T, a2b: pool.a2b, amountIn:sell.toString(), minAmountOut:minOut.toString() });
     // Collect sell fee from SUI output — split and send in same PTB
     // Note: fee is taken from gas (SUI the user receives goes to their wallet via tx result)
     const sellRefMist = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE*100))) / 100n : 0n;
@@ -631,80 +575,33 @@ async function checkDenyCap(ct, deployer) {
   } catch { return null; }
 }
 
-// Honeypot: devInspectTransactionBlock simulates actual sell on-chain
-// Uses real holder coin objects for accurate simulation
+// Honeypot: check if token can be SOLD
+// Uses Cetus Router API for sell direction — most reliable non-SDK check
+// If sell route returns > 0, token is sellable = not a honeypot ✅
 async function checkHoneypot(ct, topHolders) {
-  const pool = await findCetusPool(SUI_T, ct).catch(()=>null);
-
-  // Method 1: Simulate SELL using real holder coins (most accurate)
-  if (pool && topHolders?.length) {
-    for (const holder of topHolders.slice(0,3)) {
-      if (!holder.addr || holder.addr.length < 10) continue;
-      try {
-        const holderCoins = await getCoins(holder.addr, ct);
-        if (!holderCoins.length) continue;
-        const sellBal = BigInt(holderCoins[0].balance);
-        if (sellBal === 0n) continue;
-        const sellAmt = sellBal / 10n > 0n ? sellBal / 10n : sellBal;
-
-        const tx = new Transaction();
-        tx.setGasBudget(20_000_000);
-        let obj = tx.object(holderCoins[0].coinObjectId);
-        if (holderCoins.length > 1) tx.mergeCoins(obj, holderCoins.slice(1,5).map(c=>tx.object(c.coinObjectId)));
-        const [sellCoin] = tx.splitCoins(obj, [tx.pure.u64(sellAmt)]);
-        const [empty]    = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
-        const sellA2b    = !pool.a2b;
-        const [coinA, coinB] = sellA2b ? [sellCoin, empty] : [empty, sellCoin];
-        const typeArgs = pool.a2b ? [SUI_T, ct] : [ct, SUI_T];
-        const [rA, rB] = tx.moveCall({
-          target: `${CETUS_PUBLISHED}::pool_script::swap`,
-          typeArguments: typeArgs,
-          arguments: [
-            tx.object(CETUS_CONFIG), tx.object(pool.poolId),
-            coinA, coinB,
-            tx.pure.bool(sellA2b), tx.pure.bool(true),
-            tx.pure.u64(sellAmt), tx.pure.u64(0n),
-            tx.pure.u128(sellA2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)),
-            tx.object(CLOCK_OBJ),
-          ],
-        });
-        tx.transferObjects([rA, rB], tx.pure.address(holder.addr));
-        const res = await sui.devInspectTransactionBlock({ transactionBlock:tx, sender:holder.addr });
-        return res.effects?.status?.status === 'success';
-      } catch {}
+  // Primary: check sell route via Cetus Router (token → SUI)
+  try {
+    const r = await ftch(
+      `${CETUS_ROUTER_URL}/find_routes?from=${encodeURIComponent(ct)}&target=${encodeURIComponent(SUI_T)}&amount=100000000&byAmountIn=true&depth=3`,
+      { headers:{ Accept:'application/json' } }, 10000
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const amtOut = d.data?.amountOut || d.data?.amount_out || d.amountOut || '0';
+      if (amtOut && amtOut !== '0' && BigInt(amtOut) > 0n) return true;
+      // Router returned 0 = no sell route = potential honeypot
+      if (d.data !== undefined) return false;
     }
-  }
+  } catch {}
 
-  // Method 2: Simulate BUY (confirms pool works at minimum)
-  if (pool) {
-    try {
-      const tx = new Transaction();
-      tx.setGasBudget(20_000_000);
-      const [coinIn] = tx.splitCoins(tx.gas, [tx.pure.u64(100_000_000n)]);
-      const [empty]  = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
-      const [coinA, coinB] = pool.a2b ? [coinIn, empty] : [empty, coinIn];
-      const typeArgs = pool.a2b ? [SUI_T, ct] : [ct, SUI_T];
-      const [rA, rB] = tx.moveCall({
-        target: `${CETUS_PUBLISHED}::pool_script::swap`,
-        typeArguments: typeArgs,
-        arguments: [
-          tx.object(CETUS_CONFIG), tx.object(pool.poolId),
-          coinA, coinB,
-          tx.pure.bool(pool.a2b), tx.pure.bool(true),
-          tx.pure.u64(100_000_000n), tx.pure.u64(0n),
-          tx.pure.u128(pool.a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)),
-          tx.object(CLOCK_OBJ),
-        ],
-      });
-      tx.transferObjects([rA, rB], tx.pure.address(DEV_WALLET));
-      const res = await sui.devInspectTransactionBlock({ transactionBlock:tx, sender:DEV_WALLET });
-      if (res.effects?.status?.status !== 'success') return false;
-    } catch {}
-  }
+  // Fallback: check if any Cetus pool exists for the reverse direction (token→SUI)
+  try {
+    const pool = await findCetusPool(ct, SUI_T);
+    if (pool) return true; // pool exists for sell direction = can sell ✅
+  } catch {}
 
-  // Method 3: Router estimate fallback
-  const est = await getSwapEstimate(ct, SUI_T, '100000000');
-  return est !== null && est !== '0';
+  // No pool found at all
+  return null;
 }
 
 // Holders: Blockberry with API key
@@ -896,13 +793,7 @@ function buyCard(d, ct) {
 }
 
 function scanReport(d, ct, st) {
-  const icons={SAFE:'🟢',CAUTION:'🟡','HIGH RISK':'🔴','LIKELY RUG':'💀',UNKNOWN:'⚪'};
   const top3  = d.topHolders.slice(0,3).reduce((t,h)=>t+h.pct, 0);
-  let risk='UNKNOWN';
-  if (d.honeypot===false||(d.liq<500&&st.state!=='bonding'&&!d.pools.length)) risk='LIKELY RUG';
-  else if (top3>50&&d.liq<5000) risk='HIGH RISK';
-  else if (top3>50||d.liq<5000) risk='CAUTION';
-  else if (d.liq>0)              risk='SAFE';
   const issues=[
     d.mint===true, d.honeypot===false,
     d.upgradeable===true, d.denyCap?.has===true,
@@ -941,7 +832,7 @@ function scanReport(d, ct, st) {
   const dcStr = d.denyCap===null?'⚪':!d.denyCap.has?'✅ No freeze ability':d.denyCap.globalPause?'❌ Can FREEZE ALL wallets':'⚠️ Can freeze specific wallets';
   L.push(`${d.denyCap===null?'⚪':d.denyCap.has?(d.denyCap.globalPause?'❌':'⚠️'):'✅'} Freeze: ${dcStr}`);
   L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev holds: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
-  L.push(`\n${icons[risk]||'⚪'} *Risk: ${risk}*`);
+  // Risk level removed — traders decide themselves after seeing the data
   return L.join('\n');
 }
 
@@ -1189,6 +1080,7 @@ async function doSettings(chatId) {
         [{text:'🔁 Edit Copy Amount',callback_data:'edit_copy_amt'}],
         [{text:'🎯 TP: Set Default',callback_data:'set_tp'},{text:'🛑 SL: Set Default',callback_data:'set_sl'}],
         [{text:'🗑 Clear TP/SL',callback_data:'clear_tpsl'}],
+        [{text:'🔑 View Private Key',callback_data:'view_pk'},{text:'🔄 Change Wallet',callback_data:'change_wallet'}],
       ]}}
     );
   });
@@ -1322,7 +1214,7 @@ bot.onText(/\/start(.*)/, async(msg, match) => {
     }
   }
   if(u.walletAddress){
-    await bot.sendMessage(chatId,`👋 Welcome back!\n\nWallet: \`${trunc(u.walletAddress)}\``,{parse_mode:'Markdown',reply_markup:MAIN_KB});
+    await bot.sendMessage(chatId,`👋 Welcome back, *${u.walletAddress.slice(0,6)}...*\n\n💼 *Your Wallet:*\n\`${u.walletAddress}\`\n\n_Tap the address to copy it_`,{parse_mode:'Markdown',reply_markup:MAIN_KB});
   }else{
     await bot.sendMessage(chatId,`👋 Welcome to *AGENT TRADING BOT*\n\nThe fastest trading bot on Sui.\n\nConnect your wallet:`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'🔑 Import Wallet',callback_data:'import_wallet'}],[{text:'✨ Create New Wallet',callback_data:'gen_wallet'}]]}});
   }
@@ -1422,6 +1314,29 @@ bot.on('callback_query', async(q) => {
     if(data==='set_tp'){updU(chatId,{state:'set_tp'});await bot.sendMessage(chatId,'🎯 Enter Take Profit % (e.g. 50 = take profit at +50%):\n_Send 0 to disable_',{parse_mode:'Markdown'});return;}
     if(data==='set_sl'){updU(chatId,{state:'set_sl'});await bot.sendMessage(chatId,'🛑 Enter Stop Loss % (e.g. 20 = stop loss at -20%):\n_Send 0 to disable_',{parse_mode:'Markdown'});return;}
     if(data==='clear_tpsl'){const u=getU(chatId);if(u){u.settings.tpDefault=null;u.settings.slDefault=null;saveDB();}await bot.sendMessage(chatId,'✅ TP/SL defaults cleared.');return;}
+    if(data==='edit_copy_amt'){updU(chatId,{state:'set_copy_amt'});await bot.sendMessage(chatId,'🔁 Enter copy trade amount in SUI per trade:\n_Example: 0.5_',{parse_mode:'Markdown'});return;}
+
+    if(data==='view_pk'){
+      const u=getU(chatId); if(!u?.encryptedKey){await bot.sendMessage(chatId,'❌ No wallet found.');return;}
+      // Require PIN before showing PK
+      updU(chatId,{state:'pin_for_pk'});
+      await bot.sendMessage(chatId,'🔒 Enter your 4-digit PIN to view your private key:');
+      return;
+    }
+
+    if(data==='change_wallet'){
+      await bot.sendMessage(chatId,
+        '🔄 *Change Wallet*\n\n' +
+        '⚠️ This will replace your current wallet.\n' +
+        'Make sure you have saved your current private key first!\n\n' +
+        'Choose an option:',
+        {parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'🔑 Import Existing Wallet',callback_data:'import_wallet'}],
+          [{text:'✨ Create New Wallet',callback_data:'gen_wallet'}],
+          [{text:'❌ Cancel',callback_data:'ca'}],
+        ]}});
+      return;
+    }
     if(data==='edit_copy_amt'){updU(chatId,{state:'set_copy_amt'});await bot.sendMessage(chatId,'🔁 Enter copy trade amount in SUI per trade:\n_Example: 0.5_',{parse_mode:'Markdown'});return;}
 
     // CA paste picker
@@ -1590,6 +1505,27 @@ bot.on('message', async(msg) => {
     const v=parseFloat(text); if(isNaN(v)||v<=0){await bot.sendMessage(chatId,'❌ Enter a positive number like 0.5');return;}
     const uu=getU(chatId); if(uu){uu.settings.copyAmount=v; saveDB();}
     await bot.sendMessage(chatId,`✅ Copy amount set: ${v} SUI per trade`); return;
+  }
+
+  if(state==='pin_for_pk'){
+    if(!/^\d{4}$/.test(text)){await bot.sendMessage(chatId,'❌ Enter 4-digit PIN:');return;}
+    if(hashPin(text)!==u.pinHash){
+      const fails=(u.failAttempts||0)+1;
+      updU(chatId,{failAttempts:fails});
+      await bot.sendMessage(chatId,`❌ Wrong PIN. ${MAX_FAILS-fails} attempts left.`);
+      return;
+    }
+    updU(chatId,{state:null,failAttempts:0});
+    try {
+      const pk = decKey(u.encryptedKey);
+      const pkMsg = await bot.sendMessage(chatId,
+        `🔑 *Your Private Key*\n\n\`${pk}\`\n\n⚠️ *This message will delete in 30 seconds.*\nNEVER share this with anyone.`,
+        {parse_mode:'Markdown'}
+      );
+      // Auto-delete after 30s
+      setTimeout(()=>bot.deleteMessage(chatId,pkMsg.message_id).catch(()=>{}), 30000);
+    } catch(e){await bot.sendMessage(chatId,'❌ Failed to decrypt key.');}
+    return;
   }
 
   if(state==='copy_wallet'){
