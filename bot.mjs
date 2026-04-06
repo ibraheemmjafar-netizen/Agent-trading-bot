@@ -32,7 +32,6 @@ const SUISCAN     = 'https://suiscan.xyz/mainnet/tx/';
 const GECKO       = 'https://api.geckoterminal.com/api/v2';
 const GECKO_NET   = 'sui-network';
 const BB_BASE     = 'https://api.blockberry.one/sui/v1';
-const API_7K      = 'https://api.7k.ag';
 const LOCK_MS     = 30 * 60 * 1000;
 const MAX_FAILS   = 3;
 const COOLDOWN_MS = 5 * 60 * 1000;
@@ -121,44 +120,61 @@ async function getCoins(addr,ct) { try { return (await sui.getCoins({ owner:addr
 async function getAllBals(addr)   { return sui.getAllBalances({ owner:addr }); }
 
 // ═══════════════════════════════════════════════════════════
-// 7K REST API — No SDK, pure HTTP
-// Fee collection: 7K takes commissionBps% from input and sends to partner atomically
-// This is the ONLY correct way to collect fees without modifying 7K's PTB
+// SWAP ENGINE — Aftermath Finance SDK
+// Aftermath aggregates all Sui DEXes (Cetus, Turbos, Bluefin, DeepBook, etc.)
+// and handles fee collection atomically via externalFee parameter
 // ═══════════════════════════════════════════════════════════
-// 7K REST API — tries multiple endpoint formats with 25s timeout
-// "this operation was aborted" = timeout → increased from 8s to 25s
-async function get7KQuote(tokenIn, tokenOut, amountIn) {
-  const params = `tokenIn=${encodeURIComponent(tokenIn)}&tokenOut=${encodeURIComponent(tokenOut)}&amountIn=${amountIn}&slippage=0.01`;
-  const urls = [
-    `${API_7K}/quote?${params}`,
-    `${API_7K}/v1/quote?${params}`,
-    `${API_7K}/swap/quote?${params}`,
-  ];
-  let lastErr = 'All 7K endpoints unreachable. Check Railway network settings.';
-  for (const url of urls) {
-    try {
-      const r = await ftch(url, { headers:{ Accept:'application/json' } }, 25000);
-      if (!r.ok) { const t=await r.text().catch(()=>''); lastErr=`7K HTTP ${r.status}: ${t.slice(0,60)}`; continue; }
-      const d = await r.json();
-      if (!d.outAmount || d.outAmount === '0') { lastErr='No route — token has no liquidity.'; continue; }
-      return d;
-    } catch(e) { lastErr = e.message?.includes('aborted') ? '7K API timeout — slow network, try again.' : e.message; }
-  }
-  throw new Error(lastErr);
+
+let _af = null;
+let _afRouter = null;
+
+async function getAfRouter() {
+  if (_afRouter) return _afRouter;
+  const { Aftermath } = await import('aftermath-ts-sdk');
+  _af = new Aftermath('MAINNET');
+  // init() is optional — SDK works without it but init fetches pool data
+  try { await Promise.race([_af.init(), new Promise(r=>setTimeout(r,5000))]); } catch {}
+  _afRouter = _af.Router();
+  return _afRouter;
 }
 
-async function build7KTx(quote, wallet, slippage) {
-  const body = JSON.stringify({ quoteResponse:quote, accountAddress:wallet, slippage:slippage/100, commission:{ partner:DEV_WALLET, commissionBps:FEE_BPS } });
-  const urls = [`${API_7K}/build-tx`, `${API_7K}/v1/build-tx`];
-  let lastErr = '7K build-tx unreachable.';
-  for (const url of urls) {
-    try {
-      const r = await ftch(url, { method:'POST', headers:{ 'Content-Type':'application/json', Accept:'application/json' }, body }, 30000);
-      if (!r.ok) { const t=await r.text().catch(()=>''); lastErr=`7K build-tx ${r.status}: ${t.slice(0,80)}`; continue; }
-      return await r.json();
-    } catch(e) { lastErr = e.message?.includes('aborted') ? '7K build-tx timeout — try again.' : e.message; }
-  }
-  throw new Error(lastErr);
+// Get a swap quote from Aftermath aggregator
+async function getSwapQuote(tokenIn, tokenOut, amountIn) {
+  const router = await getAfRouter();
+  const route = await router.getCompleteTradeRouteGivenAmountIn({
+    coinInType:    tokenIn,
+    coinOutType:   tokenOut,
+    coinInAmount:  BigInt(amountIn),
+    referrer:      DEV_WALLET,
+  });
+  if (!route || !route.coinOut?.amount || route.coinOut.amount === 0n)
+    throw new Error('No swap route found — token may have no liquidity.');
+  return route;
+}
+
+// Build swap transaction — Aftermath handles fee split atomically
+async function buildSwapTx(route, wallet, slippage) {
+  const router = await getAfRouter();
+  const tx = await router.getTransactionForCompleteTradeRoute({
+    walletAddress:  wallet,
+    completeRoute:  route,
+    slippage:       slippage / 100,   // e.g. 1 → 0.01
+    referrer:       DEV_WALLET,
+    // externalFee: Aftermath charges and routes our 1% atomically
+    externalFee: {
+      recipient:     DEV_WALLET,
+      feePercentage: FEE_BPS / 10000, // 100/10000 = 0.01 = 1%
+    },
+  });
+  return tx;
+}
+
+// Quote-only for price estimates (no build needed)
+async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
+  try {
+    const route = await getSwapQuote(tokenIn, tokenOut, amountIn);
+    return route.coinOut?.amount?.toString() || null;
+  } catch { return null; }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -171,11 +187,11 @@ async function detectState(ct) {
   const c = stateCache.get(ct);
   if (c && Date.now() - c.ts < STATE_TTL) return c;
 
-  // 1. 7K quote — covers all major DEXes
+  // 1. Aftermath quote — covers Cetus, Turbos, Bluefin, DeepBook, all major DEXes
   try {
-    const q = await get7KQuote(SUI_T, ct, '1000000000');
-    if (q?.outAmount && q.outAmount !== '0') {
-      const r = { state:'dex', dex: q.routes?.[0]?.poolType || '7K Aggregator', ts: Date.now() };
+    const out = await getSwapEstimate(SUI_T, ct, '1000000000');
+    if (out && out !== '0') {
+      const r = { state:'dex', dex:'Aftermath Aggregator', ts: Date.now() };
       stateCache.set(ct, r); return r;
     }
   } catch {}
@@ -228,34 +244,15 @@ async function detectState(ct) {
 // SWAP EXECUTION
 // ═══════════════════════════════════════════════════════════
 async function swapDex({ kp, wallet, inT, outT, amtMist, slippage, u }) {
-  // get7KQuote uses the full amount — 7K takes fee internally via commissionBps
-  const quote = await get7KQuote(inT, outT, amtMist.toString());
-  const built = await build7KTx(quote, wallet, slippage);
+  // Aftermath aggregator: fee collected atomically via externalFee param (1% to DEV_WALLET)
+  const route = await getSwapQuote(inT, outT, amtMist.toString());
+  const tx    = await buildSwapTx(route, wallet, slippage);
 
-  // 7K returns { tx: base64 } or { txBytes: base64 }
-  const txData = built.tx || built.txBytes || built.transaction;
-  if (!txData) throw new Error('7K returned no transaction data. Try again.');
-
-  // Execute 7K's tx directly — do NOT modify it (fee already included via commissionBps)
-  let tx;
-  if (typeof txData === 'string') {
-    tx = Transaction.from(txData);
-  } else {
-    // Already an object
-    tx = Transaction.from(JSON.stringify(txData));
-  }
-
-  // Track referral earnings in DB (off-chain accounting)
-  // 1% fee goes to DEV_WALLET via 7K commission
-  // We credit 25% of that to referrer in our DB for periodic payout
+  // Track referral earnings in DB (Aftermath sends 1% to DEV_WALLET, we log 25% share for referrer)
   const feeMist = (amtMist * BigInt(FEE_BPS)) / 10000n;
   if (u.referredBy) {
-    const refAmount = Number(feeMist) * REF_SHARE / 1e9;
-    const refUser   = Object.values(DB).find(x => x.walletAddress === u.referredBy);
-    if (refUser) {
-      refUser.referralEarned = (refUser.referralEarned || 0) + refAmount;
-      saveDB();
-    }
+    const refUser = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+    if (refUser) { refUser.referralEarned = (refUser.referralEarned||0) + Number(feeMist)*REF_SHARE/1e9; saveDB(); }
   }
 
   const res = await sui.signAndExecuteTransaction({
@@ -264,12 +261,9 @@ async function swapDex({ kp, wallet, inT, outT, amtMist, slippage, u }) {
   if (res.effects?.status?.status !== 'success')
     throw new Error(res.effects?.status?.error || 'Transaction failed on-chain');
 
-  return {
-    digest: res.digest,
-    out: quote.outAmount,
-    fee: feeMist,
-    route: quote.routes?.[0]?.poolType || '7K',
-  };
+  const outAmt = route.coinOut?.amount?.toString() || '0';
+  const dex    = route.routes?.[0]?.pool?.protocol || 'Aftermath';
+  return { digest: res.digest, out: outAmt, fee: feeMist, route: dex };
 }
 
 async function swapBuyBonding({ kp, wallet, ct, amtMist, curveId, u }) {
@@ -407,11 +401,11 @@ async function checkMintAuth(ct) {
   } catch { return null; }
 }
 
-// Honeypot: can we get a sell quote?
+// Honeypot: can we get a sell quote from Aftermath?
 async function checkHoneypot(ct) {
   try {
-    const q = await get7KQuote(ct, SUI_T, '100000000');
-    return !!(q?.outAmount && q.outAmount !== '0');
+    const out = await getSwapEstimate(ct, SUI_T, '100000000');
+    return out !== null && out !== '0';
   } catch { return null; }
 }
 
@@ -592,7 +586,7 @@ function buyCard(d, ct) {
   if (d.chg6h)  chgs.push(`6H: ${fChg(d.chg6h)}`);
   if (d.chg24h) chgs.push(`24H: ${fChg(d.chg24h)}`);
   if (chgs.length) L.push(`📉 ${chgs.join(' | ')}`);
-  if (d.pools.length>1) L.push(`🔀 ${d.pools.length} pools — 7K routes to best price`);
+  if (d.pools.length>1) L.push(`🔀 ${d.pools.length} pools — Aftermath routes to best price`);
   L.push(`\n🛡 *Audit* (Issues: ${issues})`);
   L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'?':d.mint?'Yes ⚠️':'No'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'?':d.honeypot?'No':'Yes ❌'}`);
   L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
@@ -633,7 +627,7 @@ function scanReport(d, ct, st) {
     L.push(`\n💧 *Pools (${d.pools.length} found)*`);
     d.pools.slice(0,4).forEach((p,i)=>L.push(`  ${i===0?'⭐':'•'} ${p.dex}: $${fNum(p.liq)}${p.vol>0?` | vol $${fNum(p.vol)}`:''}`));
     L.push(`Total liq: $${fNum(d.liq)}`);
-    L.push(`💡 7K routes to best pool automatically`);
+    L.push(`💡 Aftermath aggregator routes to highest liquidity pool`);
   } else { L.push('\n❌ No pools found on any DEX'); }
   L.push(`\n🛡 *Security* (Issues: ${issues})`);
   L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'?':d.mint?'Yes ⚠️':'No'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'?':d.honeypot?'No':'Yes ❌'}`);
@@ -656,9 +650,9 @@ async function getPnl(pos) {
   if (pos.source==='bonding'||!pos.tokens||pos.tokens<=0) return null;
   try {
     const amt = BigInt(Math.floor(pos.tokens * Math.pow(10, pos.dec||9)));
-    const q   = await get7KQuote(pos.ct, SUI_T, amt.toString());
-    if (!q?.outAmount||q.outAmount==='0') return null;
-    const cur = Number(q.outAmount)/1e9;
+    const out = await getSwapEstimate(pos.ct, SUI_T, amt.toString());
+    if (!out || out==='0') return null;
+    const cur = Number(out)/1e9;
     return { cur, pnl: cur-parseFloat(pos.spent), pct: (cur-parseFloat(pos.spent))/parseFloat(pos.spent)*100 };
   } catch { return null; }
 }
@@ -901,8 +895,8 @@ async function doHelp(chatId) {
     `*Account*\n` +
     `/referral — Referral earnings\n` +
     `/settings — Slippage, buy amounts, TP/SL\n\n` +
-    `*DEXes (7K Aggregator)*\n` +
-    `Cetus • Turbos • Aftermath • Bluefin • Kriya • FlowX • DeepBook\n\n` +
+    `*DEXes (Aftermath Aggregator)*\n` +
+    `Cetus • Turbos • Bluefin • Kriya • FlowX • DeepBook\n\n` +
     `*Launchpads*\n` +
     `MovePump • hop.fun • MoonBags • Turbos.fun\n\n` +
     `*Fee:* 1% per trade | Referrers earn 25% (tracked)`,
@@ -956,7 +950,7 @@ async function showBuyConfirm(chatId, ct, amtSui, eid) {
   const feeMist=(amtM*BigInt(FEE_BPS))/10000n;
   updU(chatId,{pd:{...getU(chatId).pd,ct,amtSui}});
   let est='?';
-  try{const q=await get7KQuote(SUI_T,ct,amtM.toString());if(q?.outAmount&&q.outAmount!=='0')est=(Number(q.outAmount)/Math.pow(10,meta.decimals||9)).toFixed(4);}catch{}
+  try{const out=await getSwapEstimate(SUI_T,ct,amtM.toString());if(out&&out!=='0')est=(Number(out)/Math.pow(10,meta.decimals||9)).toFixed(4);}catch{}
   const text=`💰 *Confirm Buy*\n\nToken: *${sym}*\nAmount: ${amtSui} SUI\nFee (1%): ${fSui(feeMist)} SUI\n${est!='?'?`Est. receive: ~${est} ${sym}\n`:''}Slippage: ${u.settings.slippage}%`;
   const kb={inline_keyboard:[[{text:'✅ Confirm Buy',callback_data:'bc'},{text:'❌ Cancel',callback_data:'ca'}]]};
   if(eid) await bot.editMessageText(text,{chat_id:chatId,message_id:eid,parse_mode:'Markdown',reply_markup:kb}).catch(async()=>bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb}));
@@ -985,7 +979,7 @@ async function showSellConfirm(chatId, ct, pct, eid) {
   const sellAmt=(total*BigInt(pct))/100n;
   const disp=(Number(sellAmt)/Math.pow(10,meta.decimals||9)).toFixed(4);
   let est='?';
-  try{const q=await get7KQuote(ct,SUI_T,sellAmt.toString());if(q?.outAmount&&q.outAmount!=='0')est=(Number(q.outAmount)/1e9).toFixed(4);}catch{}
+  try{const out=await getSwapEstimate(ct,SUI_T,sellAmt.toString());if(out&&out!=='0')est=(Number(out)/1e9).toFixed(4);}catch{}
   const text=`💸 *Confirm Sell*\n\nToken: *${sym}*\nSelling: ${pct}% (${disp} ${sym})\n${est!='?'?`Est. receive: ~${est} SUI\n`:''}Slippage: ${u.settings.slippage}%`;
   const kb={inline_keyboard:[[{text:'✅ Confirm Sell',callback_data:'sc'},{text:'❌ Cancel',callback_data:'ca'}]]};
   if(eid) await bot.editMessageText(text,{chat_id:chatId,message_id:eid,parse_mode:'Markdown',reply_markup:kb}).catch(async()=>bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb}));
@@ -1399,19 +1393,17 @@ async function main() {
   console.log('  AGENT TRADING BOT — Final v5');
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
 
-  // Test 7K API with the actual quote endpoint (not just health)
-  console.log('Testing 7K API...');
+  // Test Aftermath aggregator connectivity
+  console.log('Testing Aftermath aggregator...');
   try {
-    // Try a real quote: 1 SUI → USDC (fast test)
-    const testQ = await get7KQuote(
+    const out = await getSwapEstimate(
       '0x2::sui::SUI',
       '0x5d4b302506645c37ff133b98c4b50a5ae14841659738d6d733d59d0d217a93bf::coin::COIN',
       '1000000000'
     );
-    console.log(`✅ 7K API working — outAmount: ${testQ.outAmount?.slice(0,8)}`);
+    console.log(out && out !== '0' ? `✅ Aftermath working — estimated out: ${out.slice(0,8)}` : '⚠️ Aftermath: no route for test pair');
   } catch(e) {
-    console.warn(`⚠️ 7K API: ${e.message}`);
-    console.warn('   Buys/sells may fail until 7K is reachable from Railway network');
+    console.warn(`⚠️ Aftermath: ${e.message}`);
   }
 
   // Start background engines
