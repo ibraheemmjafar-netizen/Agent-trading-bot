@@ -1597,32 +1597,37 @@ async function main() {
 
   loadDB();
 
-  // Kill old polling sessions — use direct Telegram API (library method doesn't exist)
+  // Step 1: deleteWebhook to clear any webhook mode
   try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/deleteWebhook?drop_pending_updates=true`);
-    const d = await r.json();
-    console.log(d.ok ? '✅ Old sessions cleared' : `Webhook clear: ${d.description}`);
-  } catch(e) { console.warn('Webhook clear:', e.message); }
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/deleteWebhook?drop_pending_updates=true`);
+  } catch {}
+
+  // Step 2: Call getUpdates with timeout=0 — this KILLS any existing long-poll session
+  // Telegram only allows one active getUpdates caller. This forces the old one out.
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=-1&timeout=0&limit=1`);
+    await new Promise(r => setTimeout(r, 1500)); // wait for Telegram to terminate old session
+    console.log('✅ Old sessions cleared');
+  } catch(e) { console.warn('Session clear:', e.message); }
 
   // Get real bot username for referral links
   try {
     const me = await bot.getMe();
     BOT_USERNAME = me.username || BOT_USERNAME;
-    console.log(`Bot: @${BOT_USERNAME}`);
   } catch(e) { console.warn('getMe failed:', e.message); }
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('  AGENT TRADING BOT — Final v5');
+  console.log(`  Bot: @${BOT_USERNAME}`);
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
-
-  console.log('✅ Swap engine: Cetus CLMM (direct on-chain, no SDK)');
+  console.log('  Swap: Cetus CLMM (direct on-chain)');
 
   // Start background engines
   positionMonitor().catch(e=>console.error('Monitor:', e));
   sniperEngine().catch(e=>console.error('Sniper:', e));
   copyEngine().catch(e=>console.error('Copy:', e));
 
-  console.log('  Bot is live!');
+  console.log('  Bot is live! 🚀');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   if(ADMIN_ID) bot.sendMessage(ADMIN_ID,'🟢 AGENT TRADING BOT Final v5 online.').catch(()=>{});
 }
