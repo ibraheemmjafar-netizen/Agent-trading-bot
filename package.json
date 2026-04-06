@@ -5,7 +5,6 @@
   "main": "bot.mjs",
   "scripts": { "start": "node bot.mjs" },
   "dependencies": {
-    "@7kprotocol/sdk-ts": "2.0.0",
     "@mysten/sui": "^1.0.0",
     "bn.js": "^5.2.1",
     "node-telegram-bot-api": "^0.66.0",
