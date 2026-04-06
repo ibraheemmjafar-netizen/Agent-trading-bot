@@ -23,7 +23,7 @@ const ADMIN_ID    = process.env.ADMIN_CHAT_ID || '';
 const BB_KEY      = '9W0M5OHgX2gF05Si1AG7kPUm6hxg6P';
 
 const DEV_WALLET  = '0x47cee6fed8a44224350d0565a45dd97b320a9c3f54a8feb6036fb9b2d3a81a08';
-const FEE_BPS     = 100;       // 1% — used in 7K commission param
+const FEE_BPS     = 100;       // 1% fee, deducted before swap
 const REF_SHARE   = 0.25;      // 25% of fee tracked in DB for referrers
 const MIST        = 1_000_000_000n;
 const SUI_T       = '0x2::sui::SUI';
@@ -120,63 +120,147 @@ async function getCoins(addr,ct) { try { return (await sui.getCoins({ owner:addr
 async function getAllBals(addr)   { return sui.getAllBalances({ owner:addr }); }
 
 // ═══════════════════════════════════════════════════════════
-// SWAP ENGINE — Aftermath Finance SDK
-// Aftermath aggregates all Sui DEXes (Cetus, Turbos, Bluefin, DeepBook, etc.)
-// and handles fee collection atomically via externalFee parameter
+// SWAP ENGINE — Cetus CLMM + Turbos direct on-chain
+// No external SDK — pure @mysten/sui Transaction (PTB)
+// Cetus is the deepest liquidity DEX on Sui Mainnet
 // ═══════════════════════════════════════════════════════════
 
-let _af = null;
-let _afRouter = null;
+// Cetus CLMM known addresses (stable, from official Cetus docs)
+// Cetus CLMM — addresses from official Cetus SDK mainnet.ts
+const CETUS_PKG        = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb'; // clmm_pool.package_id
+const CETUS_PUBLISHED  = '0xc6faf3703b0e8ba9ed06b7851134bbbe7565eb35ff823fd78432baa4cbeaa12e'; // clmm_pool.published_at (use for Move calls)
+const CETUS_INTEGRATE  = '0x2d8c2e0fc6dd25b0214b3fa747e0fd27fd54608142cd2e4f64c1cd350cc4add4'; // integrate.published_at (multi-DEX router)
+const CETUS_CONFIG     = '0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f'; // global_config_id — WAS MISSING TRAILING f
+const CETUS_ROUTER_URL = 'https://api-sui.cetus.zone/router';
+const CLOCK_OBJ        = '0x6';
 
-async function getAfRouter() {
-  if (_afRouter) return _afRouter;
-  const { Aftermath } = await import('aftermath-ts-sdk');
-  _af = new Aftermath('MAINNET');
-  // Fire init in background — SDK fetches pool data. Don't block on it.
-  // Routes still work without init (SDK fetches on-demand), just may be slower first call.
-  _af.init().catch(() => {});
-  _afRouter = _af.Router();
-  return _afRouter;
+// Cetus sqrt_price_limit constants (from Cetus SDK magic-numbers)
+const CETUS_MIN_SQRT = '4295048016';               // a2b = true  (selling coinA)
+const CETUS_MAX_SQRT = '79226673515401279992447579055'; // a2b = false (selling coinB)
+
+// Find best Cetus pool for a token pair
+// Queries both orderings since Cetus stores pools as CoinA/CoinB pairs
+async function findCetusPool(coinA, coinB) {
+  // Normalize — SUI is always the base in most pools
+  for (const [ca, cb, isA2b] of [[coinA, coinB, true], [coinB, coinA, false]]) {
+    try {
+      const r = await ftch(
+        `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type_a=${encodeURIComponent(ca)}&coin_type_b=${encodeURIComponent(cb)}&limit=5&order_by=tvl&order=desc`,
+        { headers: { Accept: 'application/json' } }, 8000
+      );
+      if (!r.ok) continue;
+      const d = await r.json();
+      const pools = d.data?.list || [];
+      if (!pools.length) continue;
+      // Pick highest TVL pool
+      const p = pools[0];
+      const poolId = p.pool_address || p.id;
+      if (!poolId) continue;
+      return { poolId, a2b: isA2b, coinA: ca, coinB: cb, liq: parseFloat(p.tvl || p.liquidity_usd || 0) };
+    } catch {}
+  }
+  return null;
 }
 
-// Get a swap quote from Aftermath aggregator
-async function getSwapQuote(tokenIn, tokenOut, amountIn) {
-  const router = await getAfRouter();
-  const route = await router.getCompleteTradeRouteGivenAmountIn({
-    coinInType:    tokenIn,
-    coinOutType:   tokenOut,
-    coinInAmount:  BigInt(amountIn),
-    referrer:      DEV_WALLET,
-  });
-  if (!route || !route.coinOut?.amount || route.coinOut.amount === 0n)
-    throw new Error('No swap route found — token may have no liquidity.');
-  return route;
+// Get swap estimate — uses Cetus Router API which covers ALL DEXes
+// (Cetus, Turbos, DeepBook, Aftermath, Kriya, Bluefin)
+async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
+  // 1. Cetus Router API (multi-DEX, most accurate)
+  try {
+    const r = await ftch(
+      `${CETUS_ROUTER_URL}/find_routes?from=${encodeURIComponent(tokenIn)}&target=${encodeURIComponent(tokenOut)}&amount=${amountIn}&byAmountIn=true&depth=3&splitAlgorithm=1&splitFactor=1&splitCount=1`,
+      { headers: { Accept: 'application/json' } }, 10000
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const amountOut = d.data?.amountOut || d.data?.amount_out || d.amountOut;
+      if (amountOut && amountOut !== '0') return amountOut.toString();
+    }
+  } catch {}
+
+  // 2. Cetus pool direct estimate fallback
+  try {
+    const pool = await findCetusPool(tokenIn, tokenOut);
+    if (!pool) return null;
+    const r = await ftch(
+      `https://api-sui.cetus.zone/v2/sui/swap/calculate?pool_id=${pool.poolId}&a_to_b=${pool.a2b}&amount=${amountIn}&amount_specified_is_input=true`,
+      { headers: { Accept: 'application/json' } }, 6000
+    );
+    if (r.ok) {
+      const d = await r.json();
+      return d.data?.amount_out?.toString() || null;
+    }
+  } catch {}
+
+  return null;
 }
 
-// Build swap transaction — Aftermath handles fee split atomically
-async function buildSwapTx(route, wallet, slippage) {
-  const router = await getAfRouter();
-  const tx = await router.getTransactionForCompleteTradeRoute({
-    walletAddress:  wallet,
-    completeRoute:  route,
-    slippage:       slippage / 100,   // e.g. 1 → 0.01
-    referrer:       DEV_WALLET,
-    // externalFee: Aftermath charges and routes our 1% atomically
-    externalFee: {
-      recipient:     DEV_WALLET,
-      feePercentage: FEE_BPS / 10000, // 100/10000 = 0.01 = 1%
-    },
+// Build Cetus swap PTB — direct Move call, no SDK needed
+async function buildCetusSwapTx({ wallet, poolId, coinInType, coinOutType, a2b, amountIn, minAmountOut }) {
+  const tx = new Transaction();
+  tx.setGasBudget(50_000_000);
+  tx.setSender(wallet);
+
+  // Split the input coin from gas (for SUI → token swaps)
+  // For token → SUI, we need to use the actual token coin objects
+  let coinIn;
+  if (coinInType === SUI_T) {
+    [coinIn] = tx.splitCoins(tx.gas, [tx.pure.u64(amountIn)]);
+  } else {
+    // For token sells: get coin objects and merge if needed
+    const coins = await getCoins(wallet, coinInType);
+    if (!coins.length) throw new Error('No token balance found');
+    let obj = tx.object(coins[0].coinObjectId);
+    if (coins.length > 1) {
+      tx.mergeCoins(obj, coins.slice(1).map(c => tx.object(c.coinObjectId)));
+    }
+    const total = coins.reduce((s,c) => s + BigInt(c.balance), 0n);
+    if (BigInt(amountIn) < total) {
+      [coinIn] = tx.splitCoins(obj, [tx.pure.u64(amountIn)]);
+    } else {
+      coinIn = obj;
+    }
+  }
+
+  // Create an empty coin for the output side (Cetus requires both coins as input)
+  // For SUI→token: coin_a = SUI (split), coin_b = empty token coin
+  // For token→SUI: coin_a = empty SUI coin (0), coin_b = token coin
+  let coinA, coinB;
+  if (a2b) {
+    // Swapping coinA → coinB
+    coinA = coinIn;
+    const [empty] = tx.splitCoins(tx.gas, [tx.pure.u64(0)]);
+    coinB = empty;
+  } else {
+    const [empty] = tx.splitCoins(tx.gas, [tx.pure.u64(0)]);
+    coinA = empty;
+    coinB = coinIn;
+  }
+
+  // Call Cetus swap
+  const [resultA, resultB] = tx.moveCall({
+    target: `${CETUS_PUBLISHED}::pool_script::swap`,
+    typeArguments: a2b ? [coinInType, coinOutType] : [coinOutType, coinInType],
+    arguments: [
+      tx.object(CETUS_CONFIG),
+      tx.object(poolId),
+      coinA,
+      coinB,
+      tx.pure.bool(a2b),
+      tx.pure.bool(true),              // by_amount_in = true
+      tx.pure.u64(BigInt(amountIn)),
+      tx.pure.u64(BigInt(minAmountOut || '0')),
+      tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)),
+      tx.object(CLOCK_OBJ),
+    ],
   });
+
+  // Transfer results to wallet
+  tx.transferObjects([resultA, resultB], tx.pure.address(wallet));
   return tx;
 }
 
-// Quote-only for price estimates (no build needed)
-async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
-  try {
-    const route = await getSwapQuote(tokenIn, tokenOut, amountIn);
-    return route.coinOut?.amount?.toString() || null;
-  } catch { return null; }
-}
+// getSwapQuote removed — executeBuy/Sell call getSwapEstimate+buildCetusSwapTx directly
 
 // ═══════════════════════════════════════════════════════════
 // TOKEN STATE DETECTION
@@ -188,34 +272,80 @@ async function detectState(ct) {
   const c = stateCache.get(ct);
   if (c && Date.now() - c.ts < STATE_TTL) return c;
 
-  // 1. Aftermath quote — covers Cetus, Turbos, Bluefin, DeepBook, all major DEXes
+  // 1. Cetus REST — get pool ID directly (needed for PTB)
   try {
-    const out = await getSwapEstimate(SUI_T, ct, '1000000000');
-    if (out && out !== '0') {
-      const r = { state:'dex', dex:'Aftermath Aggregator', ts: Date.now() };
-      stateCache.set(ct, r); return r;
-    }
-  } catch {}
-
-  // 2. GeckoTerminal pool check
-  try {
-    for (const addr of [ct, ct.split('::')[0]]) {
-      const r = await ftch(`${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
-        { headers:{ Accept:'application/json;version=20230302' } }, 5000);
-      if (!r.ok) continue;
+    const r = await ftch(
+      `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type=${encodeURIComponent(ct)}&page_size=5&order_by=tvl&order=desc`,
+      { headers:{ Accept:'application/json' } }, 6000
+    );
+    if (r.ok) {
       const d = await r.json();
-      if (d.data?.length) {
-        const dex = d.data[0].relationships?.dex?.data?.id || 'DEX';
-        const res = { state:'dex', dex: dex[0].toUpperCase()+dex.slice(1), ts: Date.now() };
+      const pools = d.data?.list || [];
+      if (pools.length) {
+        const best = pools[0];
+        const poolId = best.pool_address || best.id;
+        const coinA  = best.coin_type_a || SUI_T;
+        const coinB  = best.coin_type_b || ct;
+        const a2b    = coinA.toLowerCase() === SUI_T.toLowerCase();
+        const res = { state:'cetus', dex:'Cetus', poolId, coinA, coinB, a2b, ts: Date.now() };
         stateCache.set(ct, res); return res;
       }
     }
   } catch {}
 
-  // 3. Cetus REST
+  // 2. Turbos REST — check for Turbos CLMM pools
   try {
-    const r = await ftch(`https://api-sui.cetus.zone/v2/sui/pools_info?coin_type=${encodeURIComponent(ct)}&page_size=3`, {}, 5000);
-    if (r.ok) { const d = await r.json(); if (d.data?.list?.length) { const res = { state:'dex', dex:'Cetus', ts:Date.now() }; stateCache.set(ct,res); return res; } }
+    const r = await ftch(
+      `https://api.turbos.finance/pools?coin_type_a=0x2::sui::SUI&coin_type_b=${encodeURIComponent(ct)}&page=1&pageSize=5`,
+      { headers:{ Accept:'application/json' } }, 6000
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const pools = (d.data || d.list || d.pools || d.result || []);
+      if (pools.length) {
+        const best = pools[0];
+        const poolId = best.pool_address || best.id || best.poolId;
+        const fee = best.fee_rate || best.fee || '3000';
+        const res = { state:'turbos', dex:'Turbos', poolId, fee, a2b: true, coinA: SUI_T, coinB: ct, ts: Date.now() };
+        stateCache.set(ct, res); return res;
+      }
+    }
+    // Try reversed
+    const r2 = await ftch(
+      `https://api.turbos.finance/pools?coin_type_a=${encodeURIComponent(ct)}&coin_type_b=0x2::sui::SUI&page=1&pageSize=5`,
+      { headers:{ Accept:'application/json' } }, 6000
+    );
+    if (r2.ok) {
+      const d = await r2.json();
+      const pools = (d.data || d.list || d.pools || d.result || []);
+      if (pools.length) {
+        const best = pools[0];
+        const poolId = best.pool_address || best.id || best.poolId;
+        const fee = best.fee_rate || best.fee || '3000';
+        const res = { state:'turbos', dex:'Turbos', poolId, fee, a2b: false, coinA: ct, coinB: SUI_T, ts: Date.now() };
+        stateCache.set(ct, res); return res;
+      }
+    }
+  } catch {}
+
+  // 3. GeckoTerminal — identify which DEX the token lives on
+  try {
+    for (const addr of [ct, ct.split('::')[0]]) {
+      const r = await ftch(
+        `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
+        { headers:{ Accept:'application/json;version=20230302' } }, 5000
+      );
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (d.data?.length) {
+        const dexRaw = d.data[0].relationships?.dex?.data?.id || 'dex';
+        const dex = dexRaw[0].toUpperCase() + dexRaw.slice(1);
+        const liq = parseFloat(d.data[0].attributes?.reserve_in_usd || 0);
+        // Return unsupported_dex so executeBuy/Sell can show a helpful error
+        const res = { state:'unsupported_dex', dex, liq, ts: Date.now() };
+        stateCache.set(ct, res); return res;
+      }
+    }
   } catch {}
 
   // 4. Launchpad bonding curves
@@ -244,28 +374,7 @@ async function detectState(ct) {
 // ═══════════════════════════════════════════════════════════
 // SWAP EXECUTION
 // ═══════════════════════════════════════════════════════════
-async function swapDex({ kp, wallet, inT, outT, amtMist, slippage, u }) {
-  // Aftermath aggregator: fee collected atomically via externalFee param (1% to DEV_WALLET)
-  const route = await getSwapQuote(inT, outT, amtMist.toString());
-  const tx    = await buildSwapTx(route, wallet, slippage);
-
-  // Track referral earnings in DB (Aftermath sends 1% to DEV_WALLET, we log 25% share for referrer)
-  const feeMist = (amtMist * BigInt(FEE_BPS)) / 10000n;
-  if (u.referredBy) {
-    const refUser = Object.values(DB).find(x => x.walletAddress === u.referredBy);
-    if (refUser) { refUser.referralEarned = (refUser.referralEarned||0) + Number(feeMist)*REF_SHARE/1e9; saveDB(); }
-  }
-
-  const res = await sui.signAndExecuteTransaction({
-    signer: kp, transaction: tx, options: { showEffects: true },
-  });
-  if (res.effects?.status?.status !== 'success')
-    throw new Error(res.effects?.status?.error || 'Transaction failed on-chain');
-
-  const outAmt = route.coinOut?.amount?.toString() || '0';
-  const dex    = route.routes?.[0]?.pool?.protocol || 'Aftermath';
-  return { digest: res.digest, out: outAmt, fee: feeMist, route: dex };
-}
+// swapDex removed — executeBuy/Sell handle routing directly
 
 async function swapBuyBonding({ kp, wallet, ct, amtMist, curveId, u }) {
   const pkg = ct.split('::')[0];
@@ -323,11 +432,66 @@ async function executeBuy(chatId, ct, amtSui) {
   const sym  = meta.symbol || trunc(ct);
   const st   = await detectState(ct);
 
-  if (st.state === 'dex' || st.state === 'unknown') {
-    const res = await swapDex({ kp, wallet:u.walletAddress, inT:SUI_T, outT:ct, amtMist:amt, slippage:u.settings.slippage, u });
-    const tok = Number(res.out) / Math.pow(10, meta.decimals||9);
-    addPos(chatId, { ct, sym, entry: Number(amt-res.fee)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
-    return { digest:res.digest, feeSui:fSui(res.fee), route:res.route, out:tok.toFixed(4), sym, bonding:false };
+  // Fee deduction
+  const feeMist  = (amt * BigInt(FEE_BPS)) / 10000n;
+  const tradeAmt = amt - feeMist;
+
+  if (st.state === 'cetus') {
+    const pool = { poolId: st.poolId, a2b: st.a2b };
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est  = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
+    const minOut = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const tx = await buildCetusSwapTx({ wallet: u.walletAddress, poolId: pool.poolId, coinInType: SUI_T, coinOutType: ct, a2b: pool.a2b, amountIn: tradeAmt.toString(), minAmountOut: minOut.toString() });
+    // Fee split: DEV gets 75%, referrer gets 25% — paid on-chain in same PTB
+    const refMist = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE*100))) / 100n : 0n;
+    const devMist = feeMist - refMist;
+    const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
+    tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
+    if (refMist > 0n && u.referredBy) {
+      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]);
+      tx.transferObjects([rc], tx.pure.address(u.referredBy));
+      // Update referrer earnings in DB for dashboard display
+      const ru = Object.values(DB).find(x=>x.walletAddress===u.referredBy);
+      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
+    const tok = Number(est||0) / Math.pow(10, meta.decimals||9);
+    addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus CLMM', out:tok.toFixed(4), sym, bonding:false };
+  }
+
+  if (st.state === 'turbos') {
+    // Turbos: route through Cetus if possible, otherwise show clear error
+    // (Full Turbos PTB requires fee type from pool struct — complex to get without SDK)
+    // Fallback: try Cetus with same pair first
+    const cetusPool = await findCetusPool(SUI_T, ct);
+    if (cetusPool) {
+      const est  = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
+      const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+      const minOut = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+      const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:cetusPool.poolId, coinInType:SUI_T, coinOutType:ct, a2b:cetusPool.a2b, amountIn:tradeAmt.toString(), minAmountOut:minOut.toString() });
+      const refMist2 = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE*100))) / 100n : 0n;
+      const devMist2 = feeMist - refMist2;
+      const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist2)]);
+      tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
+      if (refMist2 > 0n && u.referredBy) {
+        const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist2)]);
+        tx.transferObjects([rc], tx.pure.address(u.referredBy));
+        const ru = Object.values(DB).find(x=>x.walletAddress===u.referredBy);
+        if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist2)/1e9; saveDB(); }
+      }
+      const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+      if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
+      const tok = Number(est||0) / Math.pow(10, meta.decimals||9);
+      addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+      return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus (for Turbos token)', out:tok.toFixed(4), sym, bonding:false };
+    }
+    throw new Error(`${sym} is on Turbos CLMM. Direct Turbos swaps coming soon — trade at turbos.finance`);
+  }
+
+  if (st.state === 'unsupported_dex') {
+    throw new Error(`${sym} is on ${st.dex} (liq $${fNum(st.liq)}). Direct ${st.dex} swaps coming soon — trade there directly.`);
   }
 
   if (st.state === 'bonding') {
@@ -337,7 +501,7 @@ async function executeBuy(chatId, ct, amtSui) {
     return { digest:res.digest, feeSui:fSui(res.fee), route:st.lpName, out:'?', sym, bonding:true, lpName:st.lpName };
   }
 
-  throw new Error('Token has no liquidity on any DEX or launchpad.');
+  throw new Error(`${sym} — no liquidity found on any DEX or launchpad.`);
 }
 
 async function executeSell(chatId, ct, pct) {
@@ -352,10 +516,38 @@ async function executeSell(chatId, ct, pct) {
   if (sell === 0n) throw new Error('Sell amount is zero.');
   const st   = await detectState(ct);
 
-  if (st.state === 'dex' || st.state === 'unknown') {
-    const res = await swapDex({ kp, wallet:u.walletAddress, inT:ct, outT:SUI_T, amtMist:sell, slippage:u.settings.slippage, u });
+  if (st.state === 'cetus' || st.state === 'turbos') {
+    // For sells, try Cetus regardless of detected DEX (token may have Cetus pool for SUI pair)
+    const pool = st.state === 'cetus'
+      ? { poolId: st.poolId, a2b: !st.a2b } // reverse for sell
+      : await findCetusPool(ct, SUI_T);
+    if (!pool) throw new Error(`No Cetus sell pool found for ${sym}. Try selling on ${st.dex} directly.`);
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est  = await getSwapEstimate(ct, SUI_T, sell.toString());
+    const minOut = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const feeMist = (sell * BigInt(FEE_BPS)) / 10000n; // fee on output SUI
+    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinInType:ct, coinOutType:SUI_T, a2b: st.state==='cetus' ? !st.a2b : (pool.a2b ?? true), amountIn:sell.toString(), minAmountOut:minOut.toString() });
+    // Collect sell fee from SUI output — split and send in same PTB
+    // Note: fee is taken from gas (SUI the user receives goes to their wallet via tx result)
+    const sellRefMist = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE*100))) / 100n : 0n;
+    const sellDevMist = feeMist - sellRefMist;
+    const [sfc] = tx.splitCoins(tx.gas, [tx.pure.u64(sellDevMist)]);
+    tx.transferObjects([sfc], tx.pure.address(DEV_WALLET));
+    if (sellRefMist > 0n && u.referredBy) {
+      const [src] = tx.splitCoins(tx.gas, [tx.pure.u64(sellRefMist)]);
+      tx.transferObjects([src], tx.pure.address(u.referredBy));
+      const ru=Object.values(DB).find(x=>x.walletAddress===u.referredBy);
+      if(ru){ru.referralEarned=(ru.referralEarned||0)+Number(sellRefMist)/1e9;saveDB();}
+    }
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
     if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p=>p.ct!==ct) });
-    return { digest:res.digest, feeSui:fSui(res.fee), route:res.route, sui:(Number(res.out)/1e9).toFixed(4), sym, pct };
+    const suiOut = est ? (Number(est)/1e9).toFixed(4) : '?';
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus CLMM', sui:suiOut, sym, pct };
+  }
+
+  if (st.state === 'unsupported_dex') {
+    throw new Error(`${sym} is on ${st.dex}. Sell directly at their DEX.`);
   }
 
   if (st.state === 'bonding') {
@@ -365,7 +557,17 @@ async function executeSell(chatId, ct, pct) {
     return { digest:res.digest, feeSui:'N/A', route:st.lpName, sui:'?', sym, pct };
   }
 
-  throw new Error('Cannot sell — not found on any DEX or launchpad.');
+  // Last resort — try Cetus anyway
+  const pool = await findCetusPool(ct, SUI_T);
+  if (pool) {
+    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinInType:ct, coinOutType:SUI_T, a2b:pool.a2b, amountIn:sell.toString(), minAmountOut:'0' });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
+    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p=>p.ct!==ct) });
+    return { digest:res.digest, feeSui:'0', route:'Cetus', sui:'?', sym, pct };
+  }
+
+  throw new Error(`Cannot sell ${sym} — not found on any supported DEX.`);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -402,7 +604,7 @@ async function checkMintAuth(ct) {
   } catch { return null; }
 }
 
-// Honeypot: can we get a sell quote from Aftermath?
+// Honeypot: can we get a sell quote from Cetus?
 async function checkHoneypot(ct) {
   try {
     const out = await getSwapEstimate(ct, SUI_T, '100000000');
@@ -587,7 +789,7 @@ function buyCard(d, ct) {
   if (d.chg6h)  chgs.push(`6H: ${fChg(d.chg6h)}`);
   if (d.chg24h) chgs.push(`24H: ${fChg(d.chg24h)}`);
   if (chgs.length) L.push(`📉 ${chgs.join(' | ')}`);
-  if (d.pools.length>1) L.push(`🔀 ${d.pools.length} pools — Aftermath routes to best price`);
+  if (d.pools.length>1) L.push(`🔀 ${d.pools.length} pools — routed through best liquidity`);
   L.push(`\n🛡 *Audit* (Issues: ${issues})`);
   L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'?':d.mint?'Yes ⚠️':'No'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'?':d.honeypot?'No':'Yes ❌'}`);
   L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
@@ -628,7 +830,7 @@ function scanReport(d, ct, st) {
     L.push(`\n💧 *Pools (${d.pools.length} found)*`);
     d.pools.slice(0,4).forEach((p,i)=>L.push(`  ${i===0?'⭐':'•'} ${p.dex}: $${fNum(p.liq)}${p.vol>0?` | vol $${fNum(p.vol)}`:''}`));
     L.push(`Total liq: $${fNum(d.liq)}`);
-    L.push(`💡 Aftermath aggregator routes to highest liquidity pool`);
+    L.push(`💡 Cetus CLMM — deepest Sui liquidity`);
   } else { L.push('\n❌ No pools found on any DEX'); }
   L.push(`\n🛡 *Security* (Issues: ${issues})`);
   L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'?':d.mint?'Yes ⚠️':'No'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'?':d.honeypot?'No':'Yes ❌'}`);
@@ -710,7 +912,8 @@ async function sniperEngine() {
         try {
           stateCache.delete(w.ct);
           const st=await detectState(w.ct);
-          const fire=w.mode==='grad'?st.state==='dex':(st.state==='dex'||st.state==='bonding');
+          const isDex=['cetus','turbos'].includes(st.state);
+          const fire=w.mode==='grad'?isDex:(isDex||st.state==='bonding');
           if (!fire) continue;
           w.triggered=true;
           // Remove triggered watch from array
@@ -850,12 +1053,16 @@ async function doReferral(chatId) {
   const active=Object.values(DB).filter(x=>x.referredBy===u.walletAddress&&Date.now()-x.lastActivity<30*24*3600*1000).length;
   await bot.sendMessage(chatId,
     `🔗 *Referral Dashboard*\n\n` +
-    `Code: \`${u.referralCode}\`\nLink: \`${link}\`\n\n` +
+    `Code: \`${u.referralCode}\`\n` +
+    `Link: \`${link}\`\n\n` +
     `👥 Total referrals: ${u.referralCount||0}\n` +
     `⚡ Active last 30d: ${active}\n` +
-    `💰 Earned (accounting): ${(u.referralEarned||0).toFixed(4)} SUI\n\n` +
-    `*Share your link — earn 25% of fees from your referrals.*\n` +
-    `_Fee collection: 1% per trade. Your share tracked in our system._`,
+    `💰 Total earned: ${(u.referralEarned||0).toFixed(4)} SUI\n\n` +
+    `*How it works:*\n` +
+    `• Every trade your referrals make pays 1% fee\n` +
+    `• 25% of that fee (0.25%) is sent *directly to your wallet* in the same transaction — no claiming needed\n` +
+    `• 75% goes to the dev wallet\n\n` +
+    `*Share your link and earn passively on every trade they make forever.*`,
     {parse_mode:'Markdown'});
 }
 
@@ -873,6 +1080,7 @@ async function doSettings(chatId) {
         [{text:'— Slippage —',callback_data:'noop'}],
         [{text:'0.5%',callback_data:'slip:0.5'},{text:'1%',callback_data:'slip:1'},{text:'2%',callback_data:'slip:2'},{text:'5%',callback_data:'slip:5'}],
         [{text:'💰 Edit Quick-Buy Amounts',callback_data:'edit_amts'}],
+        [{text:'🔁 Edit Copy Amount',callback_data:'edit_copy_amt'}],
         [{text:'🎯 TP: Set Default',callback_data:'set_tp'},{text:'🛑 SL: Set Default',callback_data:'set_sl'}],
         [{text:'🗑 Clear TP/SL',callback_data:'clear_tpsl'}],
       ]}}
@@ -896,8 +1104,8 @@ async function doHelp(chatId) {
     `*Account*\n` +
     `/referral — Referral earnings\n` +
     `/settings — Slippage, buy amounts, TP/SL\n\n` +
-    `*DEXes (Aftermath Aggregator)*\n` +
-    `Cetus • Turbos • Bluefin • Kriya • FlowX • DeepBook\n\n` +
+    `*DEXes*\n` +
+    `Cetus CLMM (primary) • Turbos • Bluefin • FlowX\n\n` +
     `*Launchpads*\n` +
     `MovePump • hop.fun • MoonBags • Turbos.fun\n\n` +
     `*Fee:* 1% per trade | Referrers earn 25% (tracked)`,
@@ -937,7 +1145,7 @@ async function startBuy(chatId, ct) {
     updU(chatId,{pd:{ct,sym}});
     const amts=u.settings.buyAmounts||DEF_AMTS;
     await bot.editMessageText(
-      `💰 *Buy ${sym}*\n\`${ct}\`\n\n⚠️ Token data unavailable — 7K routes to best price automatically\n\n*Select amount:*`,
+      `💰 *Buy ${sym}*\n\`${ct}\`\n\n⚠️ Token data unavailable — Cetus CLMM will route to best price\n\n*Select amount:*`,
       {chat_id:chatId,message_id:lm.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[amts.map((a,i)=>({text:`${a} SUI`,callback_data:`ba:${i}`})),[{text:'✏️ Custom',callback_data:'ba:c'},{text:'❌ Cancel',callback_data:'ca'}]]}}
     );
   }
@@ -976,7 +1184,9 @@ async function showSellConfirm(chatId, ct, pct, eid) {
   const meta=await getMeta(ct)||{};
   const sym=meta.symbol||trunc(ct);
   const coins=await getCoins(u.walletAddress,ct);
+  if(!coins.length){await bot.sendMessage(chatId,`❌ No ${sym} in wallet.`);return;}
   const total=coins.reduce((s,c)=>s+BigInt(c.balance),0n);
+  if(total===0n){await bot.sendMessage(chatId,`❌ ${sym} balance is zero.`);return;}
   const sellAmt=(total*BigInt(pct))/100n;
   const disp=(Number(sellAmt)/Math.pow(10,meta.decimals||9)).toFixed(4);
   let est='?';
@@ -1054,11 +1264,12 @@ bot.on('callback_query', async(q) => {
 
     if(data==='bc'){
       const u=getU(chatId); if(!u?.pd?.ct||!u?.pd?.amtSui){await bot.sendMessage(chatId,'❌ Session expired.');return;}
+      const bc_ct=u.pd.ct, bc_amt=u.pd.amtSui; // capture before updU
       await bot.editMessageText('⚡ Executing buy...',{chat_id:chatId,message_id:msgId});
       try{
-        const res=await executeBuy(chatId,u.pd.ct,u.pd.amtSui);
+        const res=await executeBuy(chatId,bc_ct,bc_amt);
         await bot.editMessageText(
-          `✅ *Buy Executed!*\n\nToken: *${res.sym}*\nSpent: ${u.pd.amtSui} SUI\nFee: ${res.feeSui} SUI\n${res.out!='?'?`Received: ~${res.out} ${res.sym}\n`:''}Route: ${res.route}\n${res.bonding?`📊 On ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
+          `✅ *Buy Executed!*\n\nToken: *${res.sym}*\nSpent: ${bc_amt} SUI\nFee: ${res.feeSui} SUI\n${res.out!='?'?`Received: ~${res.out} ${res.sym}\n`:''}Route: ${res.route}\n${res.bonding?`📊 On ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
           {chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
       }catch(e){await bot.editMessageText(`❌ Buy failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:msgId});}
       updU(chatId,{pd:{}}); return;
@@ -1079,15 +1290,17 @@ bot.on('callback_query', async(q) => {
       const key=data.split(':')[1];
       if(key==='c'){updU(chatId,{state:'sell_custom'});await bot.sendMessage(chatId,'💬 Enter % to sell (1-100):\n_Example: 33_',{parse_mode:'Markdown'});return;}
       const pct=parseInt(key);
-      updU(chatId,{pd:{...getU(chatId).pd,pct}});
-      await showSellConfirm(chatId,getU(chatId).pd.ct,pct,msgId); return;
+      const ct=u.pd.ct; // capture before updU
+      updU(chatId,{pd:{...u.pd,pct}});
+      await showSellConfirm(chatId,ct,pct,msgId); return;
     }
 
     if(data==='sc'){
       const u=getU(chatId); if(!u?.pd?.ct||!u?.pd?.pct){await bot.sendMessage(chatId,'❌ Session expired.');return;}
+      const sc_ct=u.pd.ct, sc_pct=u.pd.pct; // capture before any updU
       await bot.editMessageText('⚡ Executing sell...',{chat_id:chatId,message_id:msgId});
       try{
-        const res=await executeSell(chatId,u.pd.ct,u.pd.pct);
+        const res=await executeSell(chatId,sc_ct,sc_pct);
         await bot.editMessageText(
           `✅ *Sell Executed!*\n\nToken: ${res.sym}\nSold: ${res.pct}%\nEst. SUI: ${res.sui}\nFee: ${res.feeSui} SUI\nRoute: ${res.route}\n\n🔗 [View TX](${SUISCAN}${res.digest})`,
           {chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
@@ -1103,6 +1316,7 @@ bot.on('callback_query', async(q) => {
     if(data==='set_tp'){updU(chatId,{state:'set_tp'});await bot.sendMessage(chatId,'🎯 Enter Take Profit % (e.g. 50 = take profit at +50%):\n_Send 0 to disable_',{parse_mode:'Markdown'});return;}
     if(data==='set_sl'){updU(chatId,{state:'set_sl'});await bot.sendMessage(chatId,'🛑 Enter Stop Loss % (e.g. 20 = stop loss at -20%):\n_Send 0 to disable_',{parse_mode:'Markdown'});return;}
     if(data==='clear_tpsl'){const u=getU(chatId);if(u){u.settings.tpDefault=null;u.settings.slDefault=null;saveDB();}await bot.sendMessage(chatId,'✅ TP/SL defaults cleared.');return;}
+    if(data==='edit_copy_amt'){updU(chatId,{state:'set_copy_amt'});await bot.sendMessage(chatId,'🔁 Enter copy trade amount in SUI per trade:\n_Example: 0.5_',{parse_mode:'Markdown'});return;}
 
     // CA paste picker
     if(data==='bfs'){const u=getU(chatId);if(!u?.pd?.ct){await bot.sendMessage(chatId,'❌ Session expired.');return;}await guard(chatId,async()=>startBuy(chatId,u.pd.ct));return;}
@@ -1265,6 +1479,13 @@ bot.on('message', async(msg) => {
     await bot.sendMessage(chatId,v===0?'✅ Stop Loss disabled':`✅ Stop Loss default: -${v}%`); return;
   }
 
+  if(state==='set_copy_amt'){
+    updU(chatId,{state:null});
+    const v=parseFloat(text); if(isNaN(v)||v<=0){await bot.sendMessage(chatId,'❌ Enter a positive number like 0.5');return;}
+    const uu=getU(chatId); if(uu){uu.settings.copyAmount=v; saveDB();}
+    await bot.sendMessage(chatId,`✅ Copy amount set: ${v} SUI per trade`); return;
+  }
+
   if(state==='copy_wallet'){
     if(!text.startsWith('0x')){await bot.sendMessage(chatId,'❌ Invalid wallet address.');return;}
     u.copyTraders=u.copyTraders||[];
@@ -1394,8 +1615,7 @@ async function main() {
   console.log('  AGENT TRADING BOT — Final v5');
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
 
-  // Pre-load Aftermath router in background (first trade will be faster)
-  getAfRouter().then(() => console.log('✅ Aftermath SDK loaded')).catch(e => console.warn('⚠️ Aftermath SDK:', e.message));
+  console.log('✅ Swap engine: Cetus CLMM (direct on-chain, no SDK)');
 
   // Start background engines
   positionMonitor().catch(e=>console.error('Monitor:', e));
