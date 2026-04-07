@@ -260,13 +260,9 @@ async function resolveCoinType(raw) {
   const geckoCandidates = [raw, firstCandidate].filter(Boolean);
   for (const addr of geckoCandidates) {
     try {
-      const r = await ftch(
-        `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
-        { headers:{ Accept:'application/json;version=20230302' } }, 7000
-      );
-      if (!r.ok) continue;
-      const d = await r.json();
-      for (const poolEntry of (d.data || []).slice(0, 3)) {
+      const gPools = await getGeckoPools(addr);
+      if (!gPools.length) continue;
+      for (const poolEntry of gPools.slice(0, 3)) {
         const poolAddr = poolEntry.attributes?.address;
         if (!poolAddr) continue;
         const poolInfo = await getPoolFromRPC(poolAddr);
@@ -353,18 +349,13 @@ async function findCetusPool(coinA, coinB) {
   } catch {}
 
   // GeckoTerminal fallback — works even when Cetus REST API is down (404/timeout)
-  // Queries token pools from GeckoTerminal, filters Cetus DEX, resolves via RPC
+  // Uses shared geckoCache to avoid duplicate requests and 429 rate limits.
   try {
     for (const addr of [coinB, coinB.split('::')[0]]) {
-      const r = await ftch(
-        `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
-        { headers:{ Accept:'application/json;version=20230302' } }, 7000
-      );
-      if (!r.ok) continue;
-      const d = await r.json();
-      if (!d.data?.length) continue;
+      const gPools = await getGeckoPools(addr);
+      if (!gPools.length) continue;
 
-      for (const poolEntry of d.data.slice(0, 8)) {
+      for (const poolEntry of gPools.slice(0, 8)) {
         const dexId = (poolEntry.relationships?.dex?.data?.id || '').toLowerCase();
         if (!dexId.includes('cetus')) continue;  // only Cetus pools here
         const poolAddress = poolEntry.attributes?.address;
@@ -566,6 +557,28 @@ async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
 const stateCache = new Map();
 const STATE_TTL  = 20_000; // 20 seconds
 
+// Shared GeckoTerminal pool cache — prevents 429 rate-limit errors when
+// resolveCoinType, findCetusPool and detectState all query the same token.
+const geckoCache = new Map();
+const GECKO_CACHE_TTL = 60_000; // 60 seconds
+
+async function getGeckoPools(addr) {
+  const hit = geckoCache.get(addr);
+  if (hit && Date.now() - hit.ts < GECKO_CACHE_TTL) return hit.pools;
+  try {
+    const r = await ftch(
+      `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
+      { headers:{ Accept:'application/json;version=20230302' } }, 8000
+    );
+    const pools = r.ok ? ((await r.json()).data || []) : [];
+    geckoCache.set(addr, { pools, ts: Date.now() });
+    return pools;
+  } catch {
+    geckoCache.set(addr, { pools: [], ts: Date.now() });
+    return [];
+  }
+}
+
 async function detectState(ct) {
   const cached = stateCache.get(ct);
   if (cached && Date.now() - cached.ts < STATE_TTL) return cached;
@@ -589,22 +602,16 @@ async function detectState(ct) {
   } catch {}
 
   // 3. GeckoTerminal — find pool address, then query Sui RPC for pool type.
+  //    Uses shared geckoCache — no duplicate HTTP calls, no 429 rate limits.
   //    Checks ALL pools from ALL address variants before giving up.
-  //    CRITICAL: never return early inside the inner loop — a token can have
-  //    its best pool listed after an unsupported-DEX pool in GeckoTerminal results.
   try {
     let firstUnsupported = null; // track in case nothing better found
     for (const addr of [ct, ct.split('::')[0]]) {
-      const r = await ftch(
-        `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
-        { headers:{ Accept:'application/json;version=20230302' } }, 7000
-      );
-      if (!r.ok) continue;
-      const d = await r.json();
-      if (!d.data?.length) continue;
+      const gPools = await getGeckoPools(addr);
+      if (!gPools.length) continue;
 
       // Iterate ALL pools — keep checking even if early entries are on unsupported DEXes
-      for (const poolEntry of d.data.slice(0, 8)) {
+      for (const poolEntry of gPools.slice(0, 8)) {
         const poolAddress = poolEntry.attributes?.address;
         if (!poolAddress) continue;
 
@@ -2158,14 +2165,11 @@ bot.onText(/\/diag\s+(.+)/, async(msg, match) => {
       lines.push(`Cetus API status: ${r1.status}`);
     } catch(e) { lines.push(`❌ Cetus API error: ${e.message}`); }
 
-    // Step 3: GeckoTerminal
+    // Step 3: GeckoTerminal (uses shared cache — no extra HTTP calls)
     for (const addr of [ct, ct.split('::')[0]]) {
       try {
-        const r = await ftch(`${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`, { headers:{ Accept:'application/json;version=20230302' } }, 7000);
-        if (!r.ok) { lines.push(`GeckoTerminal (${addr.length > 20 ? 'full' : 'pkg'}): HTTP ${r.status}`); continue; }
-        const d = await r.json();
-        const pools = d.data || [];
-        lines.push(`GeckoTerminal (${addr.length > 20 ? 'full type' : 'pkg addr'}): ${pools.length} pools`);
+        const pools = await getGeckoPools(addr);
+        lines.push(`GeckoTerminal (${addr.includes('::') ? 'full type' : 'pkg addr'}): ${pools.length} pools`);
         for (const p of pools.slice(0,5)) {
           const dexId = p.relationships?.dex?.data?.id || 'unknown';
           const pAddr = p.attributes?.address || '?';
