@@ -191,6 +191,62 @@ async function getAllBals(addr) {
   return sui.getAllBalances({ owner:addr });
 }
 
+/**
+ * Resolve a user-pasted address to a full Sui coin type.
+ *
+ * Sui coin types look like: 0xPKG::module::CoinName
+ * Users often paste only the package address: 0xPKG
+ *
+ * Strategy:
+ * 1. If input already contains "::", it's a full type — return as-is.
+ * 2. If bare package address: call getNormalizedMoveModulesByPackage to list all modules,
+ *    then try getCoinMetadata for each struct until one matches.
+ * 3. Fallback: GeckoTerminal → getPoolFromRPC to extract coin type from pool object.
+ */
+async function resolveCoinType(raw) {
+  if (!raw) return raw;
+
+  // Already a full coin type
+  if (raw.includes('::')) return raw;
+
+  // Not a Sui address
+  if (!raw.startsWith('0x') || raw.length < 42) return raw;
+
+  // Step 1: enumerate package modules and find the Coin struct
+  try {
+    const modules = await sui.getNormalizedMoveModulesByPackage({ package: raw });
+    for (const [modName, mod] of Object.entries(modules)) {
+      for (const structName of Object.keys(mod.structs || {})) {
+        const candidate = `${raw}::${modName}::${structName}`;
+        const meta = await getMeta(candidate);
+        if (meta?.symbol) return candidate; // valid coin!
+      }
+    }
+  } catch {}
+
+  // Step 2: GeckoTerminal → pool object → coin type from Pool<CoinA, CoinB>
+  try {
+    const r = await ftch(
+      `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(raw)}/pools?page=1`,
+      { headers:{ Accept:'application/json;version=20230302' } }, 7000
+    );
+    if (r.ok) {
+      const d = await r.json();
+      for (const poolEntry of (d.data || []).slice(0, 3)) {
+        const poolAddr = poolEntry.attributes?.address;
+        if (!poolAddr) continue;
+        const poolInfo = await getPoolFromRPC(poolAddr);
+        if (!poolInfo) continue;
+        const rawLow = raw.toLowerCase();
+        if (poolInfo.coinA.toLowerCase().startsWith(rawLow)) return poolInfo.coinA;
+        if (poolInfo.coinB.toLowerCase().startsWith(rawLow)) return poolInfo.coinB;
+      }
+    }
+  } catch {}
+
+  return raw; // return as-is; detectState will still try its best
+}
+
 // ═══════════════════════════════════════════════════════════
 // DEX POOL DISCOVERY
 // ═══════════════════════════════════════════════════════════
@@ -1874,14 +1930,16 @@ bot.on('message', async(msg) => {
 
   if(state==='buy_ca'){
     updU(chatId,{state:null});
-    const ct=text.startsWith('0x')?text:(await resolveTicker(text));
+    const raw=text.startsWith('0x')?text:(await resolveTicker(text));
+    const ct=raw?await resolveCoinType(raw):null;
     if(!ct){await bot.sendMessage(chatId,'❌ Token not found. Paste the full contract address.');return;}
     await guard(chatId,async()=>startBuy(chatId,ct)); return;
   }
 
   if(state==='sell_ca'){
     updU(chatId,{state:null});
-    const ct=text.startsWith('0x')?text:(await resolveTicker(text));
+    const raw=text.startsWith('0x')?text:(await resolveTicker(text));
+    const ct=raw?await resolveCoinType(raw):null;
     if(!ct){await bot.sendMessage(chatId,'❌ Token not found.');return;}
     const meta=await getMeta(ct)||{};
     await guard(chatId,async()=>{updU(chatId,{pd:{ct,sym:meta.symbol||trunc(ct)}});await showSellPct(chatId,ct,meta.symbol||trunc(ct),null);}); return;
@@ -1889,7 +1947,8 @@ bot.on('message', async(msg) => {
 
   if(state==='scan_ca'){
     updU(chatId,{state:null});
-    const ct=text.startsWith('0x')?text:(await resolveTicker(text));
+    const raw=text.startsWith('0x')?text:(await resolveTicker(text));
+    const ct=raw?await resolveCoinType(raw):null;
     if(!ct){await bot.sendMessage(chatId,'❌ Token not found.');return;}
     const m=await bot.sendMessage(chatId,'🔍 Scanning token...');
     try{
@@ -1902,7 +1961,8 @@ bot.on('message', async(msg) => {
 
   if(state==='snipe_ca'){
     updU(chatId,{state:null});
-    const ct=text.startsWith('0x')?text:(await resolveTicker(text));
+    const raw=text.startsWith('0x')?text:(await resolveTicker(text));
+    const ct=raw?await resolveCoinType(raw):null;
     if(!ct){await bot.sendMessage(chatId,'❌ Token not found.');return;}
     updU(chatId,{state:'snipe_amount',pd:{sniToken:ct}});
     await bot.sendMessage(chatId,`Token: \`${trunc(ct)}\`\n\nHow much SUI to buy when pool is found?\n_Example: 0.5_`,{parse_mode:'Markdown'}); return;
@@ -2002,10 +2062,11 @@ bot.on('message', async(msg) => {
     return;
   }
 
-  // Raw CA paste
+  // Raw CA paste — resolve bare package address to full coin type before storing
   if(text.startsWith('0x')&&text.length>40){
-    updU(chatId,{pd:{ct:text}});
-    await bot.sendMessage(chatId,`📋 \`${trunc(text)}\`\n\nWhat do you want to do?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'💰 Buy',callback_data:'bfs'},{text:'💸 Sell',callback_data:'sfs'},{text:'🔍 Scan',callback_data:'sct'}]]}});
+    const ct=await resolveCoinType(text);
+    updU(chatId,{pd:{ct}});
+    await bot.sendMessage(chatId,`📋 \`${trunc(ct)}\`\n\nWhat do you want to do?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'💰 Buy',callback_data:'bfs'},{text:'💸 Sell',callback_data:'sfs'},{text:'🔍 Scan',callback_data:'sct'}]]}});
     return;
   }
 });
