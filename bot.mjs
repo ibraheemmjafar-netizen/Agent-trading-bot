@@ -230,28 +230,41 @@ async function resolveCoinType(raw) {
   // Already a full coin type
   if (raw.includes('::')) return raw;
 
-  // Not a Sui address
+  // Not a Sui package address — return as-is
   if (!raw.startsWith('0x') || raw.length < 42) return raw;
 
-  // Step 1: enumerate package modules and find the Coin struct
+  // Step 1: enumerate package modules and find the Coin struct via RPC
+  // If only ONE struct exists across all modules, return it directly —
+  // don't require getMeta to succeed (many tokens have no on-chain metadata).
+  let firstCandidate = null;
+  let candidateCount  = 0;
   try {
     const modules = await sui.getNormalizedMoveModulesByPackage({ package: raw });
     for (const [modName, mod] of Object.entries(modules)) {
       for (const structName of Object.keys(mod.structs || {})) {
         const candidate = `${raw}::${modName}::${structName}`;
+        candidateCount++;
+        if (!firstCandidate) firstCandidate = candidate;
+        // getMeta is a fast check — if it confirms the coin, return immediately
         const meta = await getMeta(candidate);
-        if (meta?.symbol) return candidate; // valid coin!
+        if (meta?.symbol) return candidate;
       }
     }
+    // Only one struct found and getMeta didn't confirm it — still return it.
+    // Many Sui tokens skip CoinMetadata registration; the struct is the coin.
+    if (candidateCount === 1 && firstCandidate) return firstCandidate;
   } catch {}
 
-  // Step 2: GeckoTerminal → pool object → coin type from Pool<CoinA, CoinB>
-  try {
-    const r = await ftch(
-      `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(raw)}/pools?page=1`,
-      { headers:{ Accept:'application/json;version=20230302' } }, 7000
-    );
-    if (r.ok) {
+  // Step 2: GeckoTerminal → pool object → extract full coin type.
+  // Try both the raw package address AND any candidate we found in Step 1.
+  const geckoCandidates = [raw, firstCandidate].filter(Boolean);
+  for (const addr of geckoCandidates) {
+    try {
+      const r = await ftch(
+        `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
+        { headers:{ Accept:'application/json;version=20230302' } }, 7000
+      );
+      if (!r.ok) continue;
       const d = await r.json();
       for (const poolEntry of (d.data || []).slice(0, 3)) {
         const poolAddr = poolEntry.attributes?.address;
@@ -261,11 +274,22 @@ async function resolveCoinType(raw) {
         const rawLow = raw.toLowerCase();
         if (poolInfo.coinA.toLowerCase().startsWith(rawLow)) return poolInfo.coinA;
         if (poolInfo.coinB.toLowerCase().startsWith(rawLow)) return poolInfo.coinB;
+        // If we queried with the full candidate, the pool coins ARE the answer
+        if (addr !== raw) {
+          const addrLow = addr.toLowerCase();
+          if (poolInfo.coinA.toLowerCase() === addrLow) return poolInfo.coinA;
+          if (poolInfo.coinB.toLowerCase() === addrLow) return poolInfo.coinB;
+          // Fallback: return whichever coin belongs to this package
+          const pkgLow = raw.toLowerCase();
+          if (poolInfo.coinA.toLowerCase().startsWith(pkgLow)) return poolInfo.coinA;
+          if (poolInfo.coinB.toLowerCase().startsWith(pkgLow)) return poolInfo.coinB;
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
-  return raw; // return as-is; detectState will still try its best
+  // Last resort: return whatever Step 1 found, or raw unchanged
+  return firstCandidate || raw;
 }
 
 // ═══════════════════════════════════════════════════════════
