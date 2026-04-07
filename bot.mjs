@@ -303,7 +303,7 @@ async function findCetusPool(coinA, coinB) {
     } catch {}
   }
 
-  // Fallback: search by token
+  // Fallback: search by token via Cetus REST API
   try {
     const r = await ftch(
       `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type=${encodeURIComponent(coinB)}&limit=5&order_by=tvl&order=desc`,
@@ -323,7 +323,39 @@ async function findCetusPool(coinA, coinB) {
         const actualA = best.coin_type_a;
         const actualB = best.coin_type_b;
         const a2b = (actualA||'').toLowerCase() === SUI_T.toLowerCase();
-        return { poolId, coinA:actualA, coinB:actualB, a2b, liq:parseFloat(best.tvl||0), dex:'Cetus' };
+        return { poolId, coinA:actualA, coinB:actualB, a2b, liq:parseFloat(best.tvl||0), dex:'cetus' };
+      }
+    }
+  } catch {}
+
+  // GeckoTerminal fallback — works even when Cetus REST API is down (404/timeout)
+  // Queries token pools from GeckoTerminal, filters Cetus DEX, resolves via RPC
+  try {
+    for (const addr of [coinB, coinB.split('::')[0]]) {
+      const r = await ftch(
+        `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
+        { headers:{ Accept:'application/json;version=20230302' } }, 7000
+      );
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (!d.data?.length) continue;
+
+      for (const poolEntry of d.data.slice(0, 8)) {
+        const dexId = (poolEntry.relationships?.dex?.data?.id || '').toLowerCase();
+        if (!dexId.includes('cetus')) continue;  // only Cetus pools here
+        const poolAddress = poolEntry.attributes?.address;
+        if (!poolAddress) continue;
+        const poolInfo = await getPoolFromRPC(poolAddress);
+        if (!poolInfo || poolInfo.dex !== 'cetus') continue;
+        // Ensure this is a SUI pair
+        const SUI_NORM = SUI_T.toLowerCase();
+        const hasSui = poolInfo.coinA.toLowerCase() === SUI_NORM ||
+                       poolInfo.coinA.toLowerCase().endsWith('::sui::sui') ||
+                       poolInfo.coinB.toLowerCase() === SUI_NORM ||
+                       poolInfo.coinB.toLowerCase().endsWith('::sui::sui');
+        if (!hasSui) continue;
+        const liq = parseFloat(poolEntry.attributes?.reserve_in_usd || 0);
+        return { ...poolInfo, liq };
       }
     }
   } catch {}
@@ -532,9 +564,12 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 3. GeckoTerminal — find pool address, then query Sui RPC for pool type
-  //    This handles Cetus/Turbos pools when the REST APIs above fail
+  // 3. GeckoTerminal — find pool address, then query Sui RPC for pool type.
+  //    Checks ALL pools from ALL address variants before giving up.
+  //    CRITICAL: never return early inside the inner loop — a token can have
+  //    its best pool listed after an unsupported-DEX pool in GeckoTerminal results.
   try {
+    let firstUnsupported = null; // track in case nothing better found
     for (const addr of [ct, ct.split('::')[0]]) {
       const r = await ftch(
         `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
@@ -544,8 +579,8 @@ async function detectState(ct) {
       const d = await r.json();
       if (!d.data?.length) continue;
 
-      // Try each pool returned — prefer SUI pairs, check if it's Cetus or Turbos via RPC
-      for (const poolEntry of d.data.slice(0, 5)) {
+      // Iterate ALL pools — keep checking even if early entries are on unsupported DEXes
+      for (const poolEntry of d.data.slice(0, 8)) {
         const poolAddress = poolEntry.attributes?.address;
         if (!poolAddress) continue;
 
@@ -556,33 +591,39 @@ async function detectState(ct) {
         const knownDex = dexId.includes('cetus') || dexId.includes('turbos') ||
                          dexId.includes('kriya')  || dexId.includes('bluemove');
 
-        if (knownDex) {
-          // Query Sui RPC for pool object type — gets exact coinA/coinB and DEX routing info
-          const poolInfo = await getPoolFromRPC(poolAddress);
-          if (poolInfo) {
-            // Only accept SUI-paired pools
-            const SUI_NORM = SUI_T.toLowerCase();
-            const hasSui = poolInfo.coinA.toLowerCase() === SUI_NORM ||
-                           poolInfo.coinA.toLowerCase().endsWith('::sui::sui') ||
-                           poolInfo.coinB.toLowerCase() === SUI_NORM ||
-                           poolInfo.coinB.toLowerCase().endsWith('::sui::sui');
-            if (!hasSui) continue;
-
-            const DEX_LABELS = {
-              cetus:'Cetus CLMM', turbos:'Turbos CLMM',
-              kriya:'Kriya AMM', bluemove:'BlueMove AMM',
-            };
-            const dexLabel = DEX_LABELS[poolInfo.dex] || poolInfo.dex;
-            const res = { state: poolInfo.dex, dex: dexLabel, ...poolInfo, liq, ts: Date.now() };
-            stateCache.set(ct, res); return res;
-          }
+        if (!knownDex) {
+          // Remember first unsupported name but KEEP LOOKING at remaining pools
+          if (!firstUnsupported && dexId) firstUnsupported = dexId;
+          continue;
         }
 
-        // Not a supported DEX — return unsupported but with correct name
-        const dex = dexId ? dexId[0].toUpperCase() + dexId.slice(1) : 'Unknown';
-        const res = { state: 'unsupported_dex', dex, liq, ts: Date.now() };
+        // Query Sui RPC for pool object type — gets exact coinA/coinB and DEX routing info
+        const poolInfo = await getPoolFromRPC(poolAddress);
+        if (!poolInfo) continue;
+
+        // Only accept SUI-paired pools
+        const SUI_NORM = SUI_T.toLowerCase();
+        const hasSui = poolInfo.coinA.toLowerCase() === SUI_NORM ||
+                       poolInfo.coinA.toLowerCase().endsWith('::sui::sui') ||
+                       poolInfo.coinB.toLowerCase() === SUI_NORM ||
+                       poolInfo.coinB.toLowerCase().endsWith('::sui::sui');
+        if (!hasSui) continue;
+
+        const DEX_LABELS = {
+          cetus:'Cetus CLMM', turbos:'Turbos CLMM',
+          kriya:'Kriya AMM', bluemove:'BlueMove AMM',
+        };
+        const dexLabel = DEX_LABELS[poolInfo.dex] || poolInfo.dex;
+        const res = { state: poolInfo.dex, dex: dexLabel, ...poolInfo, liq, ts: Date.now() };
         stateCache.set(ct, res); return res;
       }
+    }
+
+    // Exhausted all pools — if we saw any pool at all, report its DEX as unsupported
+    if (firstUnsupported) {
+      const dex = firstUnsupported[0].toUpperCase() + firstUnsupported.slice(1);
+      const res = { state: 'unsupported_dex', dex, ts: Date.now() };
+      stateCache.set(ct, res); return res;
     }
   } catch {}
 
