@@ -90,9 +90,30 @@ const TURBOS_CORE_PKG  = '0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff433
 const TURBOS_SWAP_PKG  = '0xa5a0c25c79e428eba04fb98b3fb2a34db45ab26d4c8faf0d7e39d66a63891e64';
 const TURBOS_VERSIONED = '0xf1cf0e81048df168ebeb1b8030fad24b3e0b53ae827c25053fff0779c1445b6f';
 
+// Cetus router URL — used for price quotes and honeypot detection
+const CETUS_ROUTER_URL = 'https://api-sui.cetus.zone/v2/sui/router';
+
 // Sqrt price limits (Cetus style — used to not restrict price movement)
 const CETUS_MIN_SQRT  = '4295048016';
 const CETUS_MAX_SQRT  = '79226673515401279992447579055';
+
+// ── FlowX AMM (verified Apr 2026)
+// router::swap_exact_input<CoinIn, CoinOut>(Clock, Container, Coin<CoinIn>, min_out, recipient, deadline, TxContext)
+// Container is a shared object that stores all pairs as dynamic fields
+const FLOWX_AMM_PKG       = '0xba153169476e8c3114962261d1edc70de5ad9781b83cc617ecc8c1923191cae0';
+const FLOWX_AMM_CONTAINER = '0xd15e209f5a250d6055c264975fee57ec09bf9d6acdda3b5f866f76023d1563e6';
+
+// ── Kriya DEX AMM (verified Apr 2026)
+// spot_dex::swap_token_x_<T0,T1>(Pool<T0,T1> mut, Coin<T0>, min_out: u64, deadline: u64, TxContext)
+// spot_dex::swap_token_y_<T0,T1>(Pool<T0,T1> mut, Coin<T1>, min_out: u64, deadline: u64, TxContext)
+// Single Coin object (NOT vector), no Clock/Versioned, recipient via TxContext (sent to tx.sender)
+const KRIYA_PKG = '0xa0eba10b173538c8fecca1dff298e488402cc9ff374f8a12ca7758eebe830b66';
+
+// ── BlueMove DEX (verified Apr 2026)
+// router::swap_exact_input<T0,T1>(amount_in: u64, Coin<T0>, min_out: u64, Dex_Info mut, TxContext)
+// NOTE: Dex_Info shared object address — confirmed via diag6 on-chain lookup
+const BLUEMOVE_PKG      = '0xb24b6789e088b876afabca733bed2299fbc9e2d6369be4d1acfa17d8145454d9';
+const BLUEMOVE_DEX_INFO = '0x3f2d9f724f4a1ce5e71676448dc452be9a6243dac9c5b975a588c8c867066e92'; // confirmed via diag6 TX input [7]
 
 // ── Supported launchpads with bonding curve info
 const LAUNCHPADS = {
@@ -405,6 +426,43 @@ async function getPoolFromRPC(poolAddress) {
                   coinA.toLowerCase().endsWith('::sui::sui');
       return { dex: 'turbos', poolId: poolAddress, coinA, coinB, feeType, a2b };
     }
+
+    // FlowX AMM: dynamic_field::Field<String, PairMetadata<CoinA, CoinB>>
+    // Pool object is a dynamic field owned by the Container
+    const flowxRx = /PairMetadata<(.+),\s*([^>]+)>/;
+    const fm = type.match(flowxRx);
+    if (fm) {
+      const coinA   = fm[1].trim();
+      const coinB   = fm[2].trim();
+      const SUI_NORM = SUI_T.toLowerCase();
+      const a2b = coinA.toLowerCase() === SUI_NORM ||
+                  coinA.toLowerCase().endsWith('::sui::sui');
+      return { dex: 'flowx', poolId: FLOWX_AMM_CONTAINER, coinA, coinB, a2b };
+    }
+
+    // Kriya AMM: KRIYA_PKG::spot_dex::Pool<CoinA, CoinB>
+    const kriyaRx = /0xa0eba10b[0-9a-f]*::spot_dex::Pool<([^,]+),\s*([^>]+)>/;
+    const km = type.match(kriyaRx);
+    if (km) {
+      const coinA   = km[1].trim();
+      const coinB   = km[2].trim();
+      const SUI_NORM = SUI_T.toLowerCase();
+      const a2b = coinA.toLowerCase() === SUI_NORM ||
+                  coinA.toLowerCase().endsWith('::sui::sui');
+      return { dex: 'kriya', poolId: poolAddress, coinA, coinB, a2b };
+    }
+
+    // BlueMove AMM: BLUEMOVE_PKG::swap::Pool<CoinA, CoinB>
+    const bmRx = /0xb24b6789[0-9a-f]*::swap::Pool<([^,]+),\s*([^>]+)>/;
+    const bm = type.match(bmRx);
+    if (bm) {
+      const coinA   = bm[1].trim();
+      const coinB   = bm[2].trim();
+      const SUI_NORM = SUI_T.toLowerCase();
+      const a2b = coinA.toLowerCase() === SUI_NORM ||
+                  coinA.toLowerCase().endsWith('::sui::sui');
+      return { dex: 'bluemove', poolId: poolAddress, coinA, coinB, a2b };
+    }
   } catch {}
   return null;
 }
@@ -494,8 +552,12 @@ async function detectState(ct) {
         const dexId = (poolEntry.relationships?.dex?.data?.id || '').toLowerCase();
         const liq   = parseFloat(poolEntry.attributes?.reserve_in_usd || 0);
 
-        if (dexId.includes('cetus') || dexId.includes('turbos')) {
-          // Query Sui RPC for pool object type — gets exact coinA/coinB/feeType
+        // flow-x excluded: Container object not found on-chain (disabled Apr 2026)
+        const knownDex = dexId.includes('cetus') || dexId.includes('turbos') ||
+                         dexId.includes('kriya')  || dexId.includes('bluemove');
+
+        if (knownDex) {
+          // Query Sui RPC for pool object type — gets exact coinA/coinB and DEX routing info
           const poolInfo = await getPoolFromRPC(poolAddress);
           if (poolInfo) {
             // Only accept SUI-paired pools
@@ -506,8 +568,12 @@ async function detectState(ct) {
                            poolInfo.coinB.toLowerCase().endsWith('::sui::sui');
             if (!hasSui) continue;
 
-            const res = { state: poolInfo.dex, dex: poolInfo.dex === 'cetus' ? 'Cetus' : 'Turbos',
-                          ...poolInfo, liq, ts: Date.now() };
+            const DEX_LABELS = {
+              cetus:'Cetus CLMM', turbos:'Turbos CLMM',
+              kriya:'Kriya AMM', bluemove:'BlueMove AMM',
+            };
+            const dexLabel = DEX_LABELS[poolInfo.dex] || poolInfo.dex;
+            const res = { state: poolInfo.dex, dex: dexLabel, ...poolInfo, liq, ts: Date.now() };
             stateCache.set(ct, res); return res;
           }
         }
@@ -597,8 +663,8 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
       tx.object(CETUS_CONFIG),                                             // &GlobalConfig
       tx.object(poolId),                                                   // &mut Pool<CoinA,CoinB>
       coinVec,                                                             // vector<Coin<CoinX>>
-      tx.pure.bool(a2b),                                                   // a2b direction
-      tx.pure.u64(BigInt(amountIn)),                                       // amount_in
+      tx.pure.bool(true),                                                  // by_amount_in=true (exact input always)
+      tx.pure.u64(BigInt(amountIn)),                                       // amount_in (exact)
       tx.pure.u64(BigInt(minAmountOut || '0')),                            // min_amount_out
       tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)), // sqrt_price_limit
       tx.object(CLOCK_OBJ),                                                // &Clock
@@ -669,6 +735,170 @@ async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, c
     ],
   });
   // NOTE: output coin is transferred to recipient inside Move
+
+  return tx;
+}
+
+/**
+ * Build a FlowX AMM swap PTB.
+ *
+ * VERIFIED function signature (from Sui RPC getNormalizedMoveFunction, Apr 2026):
+ *   router::swap_exact_input<CoinIn, CoinOut>(Clock, Container, Coin<CoinIn>, min_out, recipient, deadline, TxContext)
+ *
+ * Container = FLOWX_AMM_CONTAINER (shared object owning all pair dynamic fields)
+ * Single Coin input (NOT vector). Output sent to recipient inside Move.
+ * Type params: [CoinIn, CoinOut] — a2b determines which is which.
+ *
+ * a2b=true  → buy:  [SUI_T, tokenType]
+ * a2b=false → sell: [tokenType, SUI_T]
+ */
+async function buildFlowXSwapTx({ wallet, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
+  const tx = new Transaction();
+  tx.setGasBudget(150_000_000);
+  tx.setSender(wallet);
+
+  let coinInObj;
+  if (coinInType === SUI_T) {
+    [coinInObj] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
+  } else {
+    const coins = await getCoins(wallet, coinInType);
+    if (!coins.length) throw new Error('No token balance found in wallet');
+    let obj = tx.object(coins[0].coinObjectId);
+    if (coins.length > 1) tx.mergeCoins(obj, coins.slice(1).map(c => tx.object(c.coinObjectId)));
+    const total = coins.reduce((s,c) => s + BigInt(c.balance), 0n);
+    if (BigInt(amountIn) < total) {
+      [coinInObj] = tx.splitCoins(obj, [tx.pure.u64(BigInt(amountIn))]);
+    } else {
+      coinInObj = obj;
+    }
+  }
+
+  // Type args: [CoinIn, CoinOut]
+  // a2b=true:  we're buying token with SUI → CoinIn=SUI, CoinOut=token
+  // a2b=false: we're selling token for SUI → CoinIn=token, CoinOut=SUI
+  const typeArgs = a2b ? [coinA, coinB] : [coinB, coinA];
+  const deadline = BigInt(Date.now() + 5 * 60 * 1000);
+
+  tx.moveCall({
+    target: `${FLOWX_AMM_PKG}::router::swap_exact_input`,
+    typeArguments: typeArgs,
+    arguments: [
+      tx.object(CLOCK_OBJ),               // &Clock
+      tx.object(FLOWX_AMM_CONTAINER),     // &mut Container
+      coinInObj,                           // Coin<CoinIn>
+      tx.pure.u64(BigInt(minAmountOut || '0')), // min_amount_out
+      tx.pure.address(wallet),            // recipient
+      tx.pure.u64(deadline),              // deadline
+    ],
+  });
+  // NOTE: output coin is transferred to recipient inside Move
+
+  return tx;
+}
+
+/**
+ * Build a Kriya DEX swap PTB.
+ *
+ * VERIFIED function signatures (from Sui RPC getNormalizedMoveFunction, Apr 2026):
+ *   spot_dex::swap_token_x_<T0,T1>(Pool<T0,T1> mut, Coin<T0>, min_out: u64, deadline: u64, TxContext mut)
+ *   spot_dex::swap_token_y_<T0,T1>(Pool<T0,T1> mut, Coin<T1>, min_out: u64, deadline: u64, TxContext mut)
+ *
+ * Pool = shared object for the specific pair.
+ * Single Coin (NOT vector). No Clock, no Versioned. Recipient = tx sender (via TxContext).
+ *
+ * a2b=true  → token0 (x) goes in → swap_token_x_: pass Coin<T0=SUI>
+ * a2b=false → token1 (y) goes in → swap_token_y_: pass Coin<T1=SUI>
+ */
+async function buildKriyaSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
+  const tx = new Transaction();
+  tx.setGasBudget(150_000_000);
+  tx.setSender(wallet);
+
+  let coinInObj;
+  if (coinInType === SUI_T) {
+    [coinInObj] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
+  } else {
+    const coins = await getCoins(wallet, coinInType);
+    if (!coins.length) throw new Error('No token balance found in wallet');
+    let obj = tx.object(coins[0].coinObjectId);
+    if (coins.length > 1) tx.mergeCoins(obj, coins.slice(1).map(c => tx.object(c.coinObjectId)));
+    const total = coins.reduce((s,c) => s + BigInt(c.balance), 0n);
+    if (BigInt(amountIn) < total) {
+      [coinInObj] = tx.splitCoins(obj, [tx.pure.u64(BigInt(amountIn))]);
+    } else {
+      coinInObj = obj;
+    }
+  }
+
+  // a2b=true  → SUI is coinA (token0/x) → use swap_token_x_
+  // a2b=false → SUI is coinB (token1/y) → use swap_token_y_
+  const fn = a2b ? 'swap_token_x_' : 'swap_token_y_';
+  const deadline = BigInt(Date.now() + 5 * 60 * 1000);
+
+  tx.moveCall({
+    target: `${KRIYA_PKG}::spot_dex::${fn}`,
+    typeArguments: [coinA, coinB],
+    arguments: [
+      tx.object(poolId),                              // &mut Pool<T0,T1>
+      coinInObj,                                       // Coin<Tx> — single coin
+      tx.pure.u64(BigInt(minAmountOut || '0')),       // min_amount_out (0 = no min)
+      tx.pure.u64(deadline),                          // deadline timestamp ms
+    ],
+  });
+  // NOTE: output coin is transferred to tx.sender via TxContext inside Move
+
+  return tx;
+}
+
+/**
+ * Build a BlueMove DEX swap PTB.
+ *
+ * VERIFIED function signature (from Sui RPC getNormalizedMoveFunction, Apr 2026):
+ *   router::swap_exact_input<T0,T1>(amount_in: u64, Coin<T0>, min_out: u64, Dex_Info mut, TxContext mut)
+ *
+ * Dex_Info = BLUEMOVE_DEX_INFO (global shared DEX registry — not a pool object)
+ * Single Coin. No Clock. Recipient via TxContext (tx.sender).
+ *
+ * a2b=true  → T0=SUI, T1=token
+ * a2b=false → T0=token, T1=SUI
+ */
+async function buildBlueMoveSwapTx({ wallet, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
+  if (!BLUEMOVE_DEX_INFO) throw new Error('BlueMove Dex_Info address not yet confirmed — run diag6');
+
+  const tx = new Transaction();
+  tx.setGasBudget(150_000_000);
+  tx.setSender(wallet);
+
+  let coinInObj;
+  if (coinInType === SUI_T) {
+    [coinInObj] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
+  } else {
+    const coins = await getCoins(wallet, coinInType);
+    if (!coins.length) throw new Error('No token balance found in wallet');
+    let obj = tx.object(coins[0].coinObjectId);
+    if (coins.length > 1) tx.mergeCoins(obj, coins.slice(1).map(c => tx.object(c.coinObjectId)));
+    const total = coins.reduce((s,c) => s + BigInt(c.balance), 0n);
+    if (BigInt(amountIn) < total) {
+      [coinInObj] = tx.splitCoins(obj, [tx.pure.u64(BigInt(amountIn))]);
+    } else {
+      coinInObj = obj;
+    }
+  }
+
+  // Type args: [CoinIn, CoinOut]
+  const typeArgs = a2b ? [coinA, coinB] : [coinB, coinA];
+
+  tx.moveCall({
+    target: `${BLUEMOVE_PKG}::router::swap_exact_input`,
+    typeArguments: typeArgs,
+    arguments: [
+      tx.pure.u64(BigInt(amountIn)),                   // amount_in
+      coinInObj,                                         // Coin<CoinIn>
+      tx.pure.u64(BigInt(minAmountOut || '0')),         // min_amount_out
+      tx.object(BLUEMOVE_DEX_INFO),                    // &mut Dex_Info
+    ],
+  });
+  // NOTE: output coin is transferred to tx.sender inside Move
 
   return tx;
 }
@@ -801,6 +1031,51 @@ async function executeBuy(chatId, ct, amtSui) {
     return { digest:res.digest, feeSui:fSui(feeMist), route:'Turbos CLMM', out:tok.toFixed(4), sym, bonding:false };
   }
 
+  if (st.state === 'flowx') {
+    const tx = await buildFlowXSwapTx({
+      wallet: u.walletAddress,
+      coinA:  st.coinA, coinB: st.coinB, a2b: st.a2b,
+      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
+    });
+    addFees(tx);
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX TX failed');
+    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
+    const tok = est ? Number(est) / Math.pow(10, meta.decimals||9) : 0;
+    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'FlowX AMM', out:tok.toFixed(4), sym, bonding:false };
+  }
+
+  if (st.state === 'kriya') {
+    const tx = await buildKriyaSwapTx({
+      wallet: u.walletAddress,
+      poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: st.a2b,
+      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
+    });
+    addFees(tx);
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya TX failed');
+    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
+    const tok = est ? Number(est) / Math.pow(10, meta.decimals||9) : 0;
+    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'Kriya AMM', out:tok.toFixed(4), sym, bonding:false };
+  }
+
+  if (st.state === 'bluemove') {
+    const tx = await buildBlueMoveSwapTx({
+      wallet: u.walletAddress,
+      coinA: st.coinA, coinB: st.coinB, a2b: st.a2b,
+      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
+    });
+    addFees(tx);
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove TX failed');
+    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
+    const tok = est ? Number(est) / Math.pow(10, meta.decimals||9) : 0;
+    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'BlueMove AMM', out:tok.toFixed(4), sym, bonding:false };
+  }
+
   if (st.state === 'unsupported_dex') {
     throw new Error(`${sym} is on ${st.dex}. Trade directly on their website — not yet supported here.`);
   }
@@ -812,7 +1087,7 @@ async function executeBuy(chatId, ct, amtSui) {
     return { digest:res.digest, feeSui:fSui(res.fee), route:st.lpName, out:'?', sym, bonding:true, lpName:st.lpName };
   }
 
-  throw new Error(`${sym} — no liquidity found on Cetus, Turbos, or any launchpad. Check the CA is correct.`);
+  throw new Error(`${sym} — no liquidity found on Cetus, Turbos, Kriya, BlueMove, or any launchpad. Check the CA is correct.`);
 }
 
 async function executeSell(chatId, ct, pct) {
@@ -903,6 +1178,75 @@ async function executeSell(chatId, ct, pct) {
     if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
     const suiOut = est ? (Number(est)/1e9).toFixed(4) : '?';
     return { digest:res.digest, feeSui:fSui(feeMist), route:'Turbos CLMM', sui:suiOut, sym, pct };
+  }
+
+  if (st.state === 'flowx') {
+    const coinInType = st.a2b ? st.coinB : st.coinA;  // token side
+    const sellA2b    = !st.a2b;                         // flip for sell
+    const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
+    const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
+    const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+    const devMist    = feeMist - refMist;
+    const tx = await buildFlowXSwapTx({
+      wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
+      coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
+    });
+    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
+    if (refMist > 0n && u.referredBy) {
+      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
+      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX sell failed');
+    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'FlowX AMM', sui:est ? (Number(est)/1e9).toFixed(4) : '?', sym, pct };
+  }
+
+  if (st.state === 'kriya') {
+    const coinInType = st.a2b ? st.coinB : st.coinA;  // token side
+    const sellA2b    = !st.a2b;
+    const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
+    const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
+    const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+    const devMist    = feeMist - refMist;
+    const tx = await buildKriyaSwapTx({
+      wallet: u.walletAddress, poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
+      coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
+    });
+    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
+    if (refMist > 0n && u.referredBy) {
+      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
+      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya sell failed');
+    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'Kriya AMM', sui:est ? (Number(est)/1e9).toFixed(4) : '?', sym, pct };
+  }
+
+  if (st.state === 'bluemove') {
+    const coinInType = st.a2b ? st.coinB : st.coinA;
+    const sellA2b    = !st.a2b;
+    const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
+    const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
+    const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+    const devMist    = feeMist - refMist;
+    const tx = await buildBlueMoveSwapTx({
+      wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
+      coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
+    });
+    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
+    if (refMist > 0n && u.referredBy) {
+      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
+      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove sell failed');
+    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
+    return { digest:res.digest, feeSui:fSui(feeMist), route:'BlueMove AMM', sui:est ? (Number(est)/1e9).toFixed(4) : '?', sym, pct };
   }
 
   if (st.state === 'unsupported_dex') {
