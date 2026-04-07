@@ -554,16 +554,29 @@ async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
 
 // Read actual token delta for walletAddr from a confirmed TX (balance changes)
 // Returns the BigInt amount change (positive = received, negative = spent) or null
-async function getActualDelta(digest, coinType, walletAddr) {
+// Extract balance delta from a balanceChanges array (from TX response or getTransactionBlock)
+function deltaFromChanges(changes, coinType, walletAddr) {
   try {
-    const tx = await sui.getTransactionBlock({ digest, options:{ showBalanceChanges:true } });
     const norm = t => t.replace(/^0x0+/, '0x').toLowerCase();
     const target = norm(coinType);
-    for (const c of (tx?.balanceChanges || [])) {
+    for (const c of (changes || [])) {
       const owner = c.owner?.AddressOwner || '';
       if (norm(owner) !== norm(walletAddr)) continue;
       if (norm(c.coinType || '') === target) return BigInt(c.amount);
     }
+  } catch {}
+  return null;
+}
+
+// Pass res.balanceChanges array directly (preferred — instant, no indexer delay)
+// or pass a digest string as fallback (requires separate RPC round-trip)
+async function getActualDelta(digestOrChanges, coinType, walletAddr) {
+  if (Array.isArray(digestOrChanges)) {
+    return deltaFromChanges(digestOrChanges, coinType, walletAddr);
+  }
+  try {
+    const tx = await sui.getTransactionBlock({ digest: digestOrChanges, options:{ showBalanceChanges:true } });
+    return deltaFromChanges(tx?.balanceChanges, coinType, walletAddr);
   } catch {}
   return null;
 }
@@ -1150,9 +1163,9 @@ async function executeBuy(chatId, ct, amtSui) {
       minAmountOut: minOut.toString(),
     });
     addFees(tx);
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):Number(est||0)/Math.pow(10,dec); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):Number(est||0)/Math.pow(10,dec); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'turbos') {
@@ -1167,9 +1180,9 @@ async function executeBuy(chatId, ct, amtSui) {
       amountIn:   tradeAmt.toString(),
     });
     addFees(tx);
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'flowx') {
@@ -1179,9 +1192,9 @@ async function executeBuy(chatId, ct, amtSui) {
       coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
     });
     addFees(tx);
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'kriya') {
@@ -1191,9 +1204,9 @@ async function executeBuy(chatId, ct, amtSui) {
       coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
     });
     addFees(tx);
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'bluemove') {
@@ -1203,9 +1216,9 @@ async function executeBuy(chatId, ct, amtSui) {
       coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
     });
     addFees(tx);
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'unsupported_dex') {
@@ -1271,9 +1284,9 @@ async function executeSell(chatId, ct, pct) {
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
     }
 
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Sell TX failed');
-    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'turbos') {
@@ -1299,9 +1312,9 @@ async function executeSell(chatId, ct, pct) {
       const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
     }
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos sell failed');
-    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'flowx') {
@@ -1321,9 +1334,9 @@ async function executeSell(chatId, ct, pct) {
       const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
     }
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX sell failed');
-    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'kriya') {
@@ -1343,9 +1356,9 @@ async function executeSell(chatId, ct, pct) {
       const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
     }
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya sell failed');
-    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'bluemove') {
@@ -1365,9 +1378,9 @@ async function executeSell(chatId, ct, pct) {
       const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
     }
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove sell failed');
-    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'unsupported_dex') {
@@ -1387,9 +1400,9 @@ async function executeSell(chatId, ct, pct) {
   const pool = await findCetusPool(ct, SUI_T);
   if (pool) {
     const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType:ct, amountIn:sellAmt.toString(), minAmountOut:'0' });
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
-    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const pnlD=computeSellPnl(chatId,ct,pct,suiR,0); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:'0',route:'Cetus',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const pnlD=computeSellPnl(chatId,ct,pct,suiR,0); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:'0',route:'Cetus',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD}; }
   }
 
   throw new Error(`Cannot sell ${sym} — not found on any supported DEX.`);
