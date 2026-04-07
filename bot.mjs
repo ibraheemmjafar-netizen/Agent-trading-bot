@@ -732,7 +732,7 @@ async function setSuiGasPayment(tx, wallet) {
 
 async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
   const tx = new Transaction();
-  tx.setGasBudget(150_000_000);
+  tx.setGasBudget(50_000_000);
   tx.setSender(wallet);
   if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
@@ -815,7 +815,7 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
  */
 async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, coinInType, amountIn }) {
   const tx = new Transaction();
-  tx.setGasBudget(150_000_000);
+  tx.setGasBudget(50_000_000);
   tx.setSender(wallet);
   if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
@@ -879,7 +879,7 @@ async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, c
  */
 async function buildFlowXSwapTx({ wallet, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
   const tx = new Transaction();
-  tx.setGasBudget(150_000_000);
+  tx.setGasBudget(50_000_000);
   tx.setSender(wallet);
   if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
@@ -937,7 +937,7 @@ async function buildFlowXSwapTx({ wallet, coinA, coinB, a2b, coinInType, amountI
  */
 async function buildKriyaSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
   const tx = new Transaction();
-  tx.setGasBudget(150_000_000);
+  tx.setGasBudget(50_000_000);
   tx.setSender(wallet);
   if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
@@ -993,7 +993,7 @@ async function buildBlueMoveSwapTx({ wallet, coinA, coinB, a2b, coinInType, amou
   if (!BLUEMOVE_DEX_INFO) throw new Error('BlueMove Dex_Info address not yet confirmed — run diag6');
 
   const tx = new Transaction();
-  tx.setGasBudget(150_000_000);
+  tx.setGasBudget(50_000_000);
   tx.setSender(wallet);
   if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
@@ -1093,10 +1093,28 @@ async function swapSellBonding({ kp, ct, coins, amt, curveId }) {
 async function executeBuy(chatId, ct, amtSui) {
   const u      = getU(chatId); if (!u) throw new Error('No wallet found.');
   const kp     = getKP(u);
-  const amt    = BigInt(Math.floor(parseFloat(amtSui) * Number(MIST)));
   const meta   = await getMeta(ct) || {};
   const sym    = meta.symbol || trunc(ct);
   const st     = await detectState(ct);
+
+  // ── Balance guard ────────────────────────────────────────
+  // Sui reserves the full gas budget BEFORE command 0 runs.
+  // If tradeAmt > (totalSUI - gasBudget) the splitCoins fails
+  // with "InsufficientCoinBalance in command 0" even though the
+  // user technically has enough to trade.
+  // Gas budget = 50 000 000 MIST; add 20 000 000 buffer = 70M total.
+  const GAS_RESERVE = 70_000_000n;
+  const balInfo  = await sui.getBalance({ owner: u.walletAddress, coinType: SUI_T });
+  const totalMist = BigInt(balInfo.totalBalance);
+  let amt = BigInt(Math.floor(parseFloat(amtSui) * Number(MIST)));
+  const maxSpendMist = totalMist > GAS_RESERVE ? totalMist - GAS_RESERVE : 0n;
+  if (maxSpendMist === 0n) {
+    throw new Error(`Not enough SUI for gas. Need at least ${Number(GAS_RESERVE)/1e9} SUI in wallet.`);
+  }
+  if (amt > maxSpendMist) {
+    const maxSui = (Number(maxSpendMist) / 1e9).toFixed(4);
+    throw new Error(`Amount too high. Max safe buy: ${maxSui} SUI (0.07 SUI reserved for gas). Your balance: ${(Number(totalMist)/1e9).toFixed(4)} SUI`);
+  }
 
   // Collect fee from buy amount
   const feeMist  = (amt * BigInt(FEE_BPS)) / 10000n;
