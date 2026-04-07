@@ -552,6 +552,22 @@ async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
   return null;
 }
 
+// Read actual token delta for walletAddr from a confirmed TX (balance changes)
+// Returns the BigInt amount change (positive = received, negative = spent) or null
+async function getActualDelta(digest, coinType, walletAddr) {
+  try {
+    const tx = await sui.getTransactionBlock({ digest, options:{ showBalanceChanges:true } });
+    const norm = t => t.replace(/^0x0+/, '0x').toLowerCase();
+    const target = norm(coinType);
+    for (const c of (tx?.balanceChanges || [])) {
+      const owner = c.owner?.AddressOwner || '';
+      if (norm(owner) !== norm(walletAddr)) continue;
+      if (norm(c.coinType || '') === target) return BigInt(c.amount);
+    }
+  } catch {}
+  return null;
+}
+
 // ═══════════════════════════════════════════════════════════
 // TOKEN STATE DETECTION
 // ═══════════════════════════════════════════════════════════
@@ -1098,9 +1114,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
-    const tok = Number(est||0) / Math.pow(10, meta.decimals||9);
-    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus CLMM', out:tok.toFixed(4), sym, bonding:false };
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):Number(est||0)/Math.pow(10,dec); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'turbos') {
@@ -1117,10 +1131,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos TX failed');
-    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
-    const tok = est ? Number(est) / Math.pow(10, meta.decimals||9) : 0;
-    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'Turbos CLMM', out:tok.toFixed(4), sym, bonding:false };
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'flowx') {
@@ -1132,10 +1143,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX TX failed');
-    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
-    const tok = est ? Number(est) / Math.pow(10, meta.decimals||9) : 0;
-    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'FlowX AMM', out:tok.toFixed(4), sym, bonding:false };
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'kriya') {
@@ -1147,10 +1155,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya TX failed');
-    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
-    const tok = est ? Number(est) / Math.pow(10, meta.decimals||9) : 0;
-    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'Kriya AMM', out:tok.toFixed(4), sym, bonding:false };
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'bluemove') {
@@ -1162,10 +1167,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove TX failed');
-    const est = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
-    const tok = est ? Number(est) / Math.pow(10, meta.decimals||9) : 0;
-    addPos(chatId, { ct, sym, entry:Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec:meta.decimals||9, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'BlueMove AMM', out:tok.toFixed(4), sym, bonding:false };
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'unsupported_dex') {
@@ -1233,9 +1235,7 @@ async function executeSell(chatId, ct, pct) {
 
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Sell TX failed');
-    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
-    const suiOut = est ? (Number(est)/1e9).toFixed(4) : '?';
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'Cetus CLMM', sui:suiOut, sym, pct };
+    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'turbos') {
@@ -1255,26 +1255,20 @@ async function executeSell(chatId, ct, pct) {
     const feeMist = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
     const refMist = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
     const devMist = feeMist - refMist;
-    if (devMist > 0n) {
-      const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
-      tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
-    }
+    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
     if (refMist > 0n && u.referredBy) {
-      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]);
-      tx.transferObjects([rc], tx.pure.address(u.referredBy));
+      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
       const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
     }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos sell failed');
-    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
-    const suiOut = est ? (Number(est)/1e9).toFixed(4) : '?';
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'Turbos CLMM', sui:suiOut, sym, pct };
+    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'flowx') {
-    const coinInType = st.a2b ? st.coinB : st.coinA;  // token side
-    const sellA2b    = !st.a2b;                         // flip for sell
+    const coinInType = st.a2b ? st.coinB : st.coinA;
+    const sellA2b    = !st.a2b;
     const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
     const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
     const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
@@ -1291,12 +1285,11 @@ async function executeSell(chatId, ct, pct) {
     }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX sell failed');
-    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'FlowX AMM', sui:est ? (Number(est)/1e9).toFixed(4) : '?', sym, pct };
+    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'kriya') {
-    const coinInType = st.a2b ? st.coinB : st.coinA;  // token side
+    const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
     const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
     const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
@@ -1314,8 +1307,7 @@ async function executeSell(chatId, ct, pct) {
     }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya sell failed');
-    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'Kriya AMM', sui:est ? (Number(est)/1e9).toFixed(4) : '?', sym, pct };
+    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'bluemove') {
@@ -1337,8 +1329,7 @@ async function executeSell(chatId, ct, pct) {
     }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove sell failed');
-    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
-    return { digest:res.digest, feeSui:fSui(feeMist), route:'BlueMove AMM', sui:est ? (Number(est)/1e9).toFixed(4) : '?', sym, pct };
+    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'unsupported_dex') {
@@ -1348,8 +1339,10 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'bonding') {
     if (!st.curveId) throw new Error(`Bonding curve ID unavailable for ${st.lpName}.`);
     const res = await swapSellBonding({ kp, ct, coins:bag, amt:sellAmt, curveId:st.curveId });
-    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
-    return { digest:res.digest, feeSui:'N/A', route:st.lpName, sui:'?', sym, pct };
+    const ab2 = await getActualDelta(res.digest, SUI_T, u.walletAddress).catch(()=>null);
+    const suiR2 = ab2 && ab2 > 0n ? Number(ab2)/1e9 : 0;
+    updatePositionAfterSell(chatId, ct, pct);
+    return { digest:res.digest, feeSui:'N/A', route:st.lpName, sui:suiR2>0?suiR2.toFixed(4):'?', sym, pct };
   }
 
   // Last resort: force-find Cetus pool
@@ -1358,8 +1351,7 @@ async function executeSell(chatId, ct, pct) {
     const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType:ct, amountIn:sellAmt.toString(), minAmountOut:'0' });
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
-    if (pct === 100) updU(chatId, { positions: getU(chatId).positions.filter(p => p.ct !== ct) });
-    return { digest:res.digest, feeSui:'0', route:'Cetus', sui:'?', sym, pct };
+    { const ab=await getActualDelta(res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const pnlD=computeSellPnl(chatId,ct,pct,suiR,0); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:'0',route:'Cetus',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD}; }
   }
 
   throw new Error(`Cannot sell ${sym} — not found on any supported DEX.`);
@@ -1745,7 +1737,51 @@ function scanReport(d, ct, st) {
 function addPos(chatId, p) {
   const u = getU(chatId); if (!u) return;
   u.positions = u.positions || [];
-  u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, at:Date.now() });
+  // Merge into existing position for same token (accumulate bags)
+  const existing = u.positions.find(x => x.ct === p.ct);
+  if (existing) {
+    const prevSpent = parseFloat(existing.spent) || 0;
+    const newSpent  = parseFloat(p.spent) || 0;
+    const totalSpent = prevSpent + newSpent;
+    const totalTok   = (existing.tokens || 0) + (p.tokens || 0);
+    existing.tokens = totalTok;
+    existing.spent  = totalSpent.toFixed(4);
+    existing.entry  = totalTok > 0 ? totalSpent / totalTok : existing.entry;
+    if (p.tp != null) existing.tp = p.tp;
+    if (p.sl != null) existing.sl = p.sl;
+  } else {
+    u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, at:Date.now() });
+  }
+  saveDB();
+}
+
+// Compute P&L for a sell — returns { spent, received, pnl, pnlPct } or null
+function computeSellPnl(chatId, ct, pct, suiReceived, feeSui) {
+  const u = getU(chatId); if (!u) return null;
+  const pos = (u.positions || []).find(p => p.ct === ct);
+  if (!pos || !pos.spent) return null;
+  const fraction = pct / 100;
+  const allocSpent = parseFloat(pos.spent) * fraction;
+  if (allocSpent <= 0) return null;
+  const netReceived = Math.max(0, suiReceived - feeSui);
+  const pnl    = netReceived - allocSpent;
+  const pnlPct = (pnl / allocSpent) * 100;
+  return { spent: allocSpent, received: netReceived, pnl, pnlPct };
+}
+
+// Update position after a partial/full sell
+function updatePositionAfterSell(chatId, ct, pct) {
+  const u = getU(chatId); if (!u) return;
+  if (pct >= 100) {
+    u.positions = (u.positions || []).filter(p => p.ct !== ct);
+  } else {
+    const pos = (u.positions || []).find(p => p.ct === ct);
+    if (pos) {
+      const keep = (100 - pct) / 100;
+      pos.tokens = (pos.tokens || 0) * keep;
+      pos.spent  = (parseFloat(pos.spent || '0') * keep).toFixed(4);
+    }
+  }
   saveDB();
 }
 
@@ -2014,7 +2050,8 @@ async function doHelp(chatId) {
     `*Info*\n` +
     `/scan [ca] — Full token security scan\n` +
     `/balance — Wallet balances\n` +
-    `/positions — P&L with quick-sell buttons\n\n` +
+    `/positions — Open positions with quick-sell\n` +
+    `/pnl [symbol] — P&L chart for open positions\n\n` +
     `*Account*\n` +
     `/referral — View your referral link & earnings\n` +
     `/settings — Slippage, buy amounts, TP/SL, withdraw\n\n` +
@@ -2249,14 +2286,28 @@ bot.on('callback_query', async(q) => {
       return;
     }
 
-    // ── Quick sell from positions ─────────────────────────
+    // ── Quick sell from positions (instant, no extra confirm) ─
     if(data.startsWith('qs:')){
       const parts=data.split(':');
       const idx=parseInt(parts[1]), pct=parseInt(parts[2]);
       const u=getU(chatId); const pos=u?.positions?.[idx];
       if(!pos){await bot.sendMessage(chatId,'❌ Position not found.');return;}
-      updU(chatId,{pd:{ct:pos.ct,sym:pos.sym,pct}});
-      await showSellConfirm(chatId,pos.ct,pct,null); return;
+      const m=await bot.sendMessage(chatId,`⚡ Selling ${pct}% of ${pos.sym}...`);
+      try{
+        const res=await executeSell(chatId,pos.ct,pct);
+        let sellMsg=`🔴 *Sell Executed!*\n\n🪙 Token: *${res.sym}*\n📤 Sold: ${pct}%\n💰 Received: \`${res.sui} SUI\`\n⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}`;
+        if(res.pnl){
+          const s=res.pnl.pnl>=0?'+':'',icon=res.pnl.pnl>=0?'🟢 PROFIT':'🔴 LOSS';
+          sellMsg+=`\n\n━━━━━━━━━━━━━━\n📊 *P&L Summary*\n${icon}\n\n💼 Invested: \`${res.pnl.spent.toFixed(4)} SUI\`\n💵 Returned: \`${res.sui} SUI\`\n📈 P&L: *${s}${res.pnl.pnl.toFixed(4)} SUI (${s}${res.pnl.pnlPct.toFixed(2)}%)*\n${pnlBar(res.pnl.pnlPct)}`;
+        }
+        sellMsg+=`\n\n🔗 [View TX](${SUISCAN}${res.digest})`;
+        await bot.editMessageText(sellMsg,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+        if(res.pnl){
+          const chartUrl=pnlChart(res.sym,res.pnl.pnlPct,res.pnl.spent,parseFloat(res.sui));
+          await bot.sendPhoto(chatId,chartUrl,{caption:`${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%`}).catch(()=>{});
+        }
+      }catch(e){await bot.editMessageText(`❌ Sell failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:m.message_id});}
+      return;
     }
 
     // ── Buy flow ──────────────────────────────────────────
@@ -2275,8 +2326,9 @@ bot.on('callback_query', async(q) => {
       await bot.editMessageText('⚡ Executing buy...',{chat_id:chatId,message_id:msgId});
       try{
         const res=await executeBuy(chatId,bc_ct,bc_amt);
+        const recvLine=res.out&&res.out!='?'?`✅ Received: *${Number(res.out).toLocaleString('en',{maximumFractionDigits:6})} ${res.sym}*\n`:'';
         await bot.editMessageText(
-          `✅ *Buy Executed!*\n\nToken: *${res.sym}*\nSpent: ${bc_amt} SUI\nFee: ${res.feeSui} SUI\n${res.out!='?'?`Received: ~${res.out} ${res.sym}\n`:''}Route: ${res.route}\n${res.bonding?`📊 On ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
+          `🟢 *Buy Executed!*\n\n🪙 Token: *${res.sym}*\n💸 Spent: \`${bc_amt} SUI\`\n${recvLine}⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}\n${res.bonding?`📊 On ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
           {chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
       }catch(e){await bot.editMessageText(`❌ Buy failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:msgId});}
       updU(chatId,{pd:{}}); return;
@@ -2307,9 +2359,19 @@ bot.on('callback_query', async(q) => {
       await bot.editMessageText('⚡ Executing sell...',{chat_id:chatId,message_id:msgId});
       try{
         const res=await executeSell(chatId,sc_ct,sc_pct);
-        await bot.editMessageText(
-          `✅ *Sell Executed!*\n\nToken: ${res.sym}\nSold: ${res.pct}%\nEst. SUI received: ~${res.sui}\nFee: ${res.feeSui} SUI\nRoute: ${res.route}\n\n🔗 [View TX](${SUISCAN}${res.digest})`,
-          {chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+        let sellMsg=`🔴 *Sell Executed!*\n\n🪙 Token: *${res.sym}*\n📤 Sold: ${res.pct}%${res.soldAmt?` (~${res.soldAmt.toLocaleString('en',{maximumFractionDigits:2})} ${res.sym})`:''}\n💰 Received: \`${res.sui} SUI\`\n⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}`;
+        if(res.pnl){
+          const s=res.pnl.pnl>=0?'+':'', icon=res.pnl.pnl>=0?'🟢 PROFIT':'🔴 LOSS';
+          sellMsg+=`\n\n━━━━━━━━━━━━━━\n📊 *P&L Summary*\n${icon}\n\n💼 Invested: \`${res.pnl.spent.toFixed(4)} SUI\`\n💵 Returned: \`${res.sui} SUI\`\n📈 P&L: *${s}${res.pnl.pnl.toFixed(4)} SUI (${s}${res.pnl.pnlPct.toFixed(2)}%)*\n${pnlBar(res.pnl.pnlPct)}`;
+        }
+        sellMsg+=`\n\n🔗 [View TX](${SUISCAN}${res.digest})`;
+        await bot.editMessageText(sellMsg,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+        // Send P&L chart image
+        if(res.pnl){
+          const chartUrl=pnlChart(res.sym,res.pnl.pnlPct,res.pnl.spent,parseFloat(res.sui));
+          const cap=`${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${res.pct}% Sell\nP&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  |  ${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI`;
+          await bot.sendPhoto(chatId,chartUrl,{caption:cap}).catch(()=>{});
+        }
       }catch(e){await bot.editMessageText(`❌ Sell failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:msgId});}
       updU(chatId,{pd:{}}); return;
     }
@@ -2627,6 +2689,31 @@ bot.onText(/\/scan(?:\s+(.+))?/, async(msg,m)=>{
 bot.onText(/\/withdraw/, async(msg)=>doWithdrawMenu(msg.chat.id));
 bot.onText(/\/balance/,  async(msg)=>doBalance(msg.chat.id));
 bot.onText(/\/positions/,async(msg)=>doPositions(msg.chat.id));
+bot.onText(/\/pnl(?:\s+(.+))?/, async(msg,m)=>{
+  const chatId=msg.chat.id, arg=m[1]?san(m[1].trim()):null;
+  await guard(chatId,async(u)=>{
+    const positions=(u.positions||[]).filter(p=>p.source!=='bonding'&&p.tokens>0);
+    if(!positions.length){await bot.sendMessage(chatId,'📊 No open DEX positions to show P&L for.\n\nUse /positions for all positions.');return;}
+    const target=arg?positions.filter(p=>p.ct.toLowerCase().includes(arg.toLowerCase())||p.sym.toLowerCase()===arg.toLowerCase()):positions;
+    if(!target.length){await bot.sendMessage(chatId,`❌ No position found for "${arg}".`);return;}
+    const load=await bot.sendMessage(chatId,`📊 Loading P&L for ${target.length} position(s)...`);
+    await bot.deleteMessage(chatId,load.message_id).catch(()=>{});
+    for(const pos of target){
+      try{
+        const p=await getPnl(pos);
+        if(p){
+          const cap=pnlCaption(pos,p)+`\n\nTP: ${pos.tp?pos.tp+'%':'None'} | SL: ${pos.sl?pos.sl+'%':'None'}`;
+          const url=pnlChart(pos.sym,p.pct,pos.spent,p.cur);
+          await bot.sendPhoto(chatId,url,{caption:cap,parse_mode:'Markdown'}).catch(async()=>{
+            await bot.sendMessage(chatId,cap,{parse_mode:'Markdown'});
+          });
+        }else{
+          await bot.sendMessage(chatId,`⚪ *${pos.sym}*\nHeld: ${pos.tokens?.toFixed(2)} tokens\nSpent: ${pos.spent} SUI\n_Price unavailable_`,{parse_mode:'Markdown'});
+        }
+      }catch{await bot.sendMessage(chatId,`⚪ ${pos.sym} — ${pos.spent} SUI`);}
+    }
+  });
+});
 bot.onText(/\/referral/, async(msg)=>doReferral(msg.chat.id));
 bot.onText(/\/help/,     async(msg)=>doHelp(msg.chat.id));
 bot.onText(/\/settings/, async(msg)=>doSettings(msg.chat.id));
