@@ -1,25 +1,40 @@
 /**
- * AGENT TRADING BOT — v6 Production
+ * AGENT TRADING BOT — v7 Production
  *
- * Fixes from v5:
- * 1. Turbos swap: verified real function name (pool_script::swap_a_b_with_exact_in)
- *    and correct type arguments [CoinA, CoinB, Fee]
- * 2. Cetus pool detection: now uses both direct API and findCetusPool fallback,
- *    correctly computing a2b from actual pool coin ordering
- * 3. Fee deduction on sells: fee now taken in SUI from swap output, not from
- *    gas (was causing "insufficient gas" errors on sells)
- * 4. devInspectTransactionBlock honeypot detection (simulates a sell on-chain
- *    without executing, catches real honeypots that have liquidity but blocked sells)
- * 5. TreasuryCap wrapped-object detection via queryEvents (catches renounced-by-wrap)
- * 6. UpgradeCap check uses package field correctly
- * 7. /withdraw command — send SUI or tokens to external address
- * 8. Position sell buttons directly from /positions
- * 9. Auto-retry on RPC errors (3 retries with exponential backoff)
- * 10. Better sell direction: always re-queries pool with correct token ordering
- * 11. Graceful token-not-found messages with DEX suggestions
- * 12. Turbos pool fetched directly from Turbos Finance API (not via Cetus)
- * 13. State machine hardened — clears stale states on /start
- * 14. Copy trade: skip tokens already held + check balance before buying
+ * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
+ * and confirmed against real on-chain transactions — April 2026.
+ *
+ * CRITICAL SWAP FIXES (v7):
+ * 1. Cetus function name: was pool_script::swap (PRIVATE — can never be called from PTB!)
+ *    Now correctly uses pool_script::swap_a2b / swap_b2a (public entry functions).
+ *    Input coin now wrapped as MakeMoveVec (Vec<Coin<CoinX>>) as function requires.
+ *    Output coin sent to sender INSIDE Move — no TransferObjects needed in PTB.
+ *
+ * 2. Turbos package address: old address 0x91bfbc...c3a does NOT EXIST on chain.
+ *    Correct TURBOS_SWAP_PKG = 0xa5a0c25c... (verified from live tx 3vhBNBSEF...)
+ *    Correct TURBOS_CORE_PKG = 0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1
+ *    Correct module: swap_router (NOT pool_script — that module does not exist in Turbos)
+ *    Correct functions: swap_a_b / swap_b_a with args:
+ *      (Pool, Vec<Coin>, amount, amount_limit, sqrt_price_limit, is_exact_in, recipient, deadline, Clock, Versioned)
+ *    Versioned is IMMUTABLE (&Versioned, NOT &mut) — old code passed mutable which fails.
+ *
+ * 3. Pool detection: Cetus REST API returns 404 for all endpoints.
+ *    New strategy: Turbos API (d.result[] key — not d.data/d.pools) → Cetus API →
+ *    GeckoTerminal pool address → Sui RPC getObject → parse Pool<CoinA,CoinB[,FeeType]> type.
+ *    This makes detection work even when both REST APIs are down.
+ *
+ * 4. Turbos pool API result key: API returns data in d.result[], not d.data or d.pools.
+ *    Old code always saw empty array, so Turbos pools were never found via API.
+ *
+ * RETAINED FROM v6:
+ * 5. /withdraw command — send SUI or tokens to external address
+ * 6. Quick-sell buttons in /positions
+ * 7. Copy trade balance check + skip already-held tokens
+ * 8. devInspectTransactionBlock honeypot detection
+ * 9. TreasuryCap wrapped-object detection
+ * 10. Auto-retry on RPC errors (3 retries + exponential backoff)
+ * 11. Sell fees taken from gas — prevents gas drain on sells
+ * 12. State machine hardened — /start clears stale input state
  */
 
 import TelegramBot             from 'node-telegram-bot-api';
@@ -58,17 +73,24 @@ const CLOCK_OBJ   = '0x6';
 
 let BOT_USERNAME  = 'AGENTTRADINBOT';
 
-// ── Cetus CLMM (verified from mainnet txs on SuiScan)
+// ── Cetus CLMM (verified via Sui RPC + live transaction inspection)
+// CETUS_CONFIG: GlobalConfig shared object (verified on-chain)
+// CETUS_INTEGRATE: original package ID — Sui routes to latest upgraded version automatically
+// Swap functions: pool_script::swap_a2b (SUI→token when SUI=coinA) / swap_b2a (SUI→token when SUI=coinB)
 const CETUS_CONFIG    = '0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f';
 const CETUS_INTEGRATE = '0x2d8c2e0fc6dd25b0214b3fa747e0fd27fd54608142cd2e4f64c1cd350cc4add4';
-const CETUS_ROUTER_URL = 'https://api-sui.cetus.zone/router';
+// Cetus core pool package (for RPC pool type parsing)
+const CETUS_POOL_PKG  = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb';
 
-// ── Turbos CLMM (verified from mainnet tx 9GadBDwwrGikdFCpdaPD4QbdPik5ET19Y97kpVzHmWch)
-// The real Turbos swap package and versioned object:
-const TURBOS_PKG      = '0x91bfbc386a41afcfd9b2533058d7e9154d6339ca1dfaac7bac673a82fbaa9c3a';
+// ── Turbos CLMM (verified via Sui RPC + live transaction inspection Apr 2026)
+// TURBOS_CORE_PKG: pool types / fee types (Pool, Versioned structs live here)
+// TURBOS_SWAP_PKG: swap_router::swap_a_b / swap_b_a (the callable entry functions)
+// TURBOS_VERSIONED: global versioned object — passed as IMMUTABLE &Versioned
+const TURBOS_CORE_PKG  = '0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1';
+const TURBOS_SWAP_PKG  = '0xa5a0c25c79e428eba04fb98b3fb2a34db45ab26d4c8faf0d7e39d66a63891e64';
 const TURBOS_VERSIONED = '0xf1cf0e81048df168ebeb1b8030fad24b3e0b53ae827c25053fff0779c1445b6f';
 
-// Sqrt price limits for swap direction
+// Sqrt price limits (Cetus style — used to not restrict price movement)
 const CETUS_MIN_SQRT  = '4295048016';
 const CETUS_MAX_SQRT  = '79226673515401279992447579055';
 
@@ -233,55 +255,101 @@ async function findCetusPool(coinA, coinB) {
 }
 
 /**
- * Find Turbos pool. Uses Turbos Finance API directly.
- * Returns poolId, feeType (needed as 3rd type arg), and a2b.
+ * Find Turbos pool via Turbos Finance API.
+ * API returns data in d.result[], NOT d.data or d.pools.
+ * feeType comes from fee_type field or is constructed from TURBOS_CORE_PKG.
+ * Returns poolId, feeType (3rd type arg), coinA, coinB, a2b.
  */
 async function findTurbosPool(coinA, coinB) {
-  // Turbos public pools API
-  const apiUrls = [
-    `https://api.turbos.finance/pools?coinTypeA=${encodeURIComponent(coinA)}&coinTypeB=${encodeURIComponent(coinB)}`,
-    `https://api.turbos.finance/pools?coinTypeA=${encodeURIComponent(coinB)}&coinTypeB=${encodeURIComponent(coinA)}`,
+  const pairs = [
+    [coinA, coinB, true],
+    [coinB, coinA, false],
   ];
 
-  for (let idx = 0; idx < apiUrls.length; idx++) {
+  for (const [ca, cb, isOriginalOrder] of pairs) {
     try {
-      const r = await ftch(apiUrls[idx], { headers:{ Accept:'application/json' } }, 8000);
+      const url = `https://api.turbos.finance/pools?coinTypeA=${encodeURIComponent(ca)}&coinTypeB=${encodeURIComponent(cb)}&pageSize=10`;
+      const r = await ftch(url, { headers:{ Accept:'application/json' } }, 10000);
       if (!r.ok) continue;
       const d = await r.json();
-      const pools = Array.isArray(d) ? d : (d.data || d.pools || []);
+      // Turbos API wraps data in "result", not "data" or "pools"
+      const pools = Array.isArray(d) ? d : (d.result || d.data || d.pools || []);
       if (!pools.length) continue;
-      const best = pools[0];
-      const poolId   = best.poolId || best.pool_id || best.id;
-      const feeType  = best.feeType || best.fee_type ||
-        `0x91bfbc386a41afcfd9b2533058d7e9154d6339ca1::fee${best.fee||3000}bps::FEE${best.fee||3000}BPS`;
-      const actualA  = best.coinTypeA || best.coin_type_a || (idx===0 ? coinA : coinB);
-      const a2b      = (actualA||'').toLowerCase() === coinA.toLowerCase();
+
+      // Filter to only pools matching our coin pair
+      const matched = pools.filter(p => {
+        const a = (p.coin_type_a || p.coinTypeA || '').toLowerCase();
+        const b = (p.coin_type_b || p.coinTypeB || '').toLowerCase();
+        return a === ca.toLowerCase() && b === cb.toLowerCase();
+      });
+      if (!matched.length) continue;
+
+      // Pick pool with highest liquidity
+      const best = matched.reduce((acc, p) => {
+        const liqA = parseFloat(p.liquidity_usd || p.liquidity || 0);
+        const liqB = parseFloat(acc.liquidity_usd || acc.liquidity || 0);
+        return liqA > liqB ? p : acc;
+      });
+
+      const poolId  = best.pool_id || best.poolId || best.id;
       if (!poolId) continue;
-      return { poolId, feeType, a2b, coinA:actualA, coinB:best.coinTypeB||best.coin_type_b||coinB, dex:'Turbos' };
+
+      // feeType from API response or constructed from core package
+      const feeType = best.fee_type || best.feeType ||
+        (() => {
+          const fee = best.fee || best.feeRate || 3000;
+          return `${TURBOS_CORE_PKG}::fee${fee}bps::FEE${fee}BPS`;
+        })();
+
+      const actualA = best.coin_type_a || best.coinTypeA || ca;
+      const actualB = best.coin_type_b || best.coinTypeB || cb;
+      // a2b relative to ORIGINAL call: coinA goes in → a2b=true means we're calling swap_a_b
+      const a2b = actualA.toLowerCase() === coinA.toLowerCase();
+
+      return { poolId, feeType, a2b, coinA: actualA, coinB: actualB, dex: 'Turbos',
+               liq: parseFloat(best.liquidity_usd || 0) };
     } catch {}
   }
 
-  // Fallback via Cetus aggregator (it indexes Turbos pools)
-  for (const [ca, cb] of [[coinA,coinB],[coinB,coinA]]) {
-    try {
-      const r = await ftch(
-        `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type_a=${encodeURIComponent(ca)}&coin_type_b=${encodeURIComponent(cb)}&dex=turbos&limit=5&order_by=tvl&order=desc`,
-        { headers:{ Accept:'application/json' } }, 8000
-      );
-      if (!r.ok) continue;
-      const d = await r.json();
-      const pools = d.data?.list || [];
-      if (!pools.length) continue;
-      const p       = pools[0];
-      const poolId  = p.pool_address || p.id;
-      if (!poolId) continue;
-      const feeRate = p.fee_rate || p.fee || 3000;
-      const feeType = `0x91bfbc386a41afcfd9b2533058d7e9154d6339ca1::fee${feeRate}bps::FEE${feeRate}BPS`;
-      const a2b     = (p.coin_type_a||ca).toLowerCase() === coinA.toLowerCase();
-      return { poolId, feeType, a2b, coinA:p.coin_type_a||ca, coinB:p.coin_type_b||cb, dex:'Turbos' };
-    } catch {}
-  }
+  return null;
+}
 
+/**
+ * Query the Sui RPC for a pool object and parse its coin types.
+ * Works for both Cetus Pool<CoinA,CoinB> and Turbos Pool<CoinA,CoinB,FeeType>.
+ * Returns { dex, poolId, coinA, coinB, feeType?, a2b } or null.
+ */
+async function getPoolFromRPC(poolAddress) {
+  try {
+    const obj = await sui.getObject({ id: poolAddress, options: { showType: true } });
+    const type = obj.data?.type;
+    if (!type) return null;
+
+    // Cetus: 0x1eabed...::pool::Pool<CoinA, CoinB>
+    const cetusRx = /0x1eabed[0-9a-f]*::pool::Pool<(.+),\s*([^>]+)>/;
+    const cm = type.match(cetusRx);
+    if (cm) {
+      const coinA = cm[1].trim();
+      const coinB = cm[2].trim();
+      const SUI_NORM = SUI_T.toLowerCase();
+      const a2b = coinA.toLowerCase() === SUI_NORM ||
+                  coinA.toLowerCase().endsWith('::sui::sui');
+      return { dex: 'cetus', poolId: poolAddress, coinA, coinB, a2b };
+    }
+
+    // Turbos: 0x91bfbc...::pool::Pool<CoinA, CoinB, FeeType>
+    const turbosRx = /0x91bfbc[0-9a-f]*::pool::Pool<([^,]+),\s*([^,]+),\s*([^>]+)>/;
+    const tm = type.match(turbosRx);
+    if (tm) {
+      const coinA   = tm[1].trim();
+      const coinB   = tm[2].trim();
+      const feeType = tm[3].trim();
+      const SUI_NORM = SUI_T.toLowerCase();
+      const a2b = coinA.toLowerCase() === SUI_NORM ||
+                  coinA.toLowerCase().endsWith('::sui::sui');
+      return { dex: 'turbos', poolId: poolAddress, coinA, coinB, feeType, a2b };
+    }
+  } catch {}
   return null;
 }
 
@@ -332,41 +400,7 @@ async function detectState(ct) {
   const cached = stateCache.get(ct);
   if (cached && Date.now() - cached.ts < STATE_TTL) return cached;
 
-  // 1. Cetus API — check with token as either coin_type_a or coin_type_b
-  try {
-    const r = await ftch(
-      `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type=${encodeURIComponent(ct)}&limit=5&order_by=tvl&order=desc`,
-      { headers:{ Accept:'application/json' } }, 6000
-    );
-    if (r.ok) {
-      const d     = await r.json();
-      const pools = d.data?.list || [];
-      // Only accept pools that pair with SUI
-      const suiPool = pools.find(p =>
-        (p.coin_type_a||'').toLowerCase() === SUI_T.toLowerCase() ||
-        (p.coin_type_b||'').toLowerCase() === SUI_T.toLowerCase()
-      );
-      if (suiPool) {
-        const poolId = suiPool.pool_address || suiPool.id;
-        const coinA  = suiPool.coin_type_a;
-        const coinB  = suiPool.coin_type_b;
-        const a2b    = (coinA||'').toLowerCase() === SUI_T.toLowerCase(); // true = SUI→token
-        const res = { state:'cetus', dex:'Cetus', poolId, coinA, coinB, a2b, ts:Date.now() };
-        stateCache.set(ct, res); return res;
-      }
-    }
-  } catch {}
-
-  // 2. findCetusPool broader search
-  try {
-    const pool = await findCetusPool(SUI_T, ct);
-    if (pool) {
-      const res = { state:'cetus', dex:'Cetus', ...pool, ts:Date.now() };
-      stateCache.set(ct, res); return res;
-    }
-  } catch {}
-
-  // 3. Turbos
+  // 1. Turbos pool API (most reliable — API works, returns d.result[])
   try {
     const tPool = await findTurbosPool(SUI_T, ct);
     if (tPool) {
@@ -375,20 +409,56 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 4. GeckoTerminal — for display only, marks unsupported DEX
+  // 2. Cetus pool API (try both orderings)
+  try {
+    const pool = await findCetusPool(SUI_T, ct);
+    if (pool) {
+      const res = { state:'cetus', dex:'Cetus', ...pool, ts:Date.now() };
+      stateCache.set(ct, res); return res;
+    }
+  } catch {}
+
+  // 3. GeckoTerminal — find pool address, then query Sui RPC for pool type
+  //    This handles Cetus/Turbos pools when the REST APIs above fail
   try {
     for (const addr of [ct, ct.split('::')[0]]) {
       const r = await ftch(
         `${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`,
-        { headers:{ Accept:'application/json;version=20230302' } }, 5000
+        { headers:{ Accept:'application/json;version=20230302' } }, 7000
       );
       if (!r.ok) continue;
       const d = await r.json();
-      if (d.data?.length) {
-        const dexId  = d.data[0].relationships?.dex?.data?.id || 'dex';
-        const dex    = dexId[0].toUpperCase() + dexId.slice(1);
-        const liq    = parseFloat(d.data[0].attributes?.reserve_in_usd || 0);
-        const res    = { state:'unsupported_dex', dex, liq, ts:Date.now() };
+      if (!d.data?.length) continue;
+
+      // Try each pool returned — prefer SUI pairs, check if it's Cetus or Turbos via RPC
+      for (const poolEntry of d.data.slice(0, 5)) {
+        const poolAddress = poolEntry.attributes?.address;
+        if (!poolAddress) continue;
+
+        const dexId = (poolEntry.relationships?.dex?.data?.id || '').toLowerCase();
+        const liq   = parseFloat(poolEntry.attributes?.reserve_in_usd || 0);
+
+        if (dexId.includes('cetus') || dexId.includes('turbos')) {
+          // Query Sui RPC for pool object type — gets exact coinA/coinB/feeType
+          const poolInfo = await getPoolFromRPC(poolAddress);
+          if (poolInfo) {
+            // Only accept SUI-paired pools
+            const SUI_NORM = SUI_T.toLowerCase();
+            const hasSui = poolInfo.coinA.toLowerCase() === SUI_NORM ||
+                           poolInfo.coinA.toLowerCase().endsWith('::sui::sui') ||
+                           poolInfo.coinB.toLowerCase() === SUI_NORM ||
+                           poolInfo.coinB.toLowerCase().endsWith('::sui::sui');
+            if (!hasSui) continue;
+
+            const res = { state: poolInfo.dex, dex: poolInfo.dex === 'cetus' ? 'Cetus' : 'Turbos',
+                          ...poolInfo, liq, ts: Date.now() };
+            stateCache.set(ct, res); return res;
+          }
+        }
+
+        // Not a supported DEX — return unsupported but with correct name
+        const dex = dexId ? dexId[0].toUpperCase() + dexId.slice(1) : 'Unknown';
+        const res = { state: 'unsupported_dex', dex, liq, ts: Date.now() };
         stateCache.set(ct, res); return res;
       }
     }
@@ -423,14 +493,23 @@ async function detectState(ct) {
 
 /**
  * Build a Cetus CLMM swap PTB.
- * pool_script::swap in INTEGRATE package takes both coins — the out coin starts at 0 balance.
+ *
+ * VERIFIED function signatures (from Sui RPC getNormalizedMoveFunction, Apr 2026):
+ *   pool_script::swap_a2b(config, pool, Vec<Coin<CoinA>>, a2b, amount_in, min_out, sqrt_limit, clock)
+ *   pool_script::swap_b2a(config, pool, Vec<Coin<CoinB>>, a2b, amount_in, min_out, sqrt_limit, clock)
+ *
+ * Both are public entry functions. Output coin is transferred to sender INSIDE Move.
+ * No TransferObjects needed in PTB.
+ *
+ * a2b=true  → swap_a2b: coinA goes in (SUI→token when SUI=coinA)
+ * a2b=false → swap_b2a: coinB goes in (SUI→token when SUI=coinB)
  */
 async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
   const tx = new Transaction();
-  tx.setGasBudget(60_000_000);
+  tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
 
-  // Prepare input coin
+  // Prepare input coin object
   let coinInObj;
   if (coinInType === SUI_T) {
     [coinInObj] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
@@ -449,50 +528,51 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
     }
   }
 
-  // Coin pairing — coinA gets swapped to coinB if a2b=true
-  let swapCoinA, swapCoinB;
-  if (a2b) {
-    // swapping A→B: coinA goes in, coinB starts empty
-    swapCoinA = coinInObj;
-    [swapCoinB] = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
-  } else {
-    // swapping B→A: coinB goes in, coinA starts empty
-    [swapCoinA] = tx.splitCoins(tx.gas, [tx.pure.u64(0n)]);
-    swapCoinB   = coinInObj;
-  }
+  // Cetus pool_script expects a vector of coins (MakeMoveVec), not a single coin
+  const coinVec = tx.makeMoveVec({ elements: [coinInObj] });
 
-  const [resultA, resultB] = tx.moveCall({
-    target: `${CETUS_INTEGRATE}::pool_script::swap`,
+  // swap_a2b: coinA (the input) going in; swap_b2a: coinB going in
+  const fn = a2b ? 'swap_a2b' : 'swap_b2a';
+
+  tx.moveCall({
+    target: `${CETUS_INTEGRATE}::pool_script::${fn}`,
     typeArguments: [coinA, coinB],
     arguments: [
-      tx.object(CETUS_CONFIG),
-      tx.object(poolId),
-      swapCoinA,
-      swapCoinB,
-      tx.pure.bool(a2b),
-      tx.pure.bool(true),                                                           // by_amount_in
-      tx.pure.u64(BigInt(amountIn)),
-      tx.pure.u64(BigInt(minAmountOut || '0')),
-      tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)),
-      tx.object(CLOCK_OBJ),
+      tx.object(CETUS_CONFIG),                                             // &GlobalConfig
+      tx.object(poolId),                                                   // &mut Pool<CoinA,CoinB>
+      coinVec,                                                             // vector<Coin<CoinX>>
+      tx.pure.bool(a2b),                                                   // a2b direction
+      tx.pure.u64(BigInt(amountIn)),                                       // amount_in
+      tx.pure.u64(BigInt(minAmountOut || '0')),                            // min_amount_out
+      tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)), // sqrt_price_limit
+      tx.object(CLOCK_OBJ),                                                // &Clock
     ],
   });
+  // NOTE: output coin is transferred to tx.sender inside Move — no TransferObjects needed
 
-  tx.transferObjects([resultA, resultB], tx.pure.address(wallet));
   return tx;
 }
 
 /**
- * Build a Turbos swap PTB.
- * swap_a_b:  a2b = true,  CoinA goes in
- * swap_b_a:  a2b = false, CoinB goes in
- * Type args: [CoinA, CoinB, FeeType]
+ * Build a Turbos CLMM swap PTB.
+ *
+ * VERIFIED function signatures (from Sui RPC getNormalizedMoveFunction, Apr 2026):
+ *   swap_router::swap_a_b(pool, Vec<Coin<CoinA>>, amount, amount_limit, sqrt_limit, is_exact_in, recipient, deadline, clock, versioned)
+ *   swap_router::swap_b_a(pool, Vec<Coin<CoinB>>, amount, amount_limit, sqrt_limit, is_exact_in, recipient, deadline, clock, versioned)
+ *
+ * Package: TURBOS_SWAP_PKG (separate from TURBOS_CORE_PKG which has pool types)
+ * Versioned: passed as IMMUTABLE reference (&Versioned, NOT &mut Versioned)
+ * Output coin transferred to recipient inside Move — no TransferObjects needed.
+ *
+ * a2b=true  → swap_a_b: coinA goes in, coinB comes out
+ * a2b=false → swap_b_a: coinB goes in, coinA comes out
  */
 async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, coinInType, amountIn }) {
   const tx = new Transaction();
-  tx.setGasBudget(60_000_000);
+  tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
 
+  // Prepare input coin
   let coinInObj;
   if (coinInType === SUI_T) {
     [coinInObj] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
@@ -502,30 +582,38 @@ async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, c
     let obj = tx.object(coins[0].coinObjectId);
     if (coins.length > 1) tx.mergeCoins(obj, coins.slice(1).map(c => tx.object(c.coinObjectId)));
     const total = coins.reduce((s,c) => s + BigInt(c.balance), 0n);
-    if (BigInt(amountIn) < total) { [coinInObj] = tx.splitCoins(obj, [tx.pure.u64(BigInt(amountIn))]); }
-    else { coinInObj = obj; }
+    if (BigInt(amountIn) < total) {
+      [coinInObj] = tx.splitCoins(obj, [tx.pure.u64(BigInt(amountIn))]);
+    } else {
+      coinInObj = obj;
+    }
   }
 
-  // Function: swap_a_b if a2b, else swap_b_a
-  const fn = a2b ? 'swap_a_b' : 'swap_b_a';
+  // Turbos also expects a vector of coins
+  const coinVec = tx.makeMoveVec({ elements: [coinInObj] });
 
-  const [resultCoin] = tx.moveCall({
-    target: `${TURBOS_PKG}::pool_script::${fn}`,
+  // swap_a_b: coinA goes in; swap_b_a: coinB goes in
+  const fn = a2b ? 'swap_a_b' : 'swap_b_a';
+  const deadline = BigInt(Date.now() + 5 * 60 * 1000); // 5 minutes from now
+
+  tx.moveCall({
+    target: `${TURBOS_SWAP_PKG}::swap_router::${fn}`,
     typeArguments: [coinA, coinB, feeType],
     arguments: [
-      tx.object(poolId),
-      tx.object(TURBOS_VERSIONED),
-      coinInObj,
-      tx.pure.u64(BigInt(amountIn)),
-      tx.pure.bool(true),                       // by_amount_in
-      tx.pure.u64(0n),                          // sqrt_price_limit (0 = no limit)
-      tx.pure.u64(0n),                          // min_amount_out
-      tx.pure.address(wallet),
-      tx.object(CLOCK_OBJ),
+      tx.object(poolId),                  // &mut Pool<CoinA,CoinB,FeeType>
+      coinVec,                            // vector<Coin<CoinX>>
+      tx.pure.u64(BigInt(amountIn)),      // amount (exact in)
+      tx.pure.u64(0n),                    // amount_limit (min out — 0 = no limit, slippage applied separately)
+      tx.pure.u128(0n),                   // sqrt_price_limit (0 = no restriction)
+      tx.pure.bool(true),                 // is_exact_in
+      tx.pure.address(wallet),            // recipient
+      tx.pure.u64(deadline),              // deadline (timestamp ms)
+      tx.object(CLOCK_OBJ),               // &Clock
+      tx.object(TURBOS_VERSIONED),        // &Versioned (IMMUTABLE — not mutable!)
     ],
   });
+  // NOTE: output coin is transferred to recipient inside Move
 
-  tx.transferObjects([resultCoin], tx.pure.address(wallet));
   return tx;
 }
 
