@@ -703,7 +703,19 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
   tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
 
-  // Prepare input coin object
+  // pool_script_v2 signature (verified Apr 2026 via sui_getNormalizedMoveFunction):
+  //   swap_a2b(config, pool, Coin<CoinA>, Coin<CoinB>, by_amount_in, amount, amount_limit, sqrt_limit, clock)
+  //   swap_b2a(config, pool, Coin<CoinB>, Coin<CoinA>, by_amount_in, amount, amount_limit, sqrt_limit, clock)
+  // Unlike v1, v2 takes individual coins (NOT vector) + a zero-balance output coin.
+  // The output coin receives the swap result and is auto-transferred to sender inside Move.
+
+  // a2b=true  → selling coinA for coinB: input=CoinA, output_placeholder=CoinB zero
+  // a2b=false → buying  coinA with coinB: input=CoinB, output_placeholder=CoinA zero
+  const coinInType_  = a2b ? coinA : coinB;
+  const coinOutType_ = a2b ? coinB : coinA;
+  const fn           = a2b ? 'swap_a2b' : 'swap_b2a';
+
+  // Prepare input coin
   let coinInObj;
   if (coinInType === SUI_T) {
     [coinInObj] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
@@ -722,27 +734,28 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
     }
   }
 
-  // Cetus pool_script expects a vector of coins (MakeMoveVec), not a single coin
-  const coinVec = tx.makeMoveVec({ elements: [coinInObj] });
-
-  // swap_a2b: coinA (the input) going in; swap_b2a: coinB going in
-  const fn = a2b ? 'swap_a2b' : 'swap_b2a';
+  // Create zero-balance coin for output — pool_script_v2 writes swap output into it
+  const coinOutZero = tx.moveCall({
+    target: '0x2::coin::zero',
+    typeArguments: [coinOutType_],
+  });
 
   tx.moveCall({
-    target: `${CETUS_INTEGRATE}::pool_script::${fn}`,
+    target: `${CETUS_INTEGRATE}::pool_script_v2::${fn}`,
     typeArguments: [coinA, coinB],
     arguments: [
-      tx.object(CETUS_CONFIG),                                             // &GlobalConfig
-      tx.object(poolId),                                                   // &mut Pool<CoinA,CoinB>
-      coinVec,                                                             // vector<Coin<CoinX>>
-      tx.pure.bool(true),                                                  // by_amount_in=true (exact input always)
-      tx.pure.u64(BigInt(amountIn)),                                       // amount_in (exact)
-      tx.pure.u64(BigInt(minAmountOut || '0')),                            // min_amount_out
+      tx.object(CETUS_CONFIG),                                              // &GlobalConfig
+      tx.object(poolId),                                                    // &mut Pool<CoinA,CoinB>
+      coinInObj,                                                            // Coin<CoinIn> (exact input)
+      coinOutZero,                                                          // Coin<CoinOut> zero (receives output)
+      tx.pure.bool(true),                                                   // by_amount_in=true
+      tx.pure.u64(BigInt(amountIn)),                                        // amount (exact in)
+      tx.pure.u64(BigInt(minAmountOut || '0')),                             // amount_limit (min out)
       tx.pure.u128(a2b ? BigInt(CETUS_MIN_SQRT) : BigInt(CETUS_MAX_SQRT)), // sqrt_price_limit
-      tx.object(CLOCK_OBJ),                                                // &Clock
+      tx.object(CLOCK_OBJ),                                                 // &Clock
     ],
   });
-  // NOTE: output coin is transferred to tx.sender inside Move — no TransferObjects needed
+  // Output coin auto-transferred to sender inside pool_script_v2 — no TransferObjects needed
 
   return tx;
 }
