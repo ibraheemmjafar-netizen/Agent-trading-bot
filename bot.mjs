@@ -715,10 +715,26 @@ async function detectState(ct) {
  * a2b=true  → swap_a2b: coinA goes in (SUI→token when SUI=coinA)
  * a2b=false → swap_b2a: coinB goes in (SUI→token when SUI=coinB)
  */
+// Set ALL of the user's SUI coin objects as gas payment so splitCoins(tx.gas, ...)
+// can draw from the full balance even when SUI is fragmented across multiple objects.
+async function setSuiGasPayment(tx, wallet) {
+  try {
+    const coins = await sui.getCoins({ owner: wallet, coinType: SUI_T, limit: 50 });
+    if (coins.data.length > 0) {
+      tx.setGasPayment(coins.data.map(c => ({
+        objectId: c.coinObjectId,
+        version:  c.version,
+        digest:   c.digest,
+      })));
+    }
+  } catch { /* non-fatal — SDK will pick its own gas coins */ }
+}
+
 async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
   const tx = new Transaction();
   tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
+  if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
   // pool_script_v2 signature (verified Apr 2026 via sui_getNormalizedMoveFunction):
   //   swap_a2b(config, pool, Coin<CoinA>, Coin<CoinB>, by_amount_in, amount, amount_limit, sqrt_limit, clock)
@@ -801,6 +817,7 @@ async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, c
   const tx = new Transaction();
   tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
+  if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
   // Prepare input coin
   let coinInObj;
@@ -864,6 +881,7 @@ async function buildFlowXSwapTx({ wallet, coinA, coinB, a2b, coinInType, amountI
   const tx = new Transaction();
   tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
+  if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
   let coinInObj;
   if (coinInType === SUI_T) {
@@ -921,6 +939,7 @@ async function buildKriyaSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
   const tx = new Transaction();
   tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
+  if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
   let coinInObj;
   if (coinInType === SUI_T) {
@@ -976,6 +995,7 @@ async function buildBlueMoveSwapTx({ wallet, coinA, coinB, a2b, coinInType, amou
   const tx = new Transaction();
   tx.setGasBudget(150_000_000);
   tx.setSender(wallet);
+  if (coinInType === SUI_T) await setSuiGasPayment(tx, wallet);
 
   let coinInObj;
   if (coinInType === SUI_T) {
