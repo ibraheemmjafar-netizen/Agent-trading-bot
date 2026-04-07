@@ -2110,6 +2110,69 @@ bot.onText(/\/start(.*)/, async(msg, match) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// /diag <CA> — live pool detection diagnostic
+// ═══════════════════════════════════════════════════════════
+bot.onText(/\/diag\s+(.+)/, async(msg, match) => {
+  const chatId = msg.chat.id;
+  const raw = (match[1]||'').trim();
+  await bot.sendMessage(chatId, `🔍 Running detection for:\n\`${raw}\``, { parse_mode:'Markdown' });
+
+  let lines = [];
+  try {
+    const ct = await resolveCoinType(raw);
+    lines.push(`✅ Coin type: \`${ct.slice(0,60)}...\``);
+
+    // Step 1: Turbos
+    try {
+      const tp = await findTurbosPool(SUI_T, ct);
+      lines.push(tp ? `✅ Turbos pool: \`${tp.poolId?.slice(0,20)}...\`` : `⚪ Turbos: no pool`);
+    } catch(e) { lines.push(`❌ Turbos error: ${e.message}`); }
+
+    // Step 2: Cetus REST API
+    try {
+      const r1 = await ftch(`https://api-sui.cetus.zone/v2/sui/pools_info?coin_type_a=${encodeURIComponent(SUI_T)}&coin_type_b=${encodeURIComponent(ct)}&limit=3`, { headers:{Accept:'application/json'} }, 6000);
+      lines.push(`Cetus API status: ${r1.status}`);
+    } catch(e) { lines.push(`❌ Cetus API error: ${e.message}`); }
+
+    // Step 3: GeckoTerminal
+    for (const addr of [ct, ct.split('::')[0]]) {
+      try {
+        const r = await ftch(`${GECKO}/networks/${GECKO_NET}/tokens/${encodeURIComponent(addr)}/pools?page=1`, { headers:{ Accept:'application/json;version=20230302' } }, 7000);
+        if (!r.ok) { lines.push(`GeckoTerminal (${addr.length > 20 ? 'full' : 'pkg'}): HTTP ${r.status}`); continue; }
+        const d = await r.json();
+        const pools = d.data || [];
+        lines.push(`GeckoTerminal (${addr.length > 20 ? 'full type' : 'pkg addr'}): ${pools.length} pools`);
+        for (const p of pools.slice(0,5)) {
+          const dexId = p.relationships?.dex?.data?.id || 'unknown';
+          const pAddr = p.attributes?.address || '?';
+          const liq   = parseFloat(p.attributes?.reserve_in_usd||0).toFixed(0);
+          // Try RPC for each known pool
+          const known = dexId.toLowerCase().includes('cetus') || dexId.toLowerCase().includes('turbos') ||
+                        dexId.toLowerCase().includes('kriya')  || dexId.toLowerCase().includes('bluemove');
+          if (known) {
+            const pi = await getPoolFromRPC(pAddr).catch(()=>null);
+            lines.push(`  • ${dexId} liq=$${liq} rpc=${pi ? `dex=${pi.dex} a2b=${pi.a2b}` : 'FAILED'}`);
+          } else {
+            lines.push(`  • ${dexId} liq=$${liq} [unsupported — skipping]`);
+          }
+        }
+      } catch(e) { lines.push(`GeckoTerminal error: ${e.message}`); }
+    }
+
+    // Step 4: Full detectState
+    try {
+      const st = await detectState(ct);
+      lines.push(`\n🎯 detectState result: state=${st?.state} dex=${st?.dex}`);
+      if (st?.poolId) lines.push(`   poolId: \`${st.poolId.slice(0,20)}...\``);
+      if (st?.a2b !== undefined) lines.push(`   a2b: ${st.a2b}`);
+    } catch(e) { lines.push(`❌ detectState threw: ${e.message}`); }
+
+  } catch(e) { lines.push(`❌ Fatal: ${e.message}`); }
+
+  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode:'Markdown' });
+});
+
+// ═══════════════════════════════════════════════════════════
 // CALLBACKS
 // ═══════════════════════════════════════════════════════════
 bot.on('callback_query', async(q) => {
