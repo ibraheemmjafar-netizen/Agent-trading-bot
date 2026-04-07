@@ -709,13 +709,13 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
   // Unlike v1, v2 takes individual coins (NOT vector) + a zero-balance output coin.
   // The output coin receives the swap result and is auto-transferred to sender inside Move.
 
-  // a2b=true  → selling coinA for coinB: input=CoinA, output_placeholder=CoinB zero
-  // a2b=false → buying  coinA with coinB: input=CoinB, output_placeholder=CoinA zero
-  const coinInType_  = a2b ? coinA : coinB;
-  const coinOutType_ = a2b ? coinB : coinA;
-  const fn           = a2b ? 'swap_a2b' : 'swap_b2a';
+  // Verified from live on-chain txs (Apr 2026): pool_script_v2 ALWAYS orders args as
+  // [Coin<CoinA>, Coin<CoinB>] regardless of swap direction.
+  // swap_a2b: coinA=INPUT,     coinB=zero output placeholder
+  // swap_b2a: coinA=zero output placeholder, coinB=INPUT
+  const fn = a2b ? 'swap_a2b' : 'swap_b2a';
 
-  // Prepare input coin
+  // Prepare the input coin object (SUI split or token from wallet)
   let coinInObj;
   if (coinInType === SUI_T) {
     [coinInObj] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountIn))]);
@@ -734,11 +734,17 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
     }
   }
 
-  // Create zero-balance coin for output — pool_script_v2 writes swap output into it
-  const coinOutZero = tx.moveCall({
-    target: '0x2::coin::zero',
-    typeArguments: [coinOutType_],
-  });
+  // Build CoinA and CoinB arguments — position [2] is ALWAYS CoinA, position [3] is ALWAYS CoinB
+  let coinArgA, coinArgB;
+  if (a2b) {
+    // swap_a2b: spending CoinA (input), receiving CoinB (zero → filled by pool)
+    coinArgA = coinInObj;
+    coinArgB = tx.moveCall({ target: '0x2::coin::zero', typeArguments: [coinB] });
+  } else {
+    // swap_b2a: spending CoinB (input, e.g. SUI), receiving CoinA (zero → filled by pool)
+    coinArgA = tx.moveCall({ target: '0x2::coin::zero', typeArguments: [coinA] });
+    coinArgB = coinInObj;
+  }
 
   tx.moveCall({
     target: `${CETUS_INTEGRATE}::pool_script_v2::${fn}`,
@@ -746,8 +752,8 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
     arguments: [
       tx.object(CETUS_CONFIG),                                              // &GlobalConfig
       tx.object(poolId),                                                    // &mut Pool<CoinA,CoinB>
-      coinInObj,                                                            // Coin<CoinIn> (exact input)
-      coinOutZero,                                                          // Coin<CoinOut> zero (receives output)
+      coinArgA,                                                             // Coin<CoinA>
+      coinArgB,                                                             // Coin<CoinB>
       tx.pure.bool(true),                                                   // by_amount_in=true
       tx.pure.u64(BigInt(amountIn)),                                        // amount (exact in)
       tx.pure.u64(BigInt(minAmountOut || '0')),                             // amount_limit (min out)
