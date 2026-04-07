@@ -74,11 +74,12 @@ const CLOCK_OBJ   = '0x6';
 let BOT_USERNAME  = 'AGENTTRADINBOT';
 
 // ── Cetus CLMM (verified via Sui RPC + live transaction inspection)
-// CETUS_CONFIG: GlobalConfig shared object (verified on-chain)
-// CETUS_INTEGRATE: original package ID — Sui routes to latest upgraded version automatically
-// Swap functions: pool_script::swap_a2b (SUI→token when SUI=coinA) / swap_b2a (SUI→token when SUI=coinB)
+// CETUS_CONFIG: GlobalConfig shared object (verified on-chain), package_version=12
+// CETUS_INTEGRATE: current published_at from @cetusprotocol/cetus-sui-clmm-sdk v5.4.0
+//   Old 0x2d8c... has CURRENT_VERSION < 12 — fails checked_package_version on all current pools.
+//   New 0xb2db... has CURRENT_VERSION=12, same pool_script_v2 signature (10 params).
 const CETUS_CONFIG    = '0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f';
-const CETUS_INTEGRATE = '0x2d8c2e0fc6dd25b0214b3fa747e0fd27fd54608142cd2e4f64c1cd350cc4add4';
+const CETUS_INTEGRATE = '0xb2db7142fa83210a7d78d9c12ac49c043b3cbbd482224fea6e3da00aa5a5ae2d';
 // Cetus core pool package (for RPC pool type parsing)
 const CETUS_POOL_PKG  = '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb';
 
