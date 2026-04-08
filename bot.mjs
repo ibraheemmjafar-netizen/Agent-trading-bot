@@ -1360,15 +1360,23 @@ async function executeBuy(chatId, ct, amtSui) {
     await new Promise(r => setTimeout(r, 800));
 
     // Hop 2: PANS → TOKEN
-    // Use exact PANS_T constant (not pool-extracted type) to avoid address normalisation mismatches.
+    // Re-query the pool type fresh from chain to get exact canonical type strings.
     const tp = st.tokenPansPool;
-    const pansIsA = tp.coinA.toLowerCase() === PANS_T.toLowerCase();
-    const tokenType = pansIsA ? tp.coinB : tp.coinA;   // the non-PANS side
-    // Always use PANS_T for the PANS slot so type strings match exactly
+    // Get canonical type strings directly from chain object
+    let freshTp = tp;
+    try {
+      const poolObj = await sui.getObject({ id: tp.poolId, options: { showType: true } });
+      const fullType = poolObj.data?.type || '';
+      console.log('[PANS-BUY] hop2 rawPoolType=%s', fullType);
+      const parsed = await getPoolFromRPC(tp.poolId).catch(() => null);
+      if (parsed) freshTp = parsed;
+    } catch (e) { console.log('[PANS-BUY] hop2 pool fetch error:', e.message); }
+    const pansIsA = freshTp.coinA.toLowerCase() === PANS_T.toLowerCase();
+    const tokenType = pansIsA ? freshTp.coinB : freshTp.coinA;
     const hop2CoinA = pansIsA ? PANS_T : tokenType;
     const hop2CoinB = pansIsA ? tokenType : PANS_T;
-    console.log('[PANS-BUY] hop2 poolId=%s coinA=%s coinB=%s a2b=%s pansMist=%s',
-      tp.poolId.slice(0,20), hop2CoinA.slice(0,40), hop2CoinB.slice(0,40), pansIsA, ab1.toString());
+    console.log('[PANS-BUY] hop2 pansIsA=%s coinA=%s coinB=%s pansMist=%s',
+      pansIsA, hop2CoinA, hop2CoinB, ab1.toString());
     const tx2 = await buildCetusSwapTx({
       wallet:       u.walletAddress,
       poolId:       tp.poolId,
@@ -1555,10 +1563,11 @@ async function executeSell(chatId, ct, pct) {
 
   if (st.state === 'pans_cetus') {
     // 2-hop sell: TOKEN → PANS (tx1), then PANS → SUI (tx2)
-    // Hop 1: TOKEN → PANS — normalise to exact type constants
+    // Hop 1: TOKEN → PANS — re-query pool type fresh from chain
     const tp = st.tokenPansPool;
-    const pansIsA = tp.coinA.toLowerCase() === PANS_T.toLowerCase();
-    const tokenType = pansIsA ? tp.coinB : tp.coinA;
+    const freshTpS = await getPoolFromRPC(tp.poolId).catch(() => null) || tp;
+    const pansIsA = freshTpS.coinA.toLowerCase() === PANS_T.toLowerCase();
+    const tokenType = pansIsA ? freshTpS.coinB : freshTpS.coinA;
     const s1CoinA = pansIsA ? PANS_T : tokenType;
     const s1CoinB = pansIsA ? tokenType : PANS_T;
     // Selling TOKEN→PANS: if PANS is coinA then a2b=false (TOKEN is coinB going in)
