@@ -10,6 +10,7 @@
  *    Input coin now wrapped as MakeMoveVec (Vec<Coin<CoinX>>) as function requires.
  *    Output coin sent to sender INSIDE Move — no TransferObjects needed in PTB.
  *
+ 
  * 2. Turbos package address: old address 0x91bfbc...c3a does NOT EXIST on chain.
  *    Correct TURBOS_SWAP_PKG = 0xa5a0c25c... (verified from live tx 3vhBNBSEF...)
  *    Correct TURBOS_CORE_PKG = 0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1
@@ -610,6 +611,33 @@ const STATE_TTL  = 20_000; // 20 seconds
 const geckoCache = new Map();
 const GECKO_CACHE_TTL = 60_000; // 60 seconds
 
+// DexScreener pool cache — fallback when GeckoTerminal hasn't indexed a pool
+// (e.g. BVS/PANS pool exists on Cetus but only DexScreener has it indexed)
+const dsCache = new Map();
+const DS_CACHE_TTL = 60_000;
+
+async function getDexScreenerPools(addr) {
+  const hit = dsCache.get(addr);
+  if (hit && Date.now() - hit.ts < DS_CACHE_TTL) return hit.pools;
+  try {
+    const r = await ftch(
+      `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(addr)}`,
+      { headers:{ Accept:'application/json' } }, 8000
+    );
+    const raw = r.ok ? ((await r.json()).pairs || []) : [];
+    const pools = raw.map(p => ({
+      address: p.pairAddress,
+      dex:     (p.dexId || '').toLowerCase(),
+      liq:     p.liquidity?.usd || 0,
+    }));
+    dsCache.set(addr, { pools, ts: Date.now() });
+    return pools;
+  } catch {
+    dsCache.set(addr, { pools: [], ts: Date.now() });
+    return [];
+  }
+}
+
 async function getGeckoPools(addr) {
   const hit = geckoCache.get(addr);
   if (hit && Date.now() - hit.ts < GECKO_CACHE_TTL) return hit.pools;
@@ -678,9 +706,40 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 2. PANS ecosystem check FIRST — TOKEN/PANS pool on Cetus.
-  //    Checked before SUI-direct so PANS tokens with ghost SUI pools don't get misdirected.
-  //    Uses findSuiPansPool() which falls back to GeckoTerminal when the Cetus API is down.
+  // 2. DexScreener — PRIMARY check for PANS ecosystem tokens.
+  //    DexScreener indexes PANS meme pools (BVS/PANS, KYLN/PANS etc.) faster than
+  //    GeckoTerminal and works even when the Cetus REST API is down (404).
+  //    Must run BEFORE SUI-direct checks so PANS tokens are never misrouted.
+  try {
+    for (const addr of [ct, ct.split('::')[0]]) {
+      const dsPools = await getDexScreenerPools(addr);
+      for (const p of dsPools) {
+        if (!p.address || !p.dex.includes('cetus')) continue;
+        const poolInfo = await getPoolFromRPC(p.address).catch(() => null);
+        if (!poolInfo) continue;
+        const PANS_NORM = PANS_T.toLowerCase();
+        const SUI_NORM  = SUI_T.toLowerCase();
+        const coinAl = poolInfo.coinA.toLowerCase();
+        const coinBl = poolInfo.coinB.toLowerCase();
+        const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
+        const hasSui  = coinAl === SUI_NORM  || coinAl.endsWith('::sui::sui') ||
+                        coinBl === SUI_NORM  || coinBl.endsWith('::sui::sui');
+        if (hasPans && !hasSui) {
+          const suiPansPool = await findSuiPansPool();
+          if (suiPansPool) {
+            const res = {
+              state:'pans_cetus', dex:'Cetus (PANS hop)',
+              tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
+              suiPansPool, liq:p.liq, ts:Date.now(),
+            };
+            stateCache.set(ct, res); return res;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // 3. PANS ecosystem — Cetus API + GeckoTerminal fallback
   try {
     const pansPool = await findCetusPool(PANS_T, ct);
     if (pansPool) {
@@ -697,7 +756,7 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 3. Cetus pool API — SUI/TOKEN direct pair
+  // 4. Cetus pool API — SUI/TOKEN direct pair
   try {
     const pool = await findCetusPool(SUI_T, ct);
     if (pool) {
@@ -706,7 +765,7 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 4. GeckoTerminal — find pool address, then query Sui RPC for pool type.
+  // 5. GeckoTerminal — find pool address, then query Sui RPC for pool type.
   //    Uses shared geckoCache — no duplicate HTTP calls, no 429 rate limits.
   //    Checks ALL pools from ALL address variants before giving up.
   try {
