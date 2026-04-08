@@ -616,6 +616,40 @@ const GECKO_CACHE_TTL = 60_000; // 60 seconds
 const dsCache = new Map();
 const DS_CACHE_TTL = 60_000;
 
+// PANS ecosystem pool map: query DexScreener by PANS address (not target token)
+// and look for a pool that contains the target token.
+// DexScreener lists ALL PANS pairs when you search the PANS package address.
+// Cache for 5 minutes to avoid hitting DS on every detection.
+const pansDsCache = { pools: [], ts: 0 };
+const PANS_DS_TTL = 300_000; // 5 min
+
+async function findPansPoolForToken(ct) {
+  const now = Date.now();
+  if (now - pansDsCache.ts > PANS_DS_TTL) {
+    const pansPkg = PANS_T.split('::')[0];
+    const fresh = await getDexScreenerPools(pansPkg).catch(() => []);
+    pansDsCache.pools = fresh;
+    pansDsCache.ts    = now;
+  }
+  const CT_NORM   = ct.toLowerCase();
+  const ctPkg     = ct.split('::')[0].toLowerCase();
+  // Match: pool address known, dex is cetus, and base or quote token is ct
+  for (const p of pansDsCache.pools) {
+    if (!p.address || !p.dex.includes('cetus')) continue;
+    const bl = (p.baseSymbol  || '').toLowerCase();
+    const ql = (p.quoteSymbol || '').toLowerCase();
+    // DexScreener stores token addresses in baseToken.address / quoteToken.address
+    // We only have symbol here, but address is also in the raw pair.
+    // getDexScreenerPools now stores baseAddr/quoteAddr — use those.
+    const ba = (p.baseAddr  || '').toLowerCase();
+    const qa = (p.quoteAddr || '').toLowerCase();
+    if (ba === CT_NORM || ba.startsWith(ctPkg) || qa === CT_NORM || qa.startsWith(ctPkg)) {
+      return p; // found PANS pool containing ct
+    }
+  }
+  return null;
+}
+
 async function getDexScreenerPools(addr) {
   const hit = dsCache.get(addr);
   if (hit && Date.now() - hit.ts < DS_CACHE_TTL) return hit.pools;
@@ -638,6 +672,8 @@ async function getDexScreenerPools(addr) {
       age:     p.pairCreatedAt ? new Date(p.pairCreatedAt).toISOString() : null,
       baseSymbol:  p.baseToken?.symbol  || '',
       quoteSymbol: p.quoteToken?.symbol || '',
+      baseAddr:    p.baseToken?.address  || '',
+      quoteAddr:   p.quoteToken?.address || '',
     }));
     dsCache.set(addr, { pools, ts: Date.now() });
     return pools;
@@ -716,35 +752,49 @@ async function detectState(ct) {
   } catch {}
 
   // 2. DexScreener — PRIMARY check for PANS ecosystem tokens.
-  //    DexScreener indexes PANS meme pools (BVS/PANS, KYLN/PANS etc.) faster than
-  //    GeckoTerminal and works even when the Cetus REST API is down (404).
-  //    Must run BEFORE SUI-direct checks so PANS tokens are never misrouted.
+  //    Strategy A: query DexScreener by the TARGET TOKEN address.
+  //    Strategy B (fallback): query DexScreener by the PANS token address and
+  //    look for any pool that contains the target token.
+  //    Strategy B is the reliable one — DexScreener always has BVS/PANS when
+  //    searched from the PANS side, even if searching BVS directly returns nothing.
   try {
+    // Helper: convert a confirmed DS pool entry into a pans_cetus state result
+    const tryPansState = async (dsPool) => {
+      if (!dsPool?.address) return null;
+      const poolInfo = await getPoolFromRPC(dsPool.address).catch(() => null);
+      if (!poolInfo) return null;
+      const PANS_NORM = PANS_T.toLowerCase();
+      const SUI_NORM  = SUI_T.toLowerCase();
+      const coinAl = poolInfo.coinA.toLowerCase();
+      const coinBl = poolInfo.coinB.toLowerCase();
+      const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
+      const hasSui  = coinAl === SUI_NORM  || coinAl.endsWith('::sui::sui') ||
+                      coinBl === SUI_NORM  || coinBl.endsWith('::sui::sui');
+      if (!hasPans || hasSui) return null;
+      const suiPansPool = await findSuiPansPool();
+      if (!suiPansPool) return null;
+      return {
+        state:'pans_cetus', dex:'Cetus (PANS hop)',
+        tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
+        suiPansPool, liq:dsPool.liq, ts:Date.now(),
+      };
+    };
+
+    // Strategy A — search by target token address
     for (const addr of [ct, ct.split('::')[0]]) {
       const dsPools = await getDexScreenerPools(addr);
       for (const p of dsPools) {
-        if (!p.address || !p.dex.includes('cetus')) continue;
-        const poolInfo = await getPoolFromRPC(p.address).catch(() => null);
-        if (!poolInfo) continue;
-        const PANS_NORM = PANS_T.toLowerCase();
-        const SUI_NORM  = SUI_T.toLowerCase();
-        const coinAl = poolInfo.coinA.toLowerCase();
-        const coinBl = poolInfo.coinB.toLowerCase();
-        const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
-        const hasSui  = coinAl === SUI_NORM  || coinAl.endsWith('::sui::sui') ||
-                        coinBl === SUI_NORM  || coinBl.endsWith('::sui::sui');
-        if (hasPans && !hasSui) {
-          const suiPansPool = await findSuiPansPool();
-          if (suiPansPool) {
-            const res = {
-              state:'pans_cetus', dex:'Cetus (PANS hop)',
-              tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
-              suiPansPool, liq:p.liq, ts:Date.now(),
-            };
-            stateCache.set(ct, res); return res;
-          }
-        }
+        if (!p.dex.includes('cetus')) continue;
+        const res = await tryPansState(p);
+        if (res) { stateCache.set(ct, res); return res; }
       }
+    }
+
+    // Strategy B — search by PANS address, look for our token in results
+    const pansDsPool = await findPansPoolForToken(ct);
+    if (pansDsPool) {
+      const res = await tryPansState(pansDsPool);
+      if (res) { stateCache.set(ct, res); return res; }
     }
   } catch {}
 
@@ -2046,14 +2096,15 @@ function fSupply(n) {
 // DISPLAY CARDS
 // ═══════════════════════════════════════════════════════════
 
-function buyCard(d, ct) {
+function buyCard(d, ct, st) {
   const issues = [
     d.mint===true, d.honeypot===false,
     d.upgradeable===true, d.denyCap?.has===true,
     d.top10>50, d.devPct!==null&&d.devPct>10
   ].filter(Boolean).length;
+  const pairedWith = st?.state === 'pans_cetus' ? 'PANS' : 'SUI';
   const L = [];
-  L.push(`*${d.symbol}/SUI*`);
+  L.push(`*${d.symbol}/${pairedWith}*`);
   L.push(`\`${ct}\``);
   L.push(`\n🌐 Sui @ ${d.dex}${d.age?` | 📍 Age: ${d.age}`:''}`);
   if (d.mcap>0)   L.push(`📊 MCap: $${fNum(d.mcap)}`);
@@ -2482,10 +2533,10 @@ async function startBuy(chatId, ct) {
   const u=getU(chatId); if(!u) return;
   const lm=await bot.sendMessage(chatId,'🔍 Fetching token info...');
   try {
-    const d=await getTokenData(ct, u.walletAddress);
+    const [d,st]=await Promise.all([getTokenData(ct, u.walletAddress), detectState(ct).catch(()=>null)]);
     updU(chatId,{pd:{ct,sym:d.symbol}});
     const amts=u.settings.buyAmounts||DEF_AMTS;
-    await bot.editMessageText(buyCard(d,ct)+'\n\n*Select amount to buy:*',{
+    await bot.editMessageText(buyCard(d,ct,st)+'\n\n*Select amount to buy:*',{
       chat_id:chatId, message_id:lm.message_id, parse_mode:'Markdown',
       reply_markup:{inline_keyboard:[
         amts.map((a,i)=>({text:`${a} SUI`,callback_data:`ba:${i}`})),
