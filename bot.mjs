@@ -45,6 +45,7 @@ import { Transaction }         from '@mysten/sui/transactions';
 import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto';
 import { readFileSync, writeFileSync, existsSync }                   from 'fs';
 import { setTimeout as sleep }                                       from 'timers/promises';
+import { createClient }                                              from 'redis';
 
 // ═══════════════════════════════════════════════════════════
 // CONFIG — set via environment variables
@@ -59,8 +60,11 @@ const FEE_BPS     = 100;           // 1%
 const REF_SHARE   = 0.25;          // 25% of fee goes to referrer
 const MIST        = 1_000_000_000n;
 const SUI_T       = '0x2::sui::SUI';
-const DB_FILE     = './users.json';
 const SUISCAN     = 'https://suiscan.xyz/mainnet/tx/';
+
+// ─── Redis client (persists users.json across Railway deployments) ───
+const redisClient = createClient({ url: process.env.REDIS_URL });
+redisClient.on('error', e => console.error('Redis error:', e.message));
 const GECKO       = 'https://api.geckoterminal.com/api/v2';
 const GECKO_NET   = 'sui-network';
 const BB_KEY      = '9W0M5OHgX2gF05Si1AG7kPUm6hxg6P';
@@ -143,11 +147,24 @@ function san(s)      { return typeof s === 'string' ? s.replace(/[<>&"]/g,'').tr
 function trunc(a)    { return (!a || a.length < 12) ? (a || '') : a.slice(0,6)+'...'+a.slice(-4); }
 
 // ═══════════════════════════════════════════════════════════
-// DATABASE — flat JSON, swap for PostgreSQL in production
+// DATABASE — Redis-backed, persists across Railway deployments
 // ═══════════════════════════════════════════════════════════
 let DB = {};
-function loadDB()    { if (existsSync(DB_FILE)) try { DB = JSON.parse(readFileSync(DB_FILE, 'utf8')); } catch { DB = {}; } }
-function saveDB()    { writeFileSync(DB_FILE, JSON.stringify(DB, null, 2)); }
+async function loadDB() {
+  try {
+    await redisClient.connect();
+    const raw = await redisClient.get('agent_bot_db');
+    DB = raw ? JSON.parse(raw) : {};
+    console.log(`✅ DB loaded from Redis — ${Object.keys(DB).length} users`);
+  } catch(e) {
+    console.error('Redis loadDB failed, starting empty:', e.message);
+    DB = {};
+  }
+}
+function saveDB() {
+  redisClient.set('agent_bot_db', JSON.stringify(DB))
+    .catch(e => console.error('Redis saveDB error:', e.message));
+}
 function getU(id)    { return DB[String(id)] || null; }
 function makeU(id, extra={}) {
   const uid = String(id);
@@ -1417,8 +1434,11 @@ async function executeWithdraw(chatId, toAddr, coinType, amountRaw) {
   const kp = getKP(u);
   const tx = new Transaction();
   tx.setGasBudget(10_000_000);
+  tx.setSender(u.walletAddress);
 
   if (coinType === SUI_T) {
+    // Merge all SUI coins into gas so fragmented wallets can withdraw large amounts
+    await setSuiGasPayment(tx, u.walletAddress);
     const amtMist = BigInt(Math.floor(parseFloat(amountRaw) * Number(MIST)));
     const [coin]  = tx.splitCoins(tx.gas, [tx.pure.u64(amtMist)]);
     tx.transferObjects([coin], tx.pure.address(toAddr));
@@ -1900,7 +1920,7 @@ async function sniperEngine() {
         try {
           stateCache.delete(w.ct);
           const st=await detectState(w.ct);
-          const isDex=['cetus','turbos'].includes(st.state);
+          const isDex=['cetus','turbos','flowx','kriya','bluemove'].includes(st.state);
           const fire=w.mode==='grad'?isDex:(isDex||st.state==='bonding');
           if (!fire) continue;
           w.triggered=true;
@@ -2377,9 +2397,11 @@ bot.on('callback_query', async(q) => {
       await bot.editMessageText('⚡ Executing buy...',{chat_id:chatId,message_id:msgId});
       try{
         const res=await executeBuy(chatId,bc_ct,bc_amt);
-        const recvLine=res.out&&res.out!='?'?`✅ Received: *${Number(res.out).toLocaleString('en',{maximumFractionDigits:6})} ${res.sym}*\n`:'';
+        const gotTok=res.out&&res.out!='?';
+        const recvLine=gotTok?`✅ Received: *${Number(res.out).toLocaleString('en',{maximumFractionDigits:6})} ${res.sym}*\n`:'';
+        const priceLine=gotTok?`💹 Price: *${(parseFloat(bc_amt)/parseFloat(res.out)).toFixed(8)} SUI/${res.sym}*\n`:'';
         await bot.editMessageText(
-          `🟢 *Buy Executed!*\n\n🪙 Token: *${res.sym}*\n💸 Spent: \`${bc_amt} SUI\`\n${recvLine}⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}\n${res.bonding?`📊 On ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
+          `🟢 *Buy Executed!*\n\n🪙 Token: *${res.sym}*\n💸 Spent: \`${bc_amt} SUI\`\n${recvLine}${priceLine}⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}\n${res.bonding?`📊 On ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
           {chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
       }catch(e){await bot.editMessageText(`❌ Buy failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:msgId});}
       updU(chatId,{pd:{}}); return;
@@ -2817,7 +2839,7 @@ async function main() {
   if (!TG_TOKEN)           throw new Error('TG_BOT_TOKEN env var required');
   if (ENC_KEY.length!==64) throw new Error('ENCRYPT_KEY must be 64 hex chars\nGenerate: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
 
-  loadDB();
+  await loadDB();
 
   // Kill any existing webhook / polling session
   try { await fetch(`https://api.telegram.org/bot${TG_TOKEN}/deleteWebhook?drop_pending_updates=true`); } catch {}
@@ -2828,6 +2850,26 @@ async function main() {
   } catch(e) { console.warn('Session clear:', e.message); }
 
   try { const me=await bot.getMe(); BOT_USERNAME=me.username||BOT_USERNAME; } catch(e){ console.warn('getMe:', e.message); }
+
+  // Register commands + move the menu button to the LEFT side of the text input
+  try {
+    await bot.setMyCommands([
+      { command:'start',       description:'🚀 Launch bot / create wallet' },
+      { command:'buy',         description:'💰 Buy a token by CA ' },
+      { command:'sell',        description:'💸 Sell a token from your positions' },
+      { command:'positions',   description:'📊 View open positions & P&L' },
+      { command:'balance',     description:'💼 Check wallet balance' },
+      { command:'scan',        description:'🔍 Token security audit' },
+      { command:'snipe',       description:'⚡ Snipe a token when pool goes live' },
+      { command:'copytrader',  description:'🔁 Copy a trader\'s buys automatically' },
+      { command:'referral',    description:'🔗 Your referral link & earnings' },
+      { command:'withdraw',    description:'📤 Send SUI or tokens to an address' },
+      { command:'settings',    description:'⚙️ Slippage, amounts, TP/SL' },
+      { command:'help',        description:'❓ Full command list' },
+    ]);
+    await bot.setChatMenuButton({ menu_button: { type:'commands' } });
+    console.log('  Commands registered + left-side menu button set ✅');
+  } catch(e) { console.warn('setMyCommands:', e.message); }
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('  AGENT TRADING BOT — v6');
