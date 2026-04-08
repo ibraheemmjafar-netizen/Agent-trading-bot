@@ -60,6 +60,7 @@ const FEE_BPS     = 100;           // 1%
 const REF_SHARE   = 0.25;          // 25% of fee goes to referrer
 const MIST        = 1_000_000_000n;
 const SUI_T       = '0x2::sui::SUI';
+const PANS_T      = '0xc9523f683256502be15ec4979098d510f67b6d3f0df02eebf124515014433270::pans::PANS';
 const SUISCAN     = 'https://suiscan.xyz/mainnet/tx/';
 
 // ─── Redis client (persists users.json across Railway deployments) ───
@@ -648,6 +649,23 @@ async function detectState(ct) {
     }
   } catch {}
 
+  // 2b. PANS ecosystem — TOKEN/PANS pool on Cetus, plus SUI/PANS hop pool
+  try {
+    const pansPool = await findCetusPool(PANS_T, ct);
+    if (pansPool) {
+      const suiPansPool = await findCetusPool(SUI_T, PANS_T);
+      if (suiPansPool) {
+        const res = {
+          state:'pans_cetus', dex:'Cetus (PANS hop)',
+          tokenPansPool: pansPool,   // TOKEN↔PANS pool
+          suiPansPool:   suiPansPool, // SUI↔PANS pool
+          ts: Date.now(),
+        };
+        stateCache.set(ct, res); return res;
+      }
+    }
+  } catch {}
+
   // 3. GeckoTerminal — find pool address, then query Sui RPC for pool type.
   //    Uses shared geckoCache — no duplicate HTTP calls, no 429 rate limits.
   //    Checks ALL pools from ALL address variants before giving up.
@@ -679,12 +697,32 @@ async function detectState(ct) {
         const poolInfo = await getPoolFromRPC(poolAddress);
         if (!poolInfo) continue;
 
-        // Only accept SUI-paired pools
-        const SUI_NORM = SUI_T.toLowerCase();
-        const hasSui = poolInfo.coinA.toLowerCase() === SUI_NORM ||
-                       poolInfo.coinA.toLowerCase().endsWith('::sui::sui') ||
-                       poolInfo.coinB.toLowerCase() === SUI_NORM ||
-                       poolInfo.coinB.toLowerCase().endsWith('::sui::sui');
+        // Accept SUI-paired pools, or PANS-paired pools (2-hop route)
+        const SUI_NORM  = SUI_T.toLowerCase();
+        const PANS_NORM = PANS_T.toLowerCase();
+        const coinAl = poolInfo.coinA.toLowerCase();
+        const coinBl = poolInfo.coinB.toLowerCase();
+        const hasSui  = coinAl === SUI_NORM || coinAl.endsWith('::sui::sui') ||
+                        coinBl === SUI_NORM || coinBl.endsWith('::sui::sui');
+        const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
+
+        if (!hasSui && hasPans && poolInfo.dex === 'cetus') {
+          // TOKEN/PANS pool on Cetus — look for SUI/PANS hop pool
+          try {
+            const suiPansPool = await findCetusPool(SUI_T, PANS_T);
+            if (suiPansPool) {
+              const res = {
+                state:'pans_cetus', dex:'Cetus (PANS hop)',
+                tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
+                suiPansPool:   suiPansPool,
+                liq, ts: Date.now(),
+              };
+              stateCache.set(ct, res); return res;
+            }
+          } catch {}
+          continue;
+        }
+
         if (!hasSui) continue;
 
         const DEX_LABELS = {
@@ -1249,6 +1287,51 @@ async function executeBuy(chatId, ct, amtSui) {
     return { digest:res.digest, feeSui:fSui(res.fee), route:st.lpName, out:'?', sym, bonding:true, lpName:st.lpName };
   }
 
+  if (st.state === 'pans_cetus') {
+    // 2-hop buy: SUI → PANS (tx1), then PANS → TOKEN (tx2)
+    // Hop 1: SUI → PANS
+    const sp = st.suiPansPool;
+    const tx1 = await buildCetusSwapTx({
+      wallet:       u.walletAddress,
+      poolId:       sp.poolId,
+      coinA:        sp.coinA,
+      coinB:        sp.coinB,
+      a2b:          sp.a2b,
+      coinInType:   SUI_T,
+      amountIn:     tradeAmt.toString(),
+      minAmountOut: '0',
+    });
+    addFees(tx1);
+    const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
+    if (res1.effects?.status?.status !== 'success') throw new Error(res1.effects?.status?.error || 'PANS hop1 TX failed');
+
+    // How much PANS did we receive?
+    const ab1 = await getActualDelta(res1.balanceChanges || res1.digest, PANS_T, u.walletAddress);
+    if (!ab1 || ab1 <= 0n) throw new Error('Hop 1 (SUI→PANS) returned 0 PANS.');
+
+    // Hop 2: PANS → TOKEN
+    const tp = st.tokenPansPool;
+    const pansIsA = tp.coinA.toLowerCase() === PANS_T.toLowerCase();
+    const tx2 = await buildCetusSwapTx({
+      wallet:       u.walletAddress,
+      poolId:       tp.poolId,
+      coinA:        tp.coinA,
+      coinB:        tp.coinB,
+      a2b:          pansIsA,      // if PANS is coinA then a2b=true (PANS→TOKEN)
+      coinInType:   PANS_T,
+      amountIn:     ab1.toString(),
+      minAmountOut: '0',
+    });
+    const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
+    if (res2.effects?.status?.status !== 'success') throw new Error(res2.effects?.status?.error || 'PANS hop2 TX failed');
+
+    const dec = meta.decimals || 9;
+    const ab2 = await getActualDelta(res2.balanceChanges || res2.digest, ct, u.walletAddress);
+    const tok  = ab2 && ab2 > 0n ? Number(ab2) / Math.pow(10, dec) : 0;
+    addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+    return { digest:res2.digest, feeSui:fSui(feeMist), route:'Cetus CLMM (SUI→PANS→TOKEN)', out:tok>0?tok.toFixed(6):'?', sym, bonding:false };
+  }
+
   throw new Error(`${sym} — no liquidity found on Cetus, Turbos, Kriya, BlueMove, or any launchpad. Check the CA is correct.`);
 }
 
@@ -1411,6 +1494,72 @@ async function executeSell(chatId, ct, pct) {
     const suiR2 = ab2 && ab2 > 0n ? Number(ab2)/1e9 : 0;
     updatePositionAfterSell(chatId, ct, pct);
     return { digest:res.digest, feeSui:'N/A', route:st.lpName, sui:suiR2>0?suiR2.toFixed(4):'?', sym, pct };
+  }
+
+  if (st.state === 'pans_cetus') {
+    // 2-hop sell: TOKEN → PANS (tx1), then PANS → SUI (tx2)
+    // Hop 1: TOKEN → PANS
+    const tp = st.tokenPansPool;
+    const pansIsA = tp.coinA.toLowerCase() === PANS_T.toLowerCase();
+    // If PANS is coinA then selling TOKEN→PANS means a2b=false; if PANS is coinB then a2b=true
+    const sellA2bHop1 = !pansIsA;
+    const tx1 = await buildCetusSwapTx({
+      wallet:       u.walletAddress,
+      poolId:       tp.poolId,
+      coinA:        tp.coinA,
+      coinB:        tp.coinB,
+      a2b:          sellA2bHop1,
+      coinInType:   ct,
+      amountIn:     sellAmt.toString(),
+      minAmountOut: '0',
+    });
+    const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
+    if (res1.effects?.status?.status !== 'success') throw new Error(res1.effects?.status?.error || 'PANS sell hop1 TX failed');
+
+    const pansReceived = await getActualDelta(res1.balanceChanges || res1.digest, PANS_T, u.walletAddress);
+    if (!pansReceived || pansReceived <= 0n) throw new Error('Hop 1 (TOKEN→PANS) returned 0 PANS.');
+
+    // Hop 2: PANS → SUI
+    const sp = st.suiPansPool;
+    const suiIsA = sp.coinA.toLowerCase() === SUI_T.toLowerCase() || sp.coinA.toLowerCase().endsWith('::sui::sui');
+    // Selling PANS→SUI: if SUI is coinB then a2b=true (PANS→SUI)
+    const sellA2bHop2 = !suiIsA;
+    const tx2 = await buildCetusSwapTx({
+      wallet:       u.walletAddress,
+      poolId:       sp.poolId,
+      coinA:        sp.coinA,
+      coinB:        sp.coinB,
+      a2b:          sellA2bHop2,
+      coinInType:   PANS_T,
+      amountIn:     pansReceived.toString(),
+      minAmountOut: '0',
+    });
+    const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
+    if (res2.effects?.status?.status !== 'success') throw new Error(res2.effects?.status?.error || 'PANS sell hop2 TX failed');
+
+    const ab2   = await getActualDelta(res2.balanceChanges || res2.digest, SUI_T, u.walletAddress);
+    const suiR  = ab2 && ab2 > 0n ? Number(ab2)/1e9 : 0;
+    const feeMist = suiR > 0 ? (BigInt(Math.round(suiR * 1e9)) * BigInt(FEE_BPS)) / 10000n : 0n;
+    const refMist = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+    const devMist = feeMist - refMist;
+
+    if (devMist > 0n) {
+      const feeTx = new Transaction();
+      feeTx.setGasBudget(10_000_000);
+      const [fc] = feeTx.splitCoins(feeTx.gas, [feeTx.pure.u64(devMist)]);
+      feeTx.transferObjects([fc], feeTx.pure.address(DEV_WALLET));
+      if (refMist > 0n && u.referredBy) {
+        const [rc] = feeTx.splitCoins(feeTx.gas, [feeTx.pure.u64(refMist)]);
+        feeTx.transferObjects([rc], feeTx.pure.address(u.referredBy));
+        const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+        if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+      }
+      await sui.signAndExecuteTransaction({ signer:kp, transaction:feeTx, options:{showEffects:true} }).catch(()=>{});
+    }
+
+    const pnlD = computeSellPnl(chatId, ct, pct, suiR, Number(feeMist)/1e9);
+    updatePositionAfterSell(chatId, ct, pct);
+    return { digest:res2.digest, feeSui:fSui(feeMist), route:'Cetus CLMM (TOKEN→PANS→SUI)', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9) };
   }
 
   // Last resort: force-find Cetus pool
