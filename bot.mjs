@@ -627,6 +627,44 @@ async function getGeckoPools(addr) {
   }
 }
 
+// Find the SUI↔PANS Cetus pool via GeckoTerminal (resilient — works when Cetus REST API is down).
+// Queries PANS token's pools from GeckoTerminal, then verifies each via Sui RPC.
+// Result is cached in stateCache under the key '__sui_pans_pool__'.
+async function findSuiPansPool() {
+  const CACHE_KEY = '__sui_pans_pool__';
+  const hit = stateCache.get(CACHE_KEY);
+  if (hit && Date.now() - hit.ts < STATE_TTL) return hit.pool;
+
+  // 1. Try Cetus REST API first (fast when it works)
+  try {
+    const p = await findCetusPool(SUI_T, PANS_T);
+    if (p) { stateCache.set(CACHE_KEY, { pool:p, ts:Date.now() }); return p; }
+  } catch {}
+
+  // 2. GeckoTerminal fallback — look for SUI-paired Cetus pool in PANS token's pool list
+  const SUI_NORM = SUI_T.toLowerCase();
+  for (const addr of [PANS_T, PANS_T.split('::')[0]]) {
+    try {
+      const gPools = await getGeckoPools(addr);
+      for (const entry of gPools.slice(0, 10)) {
+        const poolAddr = entry.attributes?.address;
+        if (!poolAddr) continue;
+        const dexId = (entry.relationships?.dex?.data?.id || '').toLowerCase();
+        if (!dexId.includes('cetus')) continue;
+        const pi = await getPoolFromRPC(poolAddr).catch(() => null);
+        if (!pi) continue;
+        const al = pi.coinA.toLowerCase(), bl = pi.coinB.toLowerCase();
+        const hasSui = al === SUI_NORM || al.endsWith('::sui::sui') ||
+                       bl === SUI_NORM || bl.endsWith('::sui::sui');
+        if (!hasSui) continue;
+        stateCache.set(CACHE_KEY, { pool:pi, ts:Date.now() });
+        return pi;
+      }
+    } catch {}
+  }
+  return null;
+}
+
 async function detectState(ct) {
   const cached = stateCache.get(ct);
   if (cached && Date.now() - cached.ts < STATE_TTL) return cached;
@@ -640,7 +678,26 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 2. Cetus pool API (try both orderings)
+  // 2. PANS ecosystem check FIRST — TOKEN/PANS pool on Cetus.
+  //    Checked before SUI-direct so PANS tokens with ghost SUI pools don't get misdirected.
+  //    Uses findSuiPansPool() which falls back to GeckoTerminal when the Cetus API is down.
+  try {
+    const pansPool = await findCetusPool(PANS_T, ct);
+    if (pansPool) {
+      const suiPansPool = await findSuiPansPool();
+      if (suiPansPool) {
+        const res = {
+          state:'pans_cetus', dex:'Cetus (PANS hop)',
+          tokenPansPool: pansPool,
+          suiPansPool:   suiPansPool,
+          ts: Date.now(),
+        };
+        stateCache.set(ct, res); return res;
+      }
+    }
+  } catch {}
+
+  // 3. Cetus pool API — SUI/TOKEN direct pair
   try {
     const pool = await findCetusPool(SUI_T, ct);
     if (pool) {
@@ -649,24 +706,7 @@ async function detectState(ct) {
     }
   } catch {}
 
-  // 2b. PANS ecosystem — TOKEN/PANS pool on Cetus, plus SUI/PANS hop pool
-  try {
-    const pansPool = await findCetusPool(PANS_T, ct);
-    if (pansPool) {
-      const suiPansPool = await findCetusPool(SUI_T, PANS_T);
-      if (suiPansPool) {
-        const res = {
-          state:'pans_cetus', dex:'Cetus (PANS hop)',
-          tokenPansPool: pansPool,   // TOKEN↔PANS pool
-          suiPansPool:   suiPansPool, // SUI↔PANS pool
-          ts: Date.now(),
-        };
-        stateCache.set(ct, res); return res;
-      }
-    }
-  } catch {}
-
-  // 3. GeckoTerminal — find pool address, then query Sui RPC for pool type.
+  // 4. GeckoTerminal — find pool address, then query Sui RPC for pool type.
   //    Uses shared geckoCache — no duplicate HTTP calls, no 429 rate limits.
   //    Checks ALL pools from ALL address variants before giving up.
   try {
@@ -707,9 +747,9 @@ async function detectState(ct) {
         const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
 
         if (!hasSui && hasPans && poolInfo.dex === 'cetus') {
-          // TOKEN/PANS pool on Cetus — look for SUI/PANS hop pool
+          // TOKEN/PANS pool on Cetus — look for SUI/PANS hop pool via GeckoTerminal-resilient helper
           try {
-            const suiPansPool = await findCetusPool(SUI_T, PANS_T);
+            const suiPansPool = await findSuiPansPool();
             if (suiPansPool) {
               const res = {
                 state:'pans_cetus', dex:'Cetus (PANS hop)',
