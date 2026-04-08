@@ -1330,40 +1330,57 @@ async function executeBuy(chatId, ct, amtSui) {
   if (st.state === 'pans_cetus') {
     // 2-hop buy: SUI → PANS (tx1), then PANS → TOKEN (tx2)
     // Hop 1: SUI → PANS
+    // Normalise: use SUI_T / PANS_T constants regardless of what pool extraction returned
     const sp = st.suiPansPool;
+    const suiIsA1 = sp.coinA.toLowerCase().endsWith('::sui::sui');
+    const hop1CoinA = suiIsA1 ? SUI_T : PANS_T;
+    const hop1CoinB = suiIsA1 ? PANS_T : SUI_T;
+    const hop1A2b   = suiIsA1;   // true = swap_a2b (SUI→PANS), false = swap_b2a (SUI as coinB)
+    console.log('[PANS-BUY] hop1 poolId=%s coinA=%s a2b=%s suiMist=%s',
+      sp.poolId.slice(0,20), hop1CoinA.slice(0,20), hop1A2b, tradeAmt.toString());
     const tx1 = await buildCetusSwapTx({
       wallet:       u.walletAddress,
       poolId:       sp.poolId,
-      coinA:        sp.coinA,
-      coinB:        sp.coinB,
-      a2b:          sp.a2b,
+      coinA:        hop1CoinA,
+      coinB:        hop1CoinB,
+      a2b:          hop1A2b,
       coinInType:   SUI_T,
       amountIn:     tradeAmt.toString(),
       minAmountOut: '0',
     });
     addFees(tx1);
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
-    if (res1.effects?.status?.status !== 'success') throw new Error(res1.effects?.status?.error || 'PANS hop1 TX failed');
+    if (res1.effects?.status?.status !== 'success') throw new Error('PANS hop1 (SUI→PANS): ' + (res1.effects?.status?.error || 'TX failed'));
 
     // How much PANS did we receive?
     const ab1 = await getActualDelta(res1.balanceChanges || res1.digest, PANS_T, u.walletAddress);
     if (!ab1 || ab1 <= 0n) throw new Error('Hop 1 (SUI→PANS) returned 0 PANS.');
 
+    // Small delay to ensure PANS coin is indexed by RPC before hop 2 queries it
+    await new Promise(r => setTimeout(r, 800));
+
     // Hop 2: PANS → TOKEN
+    // Use exact PANS_T constant (not pool-extracted type) to avoid address normalisation mismatches.
     const tp = st.tokenPansPool;
     const pansIsA = tp.coinA.toLowerCase() === PANS_T.toLowerCase();
+    const tokenType = pansIsA ? tp.coinB : tp.coinA;   // the non-PANS side
+    // Always use PANS_T for the PANS slot so type strings match exactly
+    const hop2CoinA = pansIsA ? PANS_T : tokenType;
+    const hop2CoinB = pansIsA ? tokenType : PANS_T;
+    console.log('[PANS-BUY] hop2 poolId=%s coinA=%s coinB=%s a2b=%s pansMist=%s',
+      tp.poolId.slice(0,20), hop2CoinA.slice(0,40), hop2CoinB.slice(0,40), pansIsA, ab1.toString());
     const tx2 = await buildCetusSwapTx({
       wallet:       u.walletAddress,
       poolId:       tp.poolId,
-      coinA:        tp.coinA,
-      coinB:        tp.coinB,
-      a2b:          pansIsA,      // if PANS is coinA then a2b=true (PANS→TOKEN)
+      coinA:        hop2CoinA,
+      coinB:        hop2CoinB,
+      a2b:          pansIsA,
       coinInType:   PANS_T,
       amountIn:     ab1.toString(),
       minAmountOut: '0',
     });
     const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
-    if (res2.effects?.status?.status !== 'success') throw new Error(res2.effects?.status?.error || 'PANS hop2 TX failed');
+    if (res2.effects?.status?.status !== 'success') throw new Error('PANS hop2 (PANS→TOKEN): ' + (res2.effects?.status?.error || 'TX failed'));
 
     const dec = meta.decimals || 9;
     const ab2 = await getActualDelta(res2.balanceChanges || res2.digest, ct, u.walletAddress);
@@ -1538,44 +1555,58 @@ async function executeSell(chatId, ct, pct) {
 
   if (st.state === 'pans_cetus') {
     // 2-hop sell: TOKEN → PANS (tx1), then PANS → SUI (tx2)
-    // Hop 1: TOKEN → PANS
+    // Hop 1: TOKEN → PANS — normalise to exact type constants
     const tp = st.tokenPansPool;
     const pansIsA = tp.coinA.toLowerCase() === PANS_T.toLowerCase();
-    // If PANS is coinA then selling TOKEN→PANS means a2b=false; if PANS is coinB then a2b=true
+    const tokenType = pansIsA ? tp.coinB : tp.coinA;
+    const s1CoinA = pansIsA ? PANS_T : tokenType;
+    const s1CoinB = pansIsA ? tokenType : PANS_T;
+    // Selling TOKEN→PANS: if PANS is coinA then a2b=false (TOKEN is coinB going in)
+    //                     if PANS is coinB then a2b=true  (TOKEN is coinA going in)
     const sellA2bHop1 = !pansIsA;
+    console.log('[PANS-SELL] hop1 poolId=%s coinA=%s a2b=%s sellAmt=%s',
+      tp.poolId.slice(0,20), s1CoinA.slice(0,40), sellA2bHop1, sellAmt.toString());
     const tx1 = await buildCetusSwapTx({
       wallet:       u.walletAddress,
       poolId:       tp.poolId,
-      coinA:        tp.coinA,
-      coinB:        tp.coinB,
+      coinA:        s1CoinA,
+      coinB:        s1CoinB,
       a2b:          sellA2bHop1,
       coinInType:   ct,
       amountIn:     sellAmt.toString(),
       minAmountOut: '0',
     });
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
-    if (res1.effects?.status?.status !== 'success') throw new Error(res1.effects?.status?.error || 'PANS sell hop1 TX failed');
+    if (res1.effects?.status?.status !== 'success') throw new Error('PANS sell hop1 (TOKEN→PANS): ' + (res1.effects?.status?.error || 'TX failed'));
 
     const pansReceived = await getActualDelta(res1.balanceChanges || res1.digest, PANS_T, u.walletAddress);
     if (!pansReceived || pansReceived <= 0n) throw new Error('Hop 1 (TOKEN→PANS) returned 0 PANS.');
 
-    // Hop 2: PANS → SUI
+    // Small delay to ensure PANS coin is indexed
+    await new Promise(r => setTimeout(r, 800));
+
+    // Hop 2: PANS → SUI — normalise to exact type constants
     const sp = st.suiPansPool;
-    const suiIsA = sp.coinA.toLowerCase() === SUI_T.toLowerCase() || sp.coinA.toLowerCase().endsWith('::sui::sui');
-    // Selling PANS→SUI: if SUI is coinB then a2b=true (PANS→SUI)
-    const sellA2bHop2 = !suiIsA;
+    const suiIsA2 = sp.coinA.toLowerCase().endsWith('::sui::sui');
+    const s2CoinA = suiIsA2 ? SUI_T : PANS_T;
+    const s2CoinB = suiIsA2 ? PANS_T : SUI_T;
+    // Selling PANS→SUI: if SUI is coinA then a2b=false (PANS is coinB going in)
+    //                   if SUI is coinB then a2b=true  (PANS is coinA going in)
+    const sellA2bHop2 = !suiIsA2;
+    console.log('[PANS-SELL] hop2 poolId=%s coinA=%s a2b=%s pansMist=%s',
+      sp.poolId.slice(0,20), s2CoinA.slice(0,20), sellA2bHop2, pansReceived.toString());
     const tx2 = await buildCetusSwapTx({
       wallet:       u.walletAddress,
       poolId:       sp.poolId,
-      coinA:        sp.coinA,
-      coinB:        sp.coinB,
+      coinA:        s2CoinA,
+      coinB:        s2CoinB,
       a2b:          sellA2bHop2,
       coinInType:   PANS_T,
       amountIn:     pansReceived.toString(),
       minAmountOut: '0',
     });
     const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
-    if (res2.effects?.status?.status !== 'success') throw new Error(res2.effects?.status?.error || 'PANS sell hop2 TX failed');
+    if (res2.effects?.status?.status !== 'success') throw new Error('PANS sell hop2 (PANS→SUI): ' + (res2.effects?.status?.error || 'TX failed'));
 
     const ab2   = await getActualDelta(res2.balanceChanges || res2.digest, SUI_T, u.walletAddress);
     const suiR  = ab2 && ab2 > 0n ? Number(ab2)/1e9 : 0;
