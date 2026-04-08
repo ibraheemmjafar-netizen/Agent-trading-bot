@@ -628,7 +628,16 @@ async function getDexScreenerPools(addr) {
     const pools = raw.map(p => ({
       address: p.pairAddress,
       dex:     (p.dexId || '').toLowerCase(),
-      liq:     p.liquidity?.usd || 0,
+      liq:     p.liquidity?.usd   || 0,
+      vol:     p.volume?.h24      || 0,
+      priceU:  parseFloat(p.priceUsd || 0),
+      chg5m:   p.priceChange?.m5  || 0,
+      chg1h:   p.priceChange?.h1  || 0,
+      chg6h:   p.priceChange?.h6  || 0,
+      chg24h:  p.priceChange?.h24 || 0,
+      age:     p.pairCreatedAt ? new Date(p.pairCreatedAt).toISOString() : null,
+      baseSymbol:  p.baseToken?.symbol  || '',
+      quoteSymbol: p.quoteToken?.symbol || '',
     }));
     dsCache.set(addr, { pools, ts: Date.now() });
     return pools;
@@ -1937,13 +1946,33 @@ async function geckoPools(ct) {
 async function getTokenData(ct, walletAddr) {
   const cap = (p) => Promise.race([p, new Promise(r => setTimeout(()=>r(null), 7000))]);
 
-  const [gTok, pools, meta, supply, holders] = await Promise.all([
+  const [gTok, gPools, dsPools, meta, supply, holders] = await Promise.all([
     geckoTok(ct).catch(()=>null),
     geckoPools(ct).catch(()=>[]),
+    getDexScreenerPools(ct).catch(()=>[]),
     getMeta(ct).catch(()=>null),
     sui.getTotalSupply({coinType:ct}).catch(()=>null),
     cap(getHolders(ct)),
   ]);
+
+  // Convert DexScreener pools to geckoPools shape and merge.
+  // DS pools only count if they have meaningful liquidity (>$50).
+  // The highest-liq pool becomes "best" — so BVS/PANS ($103k) beats BVS/SUI ($10).
+  const dsConverted = dsPools
+    .filter(p => p.liq > 50)
+    .map(p => ({
+      id:    p.address,
+      dex:   p.dex.charAt(0).toUpperCase() + p.dex.slice(1),
+      liq:   p.liq, vol:p.vol, priceU:p.priceU,
+      chg5m: p.chg5m, chg1h:p.chg1h, chg6h:p.chg6h, chg24h:p.chg24h,
+      age:   p.age,
+      _fromDS: true,
+    }));
+
+  // Merge: prefer DS entry when same pool id exists in both; add DS-only pools.
+  const gpIds = new Set(gPools.map(p => p.id));
+  const merged = [...gPools, ...dsConverted.filter(p => !gpIds.has(p.id))];
+  const pools  = merged.sort((a, b) => b.liq - a.liq);
 
   const best   = pools[0];
   const name   = meta?.name   || gTok?.name   || '?';
