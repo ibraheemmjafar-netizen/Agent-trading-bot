@@ -381,13 +381,13 @@ async function findCetusPool(coinA, coinB) {
         if (!poolAddress) continue;
         const poolInfo = await getPoolFromRPC(poolAddress);
         if (!poolInfo || poolInfo.dex !== 'cetus') continue;
-        // Ensure this is a SUI pair
-        const SUI_NORM = SUI_T.toLowerCase();
-        const hasSui = poolInfo.coinA.toLowerCase() === SUI_NORM ||
-                       poolInfo.coinA.toLowerCase().endsWith('::sui::sui') ||
-                       poolInfo.coinB.toLowerCase() === SUI_NORM ||
-                       poolInfo.coinB.toLowerCase().endsWith('::sui::sui');
-        if (!hasSui) continue;
+        // Verify pool actually contains BOTH requested coins (prevents returning BVS/SUI
+        // when findCetusPool(PANS_T, BVS_T) queries GeckoTerminal and gets back BVS/SUI pool)
+        const pA = poolInfo.coinA.toLowerCase();
+        const pB = poolInfo.coinB.toLowerCase();
+        const hasCoinA = pA === coinA.toLowerCase() || pB === coinA.toLowerCase();
+        const hasCoinB = pA === coinB.toLowerCase() || pB === coinB.toLowerCase();
+        if (!hasCoinA || !hasCoinB) continue;
         const liq = parseFloat(poolEntry.attributes?.reserve_in_usd || 0);
         return { ...poolInfo, liq };
       }
