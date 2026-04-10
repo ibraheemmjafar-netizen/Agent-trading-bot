@@ -178,7 +178,7 @@ function makeU(id, extra={}) {
       slippage:1, confirmThreshold:0.5, copyAmount:0.1,
       buyAmounts:[...DEF_AMTS], tpDefault:null, slDefault:null,
     },
-    referralCode:genRef(), referredBy:null, referralCount:0, referralEarned:0,
+    referralCode:genRef(), referredBy:null, referredByCode:null, referralCount:0, referralEarned:0,
     state:null, pd:{}, ...extra,
   };
   saveDB(); return DB[uid];
@@ -1268,17 +1268,18 @@ async function swapBuyBonding({ kp, wallet, ct, amtMist, curveId, u }) {
   tx.setGasBudget(30_000_000);
 
   const feeMist  = (amtMist * BigInt(FEE_BPS)) / 10000n;
-  const refMist  = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+  const refWallet = resolveRefWallet(u);
+  const refMist  = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
   const devMist  = feeMist - refMist;
   const tradeMist = amtMist - feeMist;
 
   const [dc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
   tx.transferObjects([dc], tx.pure.address(DEV_WALLET));
 
-  if (refMist > 0n && u.referredBy) {
+  if (refMist > 0n && refWallet) {
     const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]);
-    tx.transferObjects([rc], tx.pure.address(u.referredBy));
-    const refUser = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+    tx.transferObjects([rc], tx.pure.address(refWallet));
+    const refUser = Object.values(DB).find(x => x.walletAddress === refWallet);
     if (refUser) { refUser.referralEarned = (refUser.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
   }
 
@@ -1346,17 +1347,18 @@ async function executeBuy(chatId, ct, amtSui) {
   const feeMist  = (amt * BigInt(FEE_BPS)) / 10000n;
   const tradeAmt = amt - feeMist;
 
-  const refMist  = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+  const refWallet = resolveRefWallet(u);
+  const refMist  = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
   const devMist  = feeMist - refMist;
 
   // Helper to append fee transfers to tx
   const addFees = (tx) => {
     const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
     tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
-    if (refMist > 0n && u.referredBy) {
+    if (refMist > 0n && refWallet) {
       const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]);
-      tx.transferObjects([rc], tx.pure.address(u.referredBy));
-      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+      tx.transferObjects([rc], tx.pure.address(refWallet));
+      const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
     }
   };
@@ -1518,6 +1520,29 @@ async function executeBuy(chatId, ct, amtSui) {
   throw new Error(`${sym} — no liquidity found on Cetus, Turbos, Kriya, BlueMove, or any launchpad. Check the CA is correct.`);
 }
 
+// Send sell fee in a separate TX after swap — always based on ACTUAL SUI received,
+// never on estimate. Silent fail so sell is never blocked by fee TX failure.
+async function postSellFee(kp, u, suiR) {
+  if (!(suiR > 0)) return 0n;
+  const feeMist  = (BigInt(Math.round(suiR * 1e9)) * BigInt(FEE_BPS)) / 10000n;
+  const refWallet = resolveRefWallet(u);
+  const refMist  = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+  const devMist  = feeMist - refMist;
+  if (devMist === 0n) return feeMist;
+  const feeTx = new Transaction();
+  feeTx.setGasBudget(10_000_000);
+  const [fc] = feeTx.splitCoins(feeTx.gas, [feeTx.pure.u64(devMist)]);
+  feeTx.transferObjects([fc], feeTx.pure.address(DEV_WALLET));
+  if (refMist > 0n && refWallet) {
+    const [rc] = feeTx.splitCoins(feeTx.gas, [feeTx.pure.u64(refMist)]);
+    feeTx.transferObjects([rc], feeTx.pure.address(refWallet));
+    const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
+    if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+  }
+  await sui.signAndExecuteTransaction({ signer:kp, transaction:feeTx, options:{showEffects:true} }).catch(()=>{});
+  return feeMist;
+}
+
 async function executeSell(chatId, ct, pct) {
   const u    = getU(chatId); if (!u) throw new Error('No wallet found.');
   const kp   = getKP(u);
@@ -1530,6 +1555,7 @@ async function executeSell(chatId, ct, pct) {
   const sellAmt = (total * BigInt(pct)) / 100n;
   if (sellAmt === 0n) throw new Error('Sell amount is zero.');
 
+  const refWallet = resolveRefWallet(u);
   const st = await detectState(ct);
 
   if (st.state === 'cetus') {
@@ -1540,9 +1566,6 @@ async function executeSell(chatId, ct, pct) {
     const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
     const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
     const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
-    const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
-    const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
-    const devMist    = feeMist - refMist;
 
     const tx = await buildCetusSwapTx({
       wallet: u.walletAddress,
@@ -1555,21 +1578,9 @@ async function executeSell(chatId, ct, pct) {
       minAmountOut: minOut.toString(),
     });
 
-    // Fee taken from gas in sell tx (SUI output stays in wallet via result coins)
-    if (devMist > 0n) {
-      const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
-      tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
-    }
-    if (refMist > 0n && u.referredBy) {
-      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]);
-      tx.transferObjects([rc], tx.pure.address(u.referredBy));
-      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
-      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
-    }
-
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Sell TX failed');
-    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'turbos') {
@@ -1585,85 +1596,45 @@ async function executeSell(chatId, ct, pct) {
       coinInType,
       amountIn: sellAmt.toString(),
     });
-    const est     = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
-    const feeMist = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
-    const refMist = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
-    const devMist = feeMist - refMist;
-    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
-    if (refMist > 0n && u.referredBy) {
-      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
-      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
-      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
-    }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos sell failed');
-    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'flowx') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
-    const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
-    const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
-    const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
-    const devMist    = feeMist - refMist;
     const tx = await buildFlowXSwapTx({
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
-    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
-    if (refMist > 0n && u.referredBy) {
-      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
-      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
-      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
-    }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX sell failed');
-    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'kriya') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
-    const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
-    const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
-    const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
-    const devMist    = feeMist - refMist;
     const tx = await buildKriyaSwapTx({
       wallet: u.walletAddress, poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
-    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
-    if (refMist > 0n && u.referredBy) {
-      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
-      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
-      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
-    }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya sell failed');
-    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'bluemove') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
-    const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
-    const feeMist    = est ? (BigInt(est) * BigInt(FEE_BPS)) / 10000n : 0n;
-    const refMist    = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
-    const devMist    = feeMist - refMist;
     const tx = await buildBlueMoveSwapTx({
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
-    if (devMist > 0n) { const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]); tx.transferObjects([fc], tx.pure.address(DEV_WALLET)); }
-    if (refMist > 0n && u.referredBy) {
-      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]); tx.transferObjects([rc], tx.pure.address(u.referredBy));
-      const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
-      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
-    }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove sell failed');
-    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
+    { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
   }
 
   if (st.state === 'unsupported_dex') {
@@ -1738,18 +1709,18 @@ async function executeSell(chatId, ct, pct) {
     const ab2   = await getActualDelta(res2.balanceChanges || res2.digest, SUI_T, u.walletAddress);
     const suiR  = ab2 && ab2 > 0n ? Number(ab2)/1e9 : 0;
     const feeMist = suiR > 0 ? (BigInt(Math.round(suiR * 1e9)) * BigInt(FEE_BPS)) / 10000n : 0n;
-    const refMist = u.referredBy ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
-    const devMist = feeMist - refMist;
+    const refMist    = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+    const devMist    = feeMist - refMist;
 
     if (devMist > 0n) {
       const feeTx = new Transaction();
       feeTx.setGasBudget(10_000_000);
       const [fc] = feeTx.splitCoins(feeTx.gas, [feeTx.pure.u64(devMist)]);
       feeTx.transferObjects([fc], feeTx.pure.address(DEV_WALLET));
-      if (refMist > 0n && u.referredBy) {
+      if (refMist > 0n && refWallet) {
         const [rc] = feeTx.splitCoins(feeTx.gas, [feeTx.pure.u64(refMist)]);
-        feeTx.transferObjects([rc], feeTx.pure.address(u.referredBy));
-        const ru = Object.values(DB).find(x => x.walletAddress === u.referredBy);
+        feeTx.transferObjects([rc], feeTx.pure.address(refWallet));
+        const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
         if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
       }
       await sui.signAndExecuteTransaction({ signer:kp, transaction:feeTx, options:{showEffects:true} }).catch(()=>{});
@@ -2327,27 +2298,65 @@ async function copyEngine() {
           const ev=(tx.events||[]).find(e=>e.type?.toLowerCase().includes('swap')||e.type?.toLowerCase().includes('trade'));
           if(!ev) continue;
           const pj=ev.parsedJson||{};
-          const bought=pj.coin_type_out||pj.token_out||pj.coinTypeOut||null;
-          if(!bought||bought===SUI_T) continue;
+          const coinOut  = pj.coin_type_out||pj.token_out||pj.coinTypeOut||null;
+          const coinIn   = pj.coin_type_in ||pj.token_in ||pj.coinTypeIn ||null;
+          const evAmtIn  = pj.amount_in  ? BigInt(pj.amount_in)  : null; // raw input amount
+          const evAmtOut = pj.amount_out ? BigInt(pj.amount_out) : null;
+
+          // ── COPY BUY: tracked wallet bought a token (SUI → token)
+          const bought = (coinOut && coinOut!==SUI_T) ? coinOut : null;
+          // SUI they spent on the buy (used for auto-amount)
+          const copierSuiSpent = bought && evAmtIn ? Number(evAmtIn)/1e9 : null;
+
+          // ── COPY SELL: tracked wallet sold a token (token → SUI)
+          const sold = (coinOut===SUI_T && coinIn && coinIn!==SUI_T) ? coinIn : null;
+
           for (const {uid,cfg} of watchers) {
             const u=getU(uid); if(!u||isLocked(u)) continue;
             try {
-              if(cfg.blacklist?.includes(bought)) continue;
-              const existing=await getCoins(u.walletAddress,bought);
-              if(existing.length) continue; // already holds it
-              if((u.positions||[]).length>=(cfg.maxPos||5)) continue;
-              const amt=cfg.amount||u.settings.copyAmount;
-              // Check sufficient SUI balance first
-              const suiBal=await getCoins(u.walletAddress,SUI_T);
-              const suiTotal=suiBal.reduce((s,c)=>s+BigInt(c.balance),0n);
-              if(suiTotal < BigInt(Math.floor(parseFloat(amt)*Number(MIST)))) {
-                bot.sendMessage(uid,`⚠️ Copy: insufficient SUI for ${trunc(bought)}`);
-                continue;
+              if (bought) {
+                // Mirror the buy
+                if(cfg.blacklist?.includes(bought)) continue;
+                const existing=await getCoins(u.walletAddress,bought);
+                if(existing.length) continue; // already holds it
+                if((u.positions||[]).length>=(cfg.maxPos||5)) continue;
+
+                // Amount: auto (match copier's SUI spend) or fixed
+                let amt = cfg.autoAmount && copierSuiSpent ? copierSuiSpent.toFixed(4) : (cfg.amount||u.settings.copyAmount);
+                amt = String(parseFloat(amt)||u.settings.copyAmount);
+
+                const suiBal=await getCoins(u.walletAddress,SUI_T);
+                const suiTotal=suiBal.reduce((s,c)=>s+BigInt(c.balance),0n);
+                if(suiTotal < BigInt(Math.floor(parseFloat(amt)*Number(MIST)))) {
+                  bot.sendMessage(uid,`⚠️ Copy: insufficient SUI for ${trunc(bought)}`);
+                  continue;
+                }
+                bot.sendMessage(uid,`🔁 *Copy Buy* \`${trunc(wallet)}\`\nBuying \`${trunc(bought)}\` — ${amt} SUI`,{parse_mode:'Markdown'});
+                const res=await executeBuy(uid,bought,amt);
+                bot.sendMessage(uid,`✅ Copied buy ${res.sym}! Fee: ${res.feeSui} SUI\n🔗 [TX](${SUISCAN}${res.digest})`,{parse_mode:'Markdown'});
+
+              } else if (sold && cfg.copySells!==false) {
+                // Mirror the sell — only if user holds this token
+                const holding=await getCoins(u.walletAddress,sold);
+                if(!holding.length) continue;
+                const meta=await getMeta(sold)||{};
+                const sym=meta.symbol||trunc(sold);
+
+                // Mirror the sell percentage the copier used
+                let sellPct=100;
+                if(evAmtIn) {
+                  // evAmtIn = tokens the copier sold; query their remaining balance
+                  const trackerBal=await getCoins(wallet,sold).catch(()=>[]);
+                  const remaining=trackerBal.reduce((s,c)=>s+BigInt(c.balance),0n);
+                  const prevBal=remaining+evAmtIn;
+                  if(prevBal>0n) sellPct=Math.min(100,Math.max(1,Math.round(Number(evAmtIn*100n/prevBal))));
+                }
+
+                bot.sendMessage(uid,`🔁 *Copy Sell* \`${trunc(wallet)}\`\nSelling ${sellPct}% ${sym}...`,{parse_mode:'Markdown'});
+                const res=await executeSell(uid,sold,sellPct);
+                bot.sendMessage(uid,`✅ Copied sell ${res.sym}! ${sellPct}% → ${res.sui} SUI | Fee: ${res.feeSui} SUI\n🔗 [TX](${SUISCAN}${res.digest})`,{parse_mode:'Markdown'});
               }
-              bot.sendMessage(uid,`🔁 *Copy* \`${trunc(wallet)}\`\nBuying \`${trunc(bought)}\` — ${amt} SUI`,{parse_mode:'Markdown'});
-              const res=await executeBuy(uid,bought,amt);
-              bot.sendMessage(uid,`✅ Copied ${res.sym}! 🔗 [TX](${SUISCAN}${res.digest})`,{parse_mode:'Markdown'});
-            } catch(e){bot.sendMessage(uid,`❌ Copy failed: ${e.message?.slice(0,100)}`);}
+            } catch(e){bot.sendMessage(uid,`❌ Copy trade failed: ${e.message?.slice(0,100)}`);}
           }
         }
       } catch {}
@@ -2434,15 +2443,38 @@ async function doPositions(chatId) {
   });
 }
 
+// Resolve the referrer's current wallet address for a given user.
+// Uses the stored referredByCode to look up the referrer live so rewards
+// still flow even if the referrer only set up their wallet after the
+// referred user joined (old code gated on ref.walletAddress at join time).
+function resolveRefWallet(u) {
+  if (u.referredBy) return u.referredBy; // fast path — already resolved
+  if (!u.referredByCode) return null;
+  const ref = Object.values(DB).find(x => x.referralCode === u.referredByCode);
+  if (ref?.walletAddress) {
+    // Backfill for future calls so we don't scan every time
+    u.referredBy = ref.walletAddress; saveDB();
+    return ref.walletAddress;
+  }
+  return null;
+}
+
 async function doReferral(chatId) {
   const u=getU(chatId)||makeU(chatId);
   const link=`https://t.me/${BOT_USERNAME}?start=${u.referralCode}`;
-  const active=Object.values(DB).filter(x=>x.referredBy===u.walletAddress&&Date.now()-x.lastActivity<30*24*3600*1000).length;
+  // Compute totals live from DB — stored counter can drift if bot restarts
+  const myCode   = u.referralCode;
+  const myWallet = u.walletAddress;
+  const allRefs  = Object.values(DB).filter(x =>
+    x.referredByCode === myCode || (myWallet && x.referredBy === myWallet)
+  );
+  const total  = allRefs.length;
+  const active = allRefs.filter(x => Date.now()-x.lastActivity < 30*24*3600*1000).length;
   await bot.sendMessage(chatId,
     `🔗 *Referral Dashboard*\n\n` +
     `Code: \`${u.referralCode}\`\n` +
     `Link: \`${link}\`\n\n` +
-    `👥 Total referrals: ${u.referralCount||0}\n` +
+    `👥 Total referrals: ${total}\n` +
     `⚡ Active (30d): ${active}\n` +
     `💰 Total earned: ${(u.referralEarned||0).toFixed(4)} SUI\n\n` +
     `*How it works:*\n` +
@@ -2617,8 +2649,10 @@ bot.onText(/\/start(.*)/, async(msg, match) => {
     u=makeU(chatId);
     if(param.startsWith('AGT-')){
       const ref=Object.values(DB).find(x=>x.referralCode===param&&x.chatId!==String(chatId));
-      if(ref?.walletAddress){
-        updU(chatId,{referredBy:ref.walletAddress});
+      if(ref){
+        // Always store the referral code so rewards flow once referrer adds a wallet.
+        // Also store wallet address now if referrer already has one.
+        updU(chatId,{referredByCode:param, referredBy:ref.walletAddress||null});
         updU(ref.chatId,{referralCount:(ref.referralCount||0)+1});
         bot.sendMessage(ref.chatId,'🎉 New user joined via your referral!');
       }
@@ -2880,7 +2914,7 @@ bot.on('message', async(msg) => {
     '💼 Balance':    ()=>doBalance(chatId),
     '🔍 Scan':       ()=>{bot.sendMessage(chatId,'Send the token CA to scan:\n_Example: 0x1234..._',{parse_mode:'Markdown'});updU(chatId,{state:'scan_ca'});},
     '⚡ Snipe':      ()=>guard(chatId,async()=>{await bot.sendMessage(chatId,'⚡ Send the token CA to snipe:\n\n_Example: 0x1234..._',{parse_mode:'Markdown'});updU(chatId,{state:'snipe_ca'});}),
-    '🔁 Copy Trade': ()=>guard(chatId,async(u)=>{if(!u.copyTraders?.length){await bot.sendMessage(chatId,'🔁 *Copy Trader*\n\nUsage: /copytrader [wallet]\nStop: /copytrader stop',{parse_mode:'Markdown'});}else{await bot.sendMessage(chatId,`🔁 *Copy Traders (${u.copyTraders.length}/3)*\n\n${u.copyTraders.map((ct,i)=>`${i+1}. \`${trunc(ct.wallet)}\` — ${ct.amount} SUI`).join('\n')}\n\nStop: /copytrader stop`,{parse_mode:'Markdown'});}}),
+    '🔁 Copy Trade': ()=>guard(chatId,async(u)=>{if(!u.copyTraders?.length){await bot.sendMessage(chatId,'🔁 *Copy Trader*\n\nNo wallets tracked.\n\nUsage: `/copytrader [wallet]`\n\nToggles per tracker:\n`/copytrader sells [n] on|off`\n`/copytrader auto [n] on|off`\n`/copytrader stop [n]`',{parse_mode:'Markdown'});}else{const lines=u.copyTraders.map((ct,i)=>{const amt=ct.autoAmount?'Auto':'Fixed '+ct.amount+' SUI';const sells=ct.copySells===false?'Sells: OFF':'Sells: ON';return `${i+1}. \`${trunc(ct.wallet)}\`\n   💰 ${amt} | ${sells}`;}).join('\n\n');await bot.sendMessage(chatId,`🔁 *Copy Traders (${u.copyTraders.length}/3)*\n\n${lines}\n\n_/copytrader sells [n] on|off_\n_/copytrader auto [n] on|off_\n_/copytrader stop [n]_`,{parse_mode:'Markdown'});}}),
     '🔗 Referral':   ()=>doReferral(chatId),
     '⚙️ Settings':   ()=>doSettings(chatId),
     '❓ Help':        ()=>doHelp(chatId),
@@ -3041,7 +3075,7 @@ bot.on('message', async(msg) => {
     if(!text.startsWith('0x')){await bot.sendMessage(chatId,'❌ Invalid wallet address. Must start with 0x');return;}
     u.copyTraders=u.copyTraders||[];
     if(u.copyTraders.length>=3){await bot.sendMessage(chatId,'❌ Max 3 wallets. Use /copytrader stop to remove all.');return;}
-    u.copyTraders.push({wallet:text,amount:u.settings.copyAmount,maxPos:5,blacklist:[]});
+    u.copyTraders.push({wallet:text,amount:u.settings.copyAmount,maxPos:5,blacklist:[],copySells:true,autoAmount:false});
     updU(chatId,{state:null,copyTraders:u.copyTraders});
     await bot.sendMessage(chatId,`✅ Now tracking \`${trunc(text)}\`\nAmount: ${u.settings.copyAmount} SUI per trade`,{parse_mode:'Markdown'}); return;
   }
@@ -3174,18 +3208,71 @@ bot.onText(/\/snipe(?:\s+(.+))?/, async(msg,m)=>{
 bot.onText(/\/copytrader(?:\s+(.+))?/, async(msg,m)=>{
   const chatId=msg.chat.id, arg=m[1]?san(m[1].trim()):null;
   await guard(chatId,async(u)=>{
-    if(!arg||arg==='list'){
-      if(!u.copyTraders?.length){await bot.sendMessage(chatId,'🔁 *Copy Trader*\n\nNo wallets tracked.\n\nUsage: /copytrader [wallet]\nStop: /copytrader stop',{parse_mode:'Markdown'});return;}
-      await bot.sendMessage(chatId,`🔁 *Copy Traders (${u.copyTraders.length}/3)*\n\n${u.copyTraders.map((ct,i)=>`${i+1}. \`${trunc(ct.wallet)}\` — ${ct.amount} SUI/trade`).join('\n')}\n\nStop: /copytrader stop`,{parse_mode:'Markdown'}); return;
+    u.copyTraders=u.copyTraders||[];
+
+    const showList=()=>{
+      if(!u.copyTraders.length){return bot.sendMessage(chatId,
+        '🔁 *Copy Trader*\n\nNo wallets tracked.\n\nUsage: `/copytrader [wallet]`\n\nCommands:\n`/copytrader sells [1-3] on|off` — toggle copy sells\n`/copytrader auto [1-3] on|off` — match copier\'s exact amount\n`/copytrader stop [1-3]` — remove tracker\n`/copytrader stop` — remove all',
+        {parse_mode:'Markdown'});}
+      const lines=u.copyTraders.map((ct,i)=>{
+        const amt=ct.autoAmount?'Auto':'Fixed '+ct.amount+' SUI';
+        const sells=ct.copySells===false?'Sells: OFF':'Sells: ON';
+        return `${i+1}. \`${trunc(ct.wallet)}\`\n   💰 ${amt} | ${sells}`;
+      }).join('\n\n');
+      return bot.sendMessage(chatId,
+        `🔁 *Copy Traders (${u.copyTraders.length}/3)*\n\n${lines}\n\n` +
+        `_/copytrader sells [n] on|off — toggle sell mirroring_\n` +
+        `_/copytrader auto [n] on|off — match copier amount_\n` +
+        `_/copytrader stop [n] — remove tracker_`,
+        {parse_mode:'Markdown'});
+    };
+
+    if(!arg||arg==='list'){return showList();}
+
+    // ── /copytrader stop [n]
+    if(arg==='stop'||arg.startsWith('stop ')){
+      const idx=parseInt(arg.split(' ')[1]);
+      if(!isNaN(idx)&&idx>=1&&idx<=u.copyTraders.length){
+        const removed=u.copyTraders.splice(idx-1,1)[0];
+        updU(chatId,{copyTraders:u.copyTraders});
+        return bot.sendMessage(chatId,`✅ Stopped tracking \`${trunc(removed.wallet)}\``,{parse_mode:'Markdown'});
+      }
+      updU(chatId,{copyTraders:[]});
+      return bot.sendMessage(chatId,'✅ All copy traders stopped.');
     }
-    if(arg==='stop'){updU(chatId,{copyTraders:[]});await bot.sendMessage(chatId,'✅ All copy traders stopped.');return;}
-    if(arg.startsWith('0x')){
-      u.copyTraders=u.copyTraders||[];
-      if(u.copyTraders.length>=3){await bot.sendMessage(chatId,'❌ Max 3 wallets. /copytrader stop first.');return;}
-      u.copyTraders.push({wallet:arg,amount:u.settings.copyAmount,maxPos:5,blacklist:[]});
+
+    // ── /copytrader sells [n] on|off
+    const sellsM=arg.match(/^sells\s+(\d)\s+(on|off)$/i);
+    if(sellsM){
+      const idx=parseInt(sellsM[1])-1, val=sellsM[2].toLowerCase()==='on';
+      if(idx<0||idx>=u.copyTraders.length) return bot.sendMessage(chatId,'❌ Invalid tracker number.');
+      u.copyTraders[idx].copySells=val;
       updU(chatId,{copyTraders:u.copyTraders});
-      await bot.sendMessage(chatId,`✅ Tracking \`${trunc(arg)}\`\nAmount: ${u.settings.copyAmount} SUI per trade`,{parse_mode:'Markdown'}); return;
+      return bot.sendMessage(chatId,`✅ Tracker ${idx+1}: Copy Sells turned ${val?'ON':'OFF'}.\n\`${trunc(u.copyTraders[idx].wallet)}\``,{parse_mode:'Markdown'});
     }
+
+    // ── /copytrader auto [n] on|off
+    const autoM=arg.match(/^auto\s+(\d)\s+(on|off)$/i);
+    if(autoM){
+      const idx=parseInt(autoM[1])-1, val=autoM[2].toLowerCase()==='on';
+      if(idx<0||idx>=u.copyTraders.length) return bot.sendMessage(chatId,'❌ Invalid tracker number.');
+      u.copyTraders[idx].autoAmount=val;
+      updU(chatId,{copyTraders:u.copyTraders});
+      return bot.sendMessage(chatId,
+        `✅ Tracker ${idx+1}: Amount mode set to *${val?'Auto (match copier)':'Fixed '+u.copyTraders[idx].amount+' SUI'}*\n\`${trunc(u.copyTraders[idx].wallet)}\``,
+        {parse_mode:'Markdown'});
+    }
+
+    // ── /copytrader [wallet]
+    if(arg.startsWith('0x')){
+      if(u.copyTraders.length>=3){await bot.sendMessage(chatId,'❌ Max 3 wallets. /copytrader stop first.');return;}
+      u.copyTraders.push({wallet:arg,amount:u.settings.copyAmount,maxPos:5,blacklist:[],copySells:true,autoAmount:false});
+      updU(chatId,{copyTraders:u.copyTraders});
+      await bot.sendMessage(chatId,
+        `✅ Tracking \`${trunc(arg)}\`\n\n💰 Amount: ${u.settings.copyAmount} SUI (fixed)\n📤 Copy Sells: ON\n⚡ Auto Amount: OFF\n\nUse \`/copytrader sells ${u.copyTraders.length} off\` to disable sell mirroring\nUse \`/copytrader auto ${u.copyTraders.length} on\` to match copier's amount`,
+        {parse_mode:'Markdown'}); return;
+    }
+
     updU(chatId,{state:'copy_wallet'}); await bot.sendMessage(chatId,'Enter the wallet address to copy:');
   });
 });
