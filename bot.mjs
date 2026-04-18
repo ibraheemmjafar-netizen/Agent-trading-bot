@@ -2525,7 +2525,8 @@ async function doHelp(chatId) {
     `/pnl [symbol] — P&L chart for open positions\n\n` +
     `*Account*\n` +
     `/referral — View your referral link & earnings\n` +
-    `/settings — Slippage, buy amounts, TP/SL, withdraw\n\n` +
+    `/settings — Slippage, buy amounts, TP/SL, withdraw\n` +
+    `/reset — Wipe wallet & PIN, re-register with new key\n\n` +
     `*Supported DEXes*\n` +
     `Cetus CLMM (primary) • Turbos CLMM\n\n` +
     `*Launchpads*\n` +
@@ -2668,6 +2669,24 @@ bot.onText(/\/start(.*)/, async(msg, match) => {
       `👋 Welcome to *AGENT TRADING BOT*\n\nThe fastest trading bot on Sui.\n\nConnect your wallet to start trading:`,
       {parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'🔑 Import Wallet',callback_data:'import_wallet'}],[{text:'✨ Create New Wallet',callback_data:'gen_wallet'}]]}});
   }
+});
+
+// ═══════════════════════════════════════════════════════════
+// /reset — wipe wallet & PIN, force re-registration
+// (Preserves referral code, referredBy, referral counts/earnings, settings)
+// ═══════════════════════════════════════════════════════════
+bot.onText(/^\/reset(?:\s|$)/, async(msg) => {
+  const chatId = msg.chat.id;
+  const u = getU(chatId);
+  if(!u){ await bot.sendMessage(chatId,'No account found. Send /start to begin.'); return; }
+  updU(chatId,{state:'confirm_reset'});
+  await bot.sendMessage(chatId,
+    '⚠️ *Reset Wallet*\n\n' +
+    'This will permanently delete your stored wallet, PIN, and positions from this bot.\n\n' +
+    'You will need to re-import your private key or create a new wallet afterwards.\n\n' +
+    '*Make sure you have your private key backed up before continuing — it cannot be recovered for you.*\n\n' +
+    'Type `CONFIRM RESET` (in capitals) to proceed, or anything else to cancel.',
+    {parse_mode:'Markdown'});
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -2922,6 +2941,24 @@ bot.on('message', async(msg) => {
   if(KB[raw]){await KB[raw]();return;}
 
   const text=raw.replace(/[<>&]/g,'').slice(0,1000);
+
+  // ── Reset confirmation (wipes wallet/PIN/positions, keeps referral data & settings) ──
+  if(state==='confirm_reset'){
+    if(text==='CONFIRM RESET'){
+      updU(chatId,{
+        encryptedKey:null, walletAddress:null, pinHash:null,
+        lockedAt:null, failAttempts:0, cooldownUntil:0,
+        positions:[], state:null, pd:{},
+      });
+      await bot.sendMessage(chatId,
+        '✅ *Wallet reset complete.*\n\nSend /start to import your private key or create a new wallet.\n\n_Your referral code and stats were preserved._',
+        {parse_mode:'Markdown'});
+    } else {
+      updU(chatId,{state:null});
+      await bot.sendMessage(chatId,'❌ Reset cancelled. Your wallet is unchanged.');
+    }
+    return;
+  }
 
   // State machine
   if(state==='import_key'){
