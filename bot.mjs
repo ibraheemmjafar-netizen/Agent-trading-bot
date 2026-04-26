@@ -70,6 +70,11 @@ const REF_SHARE   = 0.25;          // 25% of fee goes to referrer
 const MIST        = 1_000_000_000n;
 const SUI_T       = '0x2::sui::SUI';
 const PANS_T      = '0xc9523f683256502be15ec4979098d510f67b6d3f0df02eebf124515014433270::pans::PANS';
+// AGENT MemeLand: meme tokens trade as Cetus CLMM pools paired against AGENT
+// (NOT against SUI), so we route SUI → AGENT (hop1) → MEME (hop2) via two
+// Cetus swaps. SUI/AGENT 1% pool has the most TVL of the three on Cetus.
+const AGENT_T        = '0x5613a7e1f4f8fc7b896781aaba9b52944763e14421458d14c829223541d77c1c::agent::AGENT';
+const SUI_AGENT_POOL = '0xe8bf297251264d4474a6f6115ebeeeea4a3e50d534d3b663691e22b5fd36a6eb';
 const SUISCAN     = 'https://suiscan.xyz/mainnet/tx/';
 
 // ─── Redis client (persists users.json across Railway deployments) ───
@@ -3029,6 +3034,15 @@ bot.on('message', async(msg) => {
     const raw=text.startsWith('0x')?text:(await resolveTicker(text));
     const ct=raw?await resolveCoinType(raw):null;
     if(!ct){await bot.sendMessage(chatId,'❌ Token not found.');return;}
+    // Launchpad auto-detect: live Odyssey bonding-curve token → bonding-curve
+    // sell UI; otherwise fall through to standard DEX sell.
+    try {
+      const ody = await isOdysseyToken(ct);
+      if (ody && !ody.isCompleted && (ody.pairType||'SUI') === 'SUI') {
+        await _showOdyByCA(chatId, ct, ody);
+        return;
+      }
+    } catch { /* ignore detect errors, fall through */ }
     const meta=await getMeta(ct)||{};
     await guard(chatId,async()=>{updU(chatId,{pd:{ct,sym:meta.symbol||trunc(ct)}});await showSellPct(chatId,ct,meta.symbol||trunc(ct),null);}); return;
   }
@@ -3498,10 +3512,18 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
       coinType: t.coinType, packageId: t.moonbagsPackageId,
       amountInMist: amtMist, minOutRaw: 0n,
     });
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
+    const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
-      `✅ *Bought ${amtSui} SUI of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
+      `✅ *Bought ${t.symbol}* on Odyssey\n\n` +
+      `💰 Spent:    ${amtSui} SUI\n` +
+      `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\n\n` +
+      `🔗 [View TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
   } catch(e) {
     const msg = String(e?.message || e || 'unknown error');
@@ -3531,10 +3553,23 @@ async function _odySell(chatId, msgId, idx, pct) {
       coinType: t.coinType, packageId: t.moonbagsPackageId,
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
     });
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const sold = Number(sellAmt)/Math.pow(10, dec);
+    const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+    const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    // Subtract sold portion from position bag
+    if (u.positions) {
+      const pos = u.positions.find(p => p.ct === t.coinType);
+      if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
+    }
     await bot.editMessageText(
-      `✅ *Sold ${pct}% of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
+      `✅ *Sold ${pct}% of ${t.symbol}* on Odyssey\n\n` +
+      `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${t.symbol}\n` +
+      `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n\n` +
+      `🔗 [View TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
   } catch(e) {
     const msg = String(e?.message || e || 'unknown error');
@@ -3565,9 +3600,18 @@ async function _odyBuyCA(chatId, msgId, amtSui) {
       coinType: t.coinType, packageId: t.moonbagsPackageId,
       amountInMist: amtMist, minOutRaw: 0n,
     });
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
-    await bot.editMessageText(`✅ *Bought ${amtSui} SUI of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
+    const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    await bot.editMessageText(
+      `✅ *Bought ${t.symbol}* on Odyssey\n\n` +
+      `💰 Spent:    ${amtSui} SUI\n` +
+      `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\n\n` +
+      `🔗 [View TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
   } catch(e) {
     const msg = String(e?.message || e || 'unknown error');
@@ -3594,13 +3638,210 @@ async function _odySellCA(chatId, msgId, pct) {
       coinType: t.coinType, packageId: t.moonbagsPackageId,
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
     });
-    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
-    await bot.editMessageText(`✅ *Sold ${pct}% of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const sold = Number(sellAmt)/Math.pow(10, dec);
+    const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+    const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    if (u.positions) {
+      const pos = u.positions.find(p => p.ct === t.coinType);
+      if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
+    }
+    await bot.editMessageText(
+      `✅ *Sold ${pct}% of ${t.symbol}* on Odyssey\n\n` +
+      `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${t.symbol}\n` +
+      `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n\n` +
+      `🔗 [View TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
   } catch(e) {
     const msg = String(e?.message || e || 'unknown error');
     await bot.editMessageText(`❌ Sell failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// AGENT MemeLand — 2-hop SUI ↔ AGENT ↔ MEME via Cetus CLMM
+// ════════════════════════════════════════════════════════════════
+// AGENT memes pair against AGENT (not SUI). Trades require two Cetus swaps:
+//   Buy:  SUI → AGENT (SUI/AGENT 1% pool) → MEME (token's API poolId)
+//   Sell: MEME → AGENT (token's API poolId) → SUI (SUI/AGENT 1% pool)
+// Each hop uses the bot's existing Cetus pool_script_v2 builder.
+async function _showAgentBuy(chatId, at) {
+  const ct = at.coinType || at.ct;
+  if (!ct) { await bot.sendMessage(chatId, '❌ Token has no contract address.'); return; }
+  if (!at.poolId) { await bot.sendMessage(chatId, `❌ ${at.symbol||'token'} has no Cetus pool yet — try again in a few minutes.`); return; }
+  const tok = {
+    coinType: ct, symbol: at.symbol || '?', poolId: at.poolId,
+    name: at.name||'', priceSui: at.priceSui, marketCapUsd: at.marketCapUsd, source: 'agent',
+  };
+  updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), agentTok: tok } });
+  const mc = at.marketCapUsd ? `$${Number(at.marketCapUsd).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
+  const px = at.priceSui ? `${Number(at.priceSui).toExponential(3)} SUI` : 'n/a';
+  const txt =
+    `🟢 *${tok.symbol}*  (AGENT MemeLand)\n` +
+    `\`${ct.slice(0,46)}…\`\n\n` +
+    `MCAP:  ${mc}\nPrice: ${px}\nRoute: SUI → AGENT → ${tok.symbol}\n\n` +
+    `_Pick a buy size:_`;
+  const rows = [
+    [{text:'💰 0.1 SUI', callback_data:'lp:agbuyca:0.1'}, {text:'💰 0.5 SUI', callback_data:'lp:agbuyca:0.5'}],
+    [{text:'💰 1 SUI',   callback_data:'lp:agbuyca:1'  }, {text:'💰 5 SUI',   callback_data:'lp:agbuyca:5'  }],
+    [{text:'💸 Sell 25%', callback_data:'lp:agsellca:25'}, {text:'💸 Sell 100%', callback_data:'lp:agsellca:100'}],
+    [{text:'⬅️ Back', callback_data:'lp:agent'}],
+  ];
+  await bot.sendMessage(chatId, txt, {parse_mode:'Markdown', reply_markup:{inline_keyboard:rows}});
+}
+
+async function _agentBuyCA(chatId, msgId, amtSui) {
+  const u = getU(chatId);
+  if (!u || !u.encryptedKey) { await bot.sendMessage(chatId, '❌ No wallet. Use /start first.'); return; }
+  const t = u?.pd?.agentTok;
+  if (!t) { await bot.sendMessage(chatId, '❌ Lost token reference. Reopen 🚀 Launchpad → AGENT.'); return; }
+  const sym = String(t.symbol||'?').replace(/[*_`\[\]]/g, '');
+  const m = await bot.sendMessage(chatId, `⏳ Buying *${sym}* via SUI → AGENT → ${sym}\nHop 1/2: SUI → AGENT...`, {parse_mode:'Markdown'});
+  try {
+    const kp = getKP(u);
+    const amtMist  = BigInt(Math.floor(parseFloat(amtSui) * Number(MIST)));
+    // 1% fee, mirrors standard DEX buy semantics: swap (amtMist - feeMist), pay fee from gas.
+    const feeMist  = (amtMist * BigInt(FEE_BPS)) / 10000n;
+    const tradeMist = amtMist - feeMist;
+    const refWallet = resolveRefWallet(u);
+    const refMist  = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+    const devMist  = feeMist - refMist;
+
+    // Hop 1: SUI → AGENT  (pool 0xe8bf…, CoinA=AGENT, CoinB=SUI; SUI is INPUT → swap_b2a, a2b=false)
+    const tx1 = await buildCetusSwapTx({
+      wallet: u.walletAddress, poolId: SUI_AGENT_POOL,
+      coinA: AGENT_T, coinB: SUI_T, a2b: false,
+      coinInType: SUI_T, amountIn: tradeMist.toString(), minAmountOut: '0',
+    });
+    // Inline fee transfers (addFees is closure-scoped inside executeBuy and not reachable here)
+    const [fc] = tx1.splitCoins(tx1.gas, [tx1.pure.u64(devMist)]);
+    tx1.transferObjects([fc], tx1.pure.address(DEV_WALLET));
+    if (refMist > 0n && refWallet) {
+      const [rc] = tx1.splitCoins(tx1.gas, [tx1.pure.u64(refMist)]);
+      tx1.transferObjects([rc], tx1.pure.address(refWallet));
+      const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
+      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
+    const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true}});
+    if (res1.effects?.status?.status !== 'success') throw new Error('Hop 1 (SUI→AGENT): ' + (res1.effects?.status?.error || 'failed'));
+    const ab1 = await getActualDelta(res1.balanceChanges || res1.digest, AGENT_T, u.walletAddress);
+    if (!ab1 || ab1 <= 0n) throw new Error('Hop 1 returned 0 AGENT');
+
+    await bot.editMessageText(`⏳ Buying *${sym}* via SUI → AGENT → ${sym}\nHop 2/2: AGENT → ${sym}...`,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+    await new Promise(r => setTimeout(r, 800));
+
+    // Hop 2: AGENT → MEME — re-read pool type fresh to know orientation
+    let coinA = AGENT_T, coinB = t.coinType, agentIsA = true;
+    try {
+      const obj = await sui.getObject({ id: t.poolId, options:{showType:true} });
+      const args = obj.data?.type?.match(/<(.+)>$/)?.[1]?.split(/,\s*/).map(s=>s.trim());
+      if (args && args.length === 2) {
+        coinA = args[0]; coinB = args[1];
+        agentIsA = coinA.toLowerCase() === AGENT_T.toLowerCase();
+      }
+    } catch {}
+    const a2b = agentIsA;  // AGENT is INPUT; if AGENT=CoinA → swap_a2b (a2b=true) else swap_b2a (a2b=false)
+    const tx2 = await buildCetusSwapTx({
+      wallet: u.walletAddress, poolId: t.poolId,
+      coinA, coinB, a2b,
+      coinInType: AGENT_T, amountIn: ab1.toString(), minAmountOut: '0',
+    });
+    const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true}});
+    if (res2.effects?.status?.status !== 'success') throw new Error('Hop 2 (AGENT→MEME): ' + (res2.effects?.status?.error || 'failed'));
+
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const ab2  = await getActualDelta(res2.balanceChanges || res2.digest, t.coinType, u.walletAddress);
+    const got  = ab2 && ab2 > 0n ? Number(ab2)/Math.pow(10, dec) : 0;
+    const agentGot = Number(ab1)/1e9;
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    await bot.editMessageText(
+      `✅ *Bought ${sym}* via AGENT MemeLand\n\n` +
+      `💰 Spent:    ${amtSui} SUI\n` +
+      `🟢 Hop 1:    ${agentGot.toFixed(4)} AGENT\n` +
+      `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${sym}\n\n` +
+      `🔗 [TX 1](${SUISCAN}${res1.digest})  ·  [TX 2](${SUISCAN}${res2.digest})`,
+      {chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:agent'}]]}});
+  } catch(e) {
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ AGENT buy failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:agent'}]]}});
+  }
+}
+
+async function _agentSellCA(chatId, msgId, pct) {
+  const u = getU(chatId);
+  if (!u || !u.encryptedKey) { await bot.sendMessage(chatId, '❌ No wallet.'); return; }
+  const t = u?.pd?.agentTok;
+  if (!t) { await bot.sendMessage(chatId, '❌ Lost token reference. Reopen 🚀 Launchpad → AGENT.'); return; }
+  const sym = String(t.symbol||'?').replace(/[*_`\[\]]/g, '');
+  const m = await bot.sendMessage(chatId, `⏳ Selling ${pct}% of *${sym}* via ${sym} → AGENT → SUI\nHop 1/2: ${sym} → AGENT...`, {parse_mode:'Markdown'});
+  try {
+    const bal = await sui.getBalance({ owner: u.walletAddress, coinType: t.coinType });
+    const total = BigInt(bal.totalBalance || 0);
+    if (total === 0n) throw new Error('No balance to sell');
+    const sellRaw = (total * BigInt(pct)) / 100n;
+    const kp = getKP(u);
+
+    // Hop 1: MEME → AGENT — re-read pool type fresh
+    let coinA = t.coinType, coinB = AGENT_T, memeIsA = true;
+    try {
+      const obj = await sui.getObject({ id: t.poolId, options:{showType:true} });
+      const args = obj.data?.type?.match(/<(.+)>$/)?.[1]?.split(/,\s*/).map(s=>s.trim());
+      if (args && args.length === 2) {
+        coinA = args[0]; coinB = args[1];
+        memeIsA = coinA.toLowerCase() === t.coinType.toLowerCase();
+      }
+    } catch {}
+    const a2b1 = memeIsA;  // MEME is INPUT; if MEME=CoinA → a2b=true else false
+    const tx1 = await buildCetusSwapTx({
+      wallet: u.walletAddress, poolId: t.poolId,
+      coinA, coinB, a2b: a2b1,
+      coinInType: t.coinType, amountIn: sellRaw.toString(), minAmountOut: '0',
+    });
+    const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true}});
+    if (res1.effects?.status?.status !== 'success') throw new Error('Hop 1 (MEME→AGENT): ' + (res1.effects?.status?.error || 'failed'));
+    const agentGot = await getActualDelta(res1.balanceChanges || res1.digest, AGENT_T, u.walletAddress);
+    if (!agentGot || agentGot <= 0n) throw new Error('Hop 1 returned 0 AGENT');
+
+    await bot.editMessageText(`⏳ Selling ${pct}% of *${sym}* via ${sym} → AGENT → SUI\nHop 2/2: AGENT → SUI...`,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+    await new Promise(r => setTimeout(r, 800));
+
+    // Hop 2: AGENT → SUI  (pool CoinA=AGENT, CoinB=SUI; AGENT is INPUT → swap_a2b, a2b=true)
+    const tx2 = await buildCetusSwapTx({
+      wallet: u.walletAddress, poolId: SUI_AGENT_POOL,
+      coinA: AGENT_T, coinB: SUI_T, a2b: true,
+      coinInType: AGENT_T, amountIn: agentGot.toString(), minAmountOut: '0',
+    });
+    const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true}});
+    if (res2.effects?.status?.status !== 'success') throw new Error('Hop 2 (AGENT→SUI): ' + (res2.effects?.status?.error || 'failed'));
+    const suiDelta = await getActualDelta(res2.balanceChanges || res2.digest, SUI_T, u.walletAddress);
+    const suiR = suiDelta && suiDelta > 0n ? Number(suiDelta)/1e9 : 0;
+
+    // Apply post-sell fee (1% of SUI proceeds → DEV / referrer), mirroring standard sell flow
+    let feeMist = 0n;
+    try { feeMist = await postSellFee(kp, u, suiR); } catch (e) { console.error('AGENT sell postSellFee failed:', e?.message||e); }
+
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const sold = Number(sellRaw)/Math.pow(10, dec);
+    if (u.positions) {
+      const pos = u.positions.find(p => p.ct === t.coinType);
+      if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
+    }
+    await bot.editMessageText(
+      `✅ *Sold ${pct}% of ${sym}* via AGENT MemeLand\n\n` +
+      `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${sym}\n` +
+      `🟢 Hop 1:    ${(Number(agentGot)/1e9).toFixed(4)} AGENT\n` +
+      `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n` +
+      `🧾 Fee:      ${(Number(feeMist)/1e9).toFixed(4)} SUI\n\n` +
+      `🔗 [TX 1](${SUISCAN}${res1.digest})  ·  [TX 2](${SUISCAN}${res2.digest})`,
+      {chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:agent'}]]}});
+  } catch(e) {
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ AGENT sell failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:agent'}]]}});
   }
 }
 
@@ -3626,12 +3867,11 @@ bot.on('callback_query', async(q)=>{
       const { agent } = await _getLaunchpadTokens();
       const at = agent[aIdx];
       if (!at) { await bot.sendMessage(chatId, '❌ Token expired from cache. Reopen 🚀 Launchpad.'); return; }
-      const ct = at.coinType || at.ct;
-      if (!ct) { await bot.sendMessage(chatId, '❌ Token has no contract address.'); return; }
-      updU(chatId, { pd:{ ct }, state:'buy_custom' });
-      await bot.sendMessage(chatId, `🟢 *${at.symbol||'AGENT token'}* selected:\n\`${ct.slice(0,46)}...\`\n\nEnter SUI amount to buy (e.g. \`0.5\`):`, {parse_mode:'Markdown'});
+      await _showAgentBuy(chatId, at);
       return;
     }
+    if (parts[1] === 'agbuyca')  return _agentBuyCA(chatId, msgId, parts[2]);
+    if (parts[1] === 'agsellca') return _agentSellCA(chatId, msgId, parseInt(parts[2],10));
   } catch(e) {
     await bot.sendMessage(chatId, `❌ Launchpad error: ${(e.message||'').slice(0,140)}`).catch(()=>{});
   }
