@@ -54,7 +54,7 @@ import {
   fetchAllLaunchpadTokens,
   buildOdysseyBuyTx, buildOdysseySellTx,
   isOdysseyToken,
-} from './agent-launchpads-v7.1.mjs';
+} from './agent-launchpads.mjs';
 
 // ═══════════════════════════════════════════════════════════
 // CONFIG — set via environment variables
