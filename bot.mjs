@@ -3012,6 +3012,15 @@ bot.on('message', async(msg) => {
     const raw=text.startsWith('0x')?text:(await resolveTicker(text));
     const ct=raw?await resolveCoinType(raw):null;
     if(!ct){await bot.sendMessage(chatId,'❌ Token not found. Paste the full contract address.');return;}
+    // Launchpad auto-detect: if this CA is a live Odyssey bonding-curve token,
+    // route to the bonding-curve UI; otherwise fall through to standard DEX buy.
+    try {
+      const ody = await isOdysseyToken(ct);
+      if (ody && !ody.isCompleted && (ody.pairType||'SUI') === 'SUI') {
+        await _showOdyByCA(chatId, ct, ody);
+        return;
+      }
+    } catch { /* ignore detect errors, fall through */ }
     await guard(chatId,async()=>startBuy(chatId,ct)); return;
   }
 
@@ -3338,8 +3347,10 @@ function _fmtToken(t, idx) {
   const sym = (t.symbol || '?').slice(0, 10);
   const name = (t.name || '').slice(0, 18);
   const mc = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : '';
-  const prog = t.bondingProgress != null ? ` ${Math.round(t.bondingProgress)}%` : '';
-  return `${idx+1}. *${sym}* ${name ? '_'+name+'_' : ''}\n   ${mc}${prog}`;
+  const p = (t.progress != null) ? t.progress : t.bondingProgress;
+  const prog = p != null ? `  ${Math.round(p)}%` : '';
+  const pair = t.pairType && t.pairType !== 'SUI' ? `  [${t.pairType}]` : '';
+  return `${idx+1}. *${sym}* ${name ? '_'+name+'_' : ''}\n   ${mc}${prog}${pair}`;
 }
 
 async function doLaunchpadMenu(chatId) {
@@ -3365,7 +3376,8 @@ async function _showAgentList(chatId, msgId) {
     }
     const lines = agent.slice(0,10).map((t,i)=>_fmtToken(t,i)).join('\n\n');
     const txt = `🟢 *AGENT MemeLand* — ${agent.length} live\n\n${lines}\n\n_Tap a token to start a buy:_`;
-    const rows = agent.slice(0,10).map((t,i)=>([{text:`💰 Buy ${i+1}. ${(t.symbol||'?').slice(0,8)}`, callback_data:`lp:agbuy:${encodeURIComponent(t.coinType||t.ct)}`}]));
+    // Use index-based callback (Telegram callback_data has a 64-byte hard limit)
+    const rows = agent.slice(0,10).map((t,i)=>([{text:`💰 Buy ${i+1}. ${(t.symbol||'?').slice(0,8)}`, callback_data:`lp:agbuy:${i}`}]));
     rows.push([{text:'🔄 Refresh', callback_data:'lp:agent'},{text:'⬅️ Back', callback_data:'lp:menu'}]);
     const opts = { parse_mode:'Markdown', reply_markup:{ inline_keyboard:rows } };
     if (msgId) await bot.editMessageText(txt,{chat_id:chatId,message_id:msgId,...opts});
@@ -3402,16 +3414,51 @@ async function _showOdyList(chatId, msgId) {
   }
 }
 
+// Show the Odyssey buy/sell screen for a token referenced by raw CA (paste flow).
+// We persist the token info on the user's session so the buy/sell callbacks can
+// re-resolve it without depending on the global _lpCache (which can refresh /
+// expire and invalidate any synthetic index).
+async function _showOdyByCA(chatId, ct, info) {
+  const tok = {
+    coinType: ct,
+    symbol: info.symbol || (ct.split('::').pop() || '?'),
+    moonbagsPackageId: info.moonbagsPackageId,
+    pairType: info.pairType || 'SUI',
+    progress: info.progress ?? null,
+    isCompleted: !!info.isCompleted,
+    marketCap: null,
+    source: 'Odyssey',
+  };
+  updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), odyCA: tok } });
+  const sym  = tok.symbol;
+  const prog = (tok.progress != null) ? `${(Number(tok.progress)*100).toFixed(2)}%` : 'n/a';
+  const txt =
+    `🟣 *${sym}*  (Odyssey bonding curve, SUI-paired)\n` +
+    `\`${ct.slice(0,46)}…\`\n\n` +
+    `Curve progress: *${prog}*\n\n` +
+    `_Pick a buy size:_`;
+  const rows = [
+    [{text:'💰 0.1 SUI', callback_data:'lp:odbuyca:0.1'}, {text:'💰 0.5 SUI', callback_data:'lp:odbuyca:0.5'}],
+    [{text:'💰 1 SUI',   callback_data:'lp:odbuyca:1'  }, {text:'💰 5 SUI',   callback_data:'lp:odbuyca:5'  }],
+    [{text:'💸 Sell 25%', callback_data:'lp:odsellca:25'}, {text:'💸 Sell 100%', callback_data:'lp:odsellca:100'}],
+    [{text:'⬅️ Back', callback_data:'lp:menu'}],
+  ];
+  await bot.sendMessage(chatId, txt, {parse_mode:'Markdown', reply_markup:{inline_keyboard:rows}});
+}
+
 async function _showOdyToken(chatId, msgId, idx) {
   const { odyssey } = await _getLaunchpadTokens();
   const t = odyssey[idx];
   if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
   const sym = t.symbol || '?';
   const mc  = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
-  const prog = t.bondingProgress != null ? `${Math.round(t.bondingProgress)}%` : 'n/a';
-  const ct = (t.coinType || '').slice(0,46);
+  const p   = (t.progress != null) ? t.progress : t.bondingProgress;
+  const prog= p != null ? `${Math.round(p)}%` : 'n/a';
+  const pair= t.pairType || 'SUI';
+  const ct  = (t.coinType || '').slice(0,46);
+  const pairWarn = pair !== 'SUI' ? `\n\n⚠️ This token pairs with *${pair}*, not SUI. Buying with SUI will fail.` : '';
   const txt = `🟣 *${sym}* — ${t.name||''}\n\n` +
-    `MCAP: ${mc}\nBonding: ${prog}\nCA: \`${ct}...\`\n\nChoose buy amount (SUI):`;
+    `MCAP: ${mc}\nBonding: ${prog}\nPair: ${pair}\nCA: \`${ct}...\`${pairWarn}\n\nChoose buy amount (SUI):`;
   const kb = { inline_keyboard:[
     [{text:'0.1', callback_data:`lp:odbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:odbuy:${idx}:0.5`}],
     [{text:'1',   callback_data:`lp:odbuy:${idx}:1`  },{text:'2',   callback_data:`lp:odbuy:${idx}:2`  }],
@@ -3428,6 +3475,20 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
   const { odyssey } = await _getLaunchpadTokens();
   const t = odyssey[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  // Guard: this entry only supports SUI-paired curves
+  const pair = t.pairType || 'SUI';
+  if (pair !== 'SUI') {
+    await bot.editMessageText(
+      `❌ *${t.symbol}* is paired with *${pair}*, not SUI.\n\nPay-with-${pair} is not supported yet from this menu.`,
+      {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
+    return;
+  }
+  if (t.isCompleted) {
+    await bot.editMessageText(
+      `ℹ️ *${t.symbol}* has graduated off the bonding curve.\n\nUse the regular *💰 Buy* with the CA — it now trades on Cetus.`,
+      {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
+    return;
+  }
   await bot.editMessageText(`⏳ Buying ${amtSui} SUI of *${t.symbol}* on Odyssey...`,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
   try {
     const kp = getKP(u);
@@ -3443,7 +3504,8 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
       `✅ *Bought ${amtSui} SUI of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
   } catch(e) {
-    await bot.editMessageText(`❌ Buy failed: ${(e.message||'').slice(0,180)}`,{chat_id:chatId,message_id:msgId,reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ Buy failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
   }
 }
 
@@ -3475,7 +3537,70 @@ async function _odySell(chatId, msgId, idx, pct) {
       `✅ *Sold ${pct}% of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
   } catch(e) {
-    await bot.editMessageText(`❌ Sell failed: ${(e.message||'').slice(0,180)}`,{chat_id:chatId,message_id:msgId,reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ Sell failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
+  }
+}
+
+// Buy / sell helpers for the CA-paste flow. Token info lives on the user's
+// session (pd.odyCA), so no dependency on _lpCache index.
+async function _odyBuyCA(chatId, msgId, amtSui) {
+  const u = getU(chatId);
+  const t = u?.pd?.odyCA;
+  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  if ((t.pairType||'SUI') !== 'SUI') {
+    await bot.sendMessage(chatId, `❌ ${t.symbol} is paired with ${t.pairType}, not SUI — pay-with-${t.pairType} not supported here yet.`);
+    return;
+  }
+  if (t.isCompleted) {
+    await bot.sendMessage(chatId, `ℹ️ ${t.symbol} graduated off the bonding curve. Use 💰 Buy with the CA — it now trades on Cetus.`);
+    return;
+  }
+  const m = await bot.sendMessage(chatId, `⏳ Buying ${amtSui} SUI of *${t.symbol}* on Odyssey...`, {parse_mode:'Markdown'});
+  try {
+    const kp = getKP(u);
+    const amtMist = BigInt(Math.floor(parseFloat(amtSui) * Number(MIST)));
+    const tx = await buildOdysseyBuyTx({
+      suiClient: sui, walletAddress: u.walletAddress,
+      coinType: t.coinType, packageId: t.moonbagsPackageId,
+      amountInMist: amtMist, minOutRaw: 0n,
+    });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
+    await bot.editMessageText(`✅ *Bought ${amtSui} SUI of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
+      {chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+  } catch(e) {
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ Buy failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+  }
+}
+
+async function _odySellCA(chatId, msgId, pct) {
+  const u = getU(chatId);
+  const t = u?.pd?.odyCA;
+  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const m = await bot.sendMessage(chatId, `⏳ Selling ${pct}% of *${t.symbol}*...`, {parse_mode:'Markdown'});
+  try {
+    const bal = await sui.getBalance({ owner: u.walletAddress, coinType: t.coinType });
+    const total = BigInt(bal.totalBalance || 0);
+    if (total === 0n) throw new Error('No balance');
+    const sellAmt = (total * BigInt(pct)) / 100n;
+    const coins = await sui.getCoins({ owner: u.walletAddress, coinType: t.coinType });
+    const coinIds = (coins.data || []).map(c => c.coinObjectId);
+    if (!coinIds.length) throw new Error('No coin objects to sell');
+    const kp = getKP(u);
+    const tx = await buildOdysseySellTx({
+      suiClient: sui, walletAddress: u.walletAddress,
+      coinType: t.coinType, packageId: t.moonbagsPackageId,
+      tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
+    });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
+    await bot.editMessageText(`✅ *Sold ${pct}% of ${t.symbol}*\n\n🔗 [TX](${SUISCAN}${res.digest})`,
+      {chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+  } catch(e) {
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ Sell failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
   }
 }
 
@@ -3491,13 +3616,20 @@ bot.on('callback_query', async(q)=>{
     if (parts[1] === 'agent')   return _showAgentList(chatId, msgId);
     if (parts[1] === 'ody')     return _showOdyList(chatId, msgId);
     if (parts[1] === 'refresh'){ _lpCache.ts = 0; return doLaunchpadMenu(chatId); }
-    if (parts[1] === 'odpick')  return _showOdyToken(chatId, msgId, parseInt(parts[2],10));
-    if (parts[1] === 'odbuy')   return _odyBuy(chatId, msgId, parseInt(parts[2],10), parts[3]);
-    if (parts[1] === 'odsell')  return _odySell(chatId, msgId, parseInt(parts[2],10), parseInt(parts[3],10));
+    if (parts[1] === 'odpick')   return _showOdyToken(chatId, msgId, parseInt(parts[2],10));
+    if (parts[1] === 'odbuy')    return _odyBuy(chatId, msgId, parseInt(parts[2],10), parts[3]);
+    if (parts[1] === 'odsell')   return _odySell(chatId, msgId, parseInt(parts[2],10), parseInt(parts[3],10));
+    if (parts[1] === 'odbuyca')  return _odyBuyCA(chatId, msgId, parts[2]);
+    if (parts[1] === 'odsellca') return _odySellCA(chatId, msgId, parseInt(parts[2],10));
     if (parts[1] === 'agbuy') {
-      const ct = decodeURIComponent(parts[2]);
+      const aIdx = parseInt(parts[2], 10);
+      const { agent } = await _getLaunchpadTokens();
+      const at = agent[aIdx];
+      if (!at) { await bot.sendMessage(chatId, '❌ Token expired from cache. Reopen 🚀 Launchpad.'); return; }
+      const ct = at.coinType || at.ct;
+      if (!ct) { await bot.sendMessage(chatId, '❌ Token has no contract address.'); return; }
       updU(chatId, { pd:{ ct }, state:'buy_custom' });
-      await bot.sendMessage(chatId, `🟢 AGENT token selected:\n\`${ct.slice(0,46)}...\`\n\nEnter SUI amount to buy (e.g. \`0.5\`):`, {parse_mode:'Markdown'});
+      await bot.sendMessage(chatId, `🟢 *${at.symbol||'AGENT token'}* selected:\n\`${ct.slice(0,46)}...\`\n\nEnter SUI amount to buy (e.g. \`0.5\`):`, {parse_mode:'Markdown'});
       return;
     }
   } catch(e) {

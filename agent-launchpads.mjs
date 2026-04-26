@@ -224,44 +224,51 @@ export async function isOdysseyToken(coinType) {
 /**
  * Build a PTB that buys an Odyssey bonding-curve token with SUI.
  *
- * Calls: moonbags::buy_exact_in_with_lock<TokenT>(
- *   &mut Configuration, &TokenLockConfig, Coin<SUI>, min_out:u64,
- *   deadline:u64, &Clock, &mut TxContext)
- *
- * Note: bonding-curve buys output the token directly to tx.sender via the
- * moonbags::buy logic — no transferObjects needed in PTB.
+ * On-chain signature (verified from getNormalizedMoveModule + 5 successful txs):
+ *   moonbags::buy_exact_in_with_lock<T>(
+ *     cfg:        &mut Configuration,
+ *     lockCfg:    &Configuration,
+ *     suiCoin:    Coin<SUI>,    // must hold amount_in × ~1.03 (fee buffer)
+ *     amount_in:  u64,          // exact SUI mist to swap
+ *     min_out:    u64,          // minimum token units to receive
+ *     clock:      &Clock,
+ *   )
+ * The bought tokens are transferred to tx.sender by the contract itself.
  */
 export async function buildOdysseyBuyTx({
   suiClient,
   walletAddress,
   packageId,
   coinType,
-  amountInMist,           // bigint or string
-  minOutRaw = 0n,         // min token units out (bigint), 0 = accept any
-  deadlineMs = null,      // optional explicit deadline; default = now + 5min
+  amountInMist,           // bigint or string — amount of SUI to actually swap
+  minOutRaw = 0n,         // min token units out, 0 = accept any
+  feeBufferBps = 300n,    // 3% over the swap amount to cover the protocol fee
 }) {
   const cfg = await getOdysseyConfigs(suiClient, packageId);
   if (!cfg.tokenLockConfigId) {
     throw new Error('Could not discover Odyssey TokenLock Configuration');
   }
 
+  const amountIn   = BigInt(amountInMist);
+  // Ceil so we never underfund by 1 mist on tiny amounts
+  const feeBuf     = (amountIn * BigInt(feeBufferBps) + 9999n) / 10000n;
+  const coinTotal  = amountIn + feeBuf;
+
   const tx = new Transaction();
   tx.setSender(walletAddress);
 
-  // Split SUI from gas for the input coin
-  const [suiCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(BigInt(amountInMist))]);
-
-  const deadline = BigInt(deadlineMs ?? (Date.now() + 5 * 60 * 1000));
+  // Split a coin large enough to cover swap + fee buffer
+  const [suiCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(coinTotal)]);
 
   tx.moveCall({
     target: `${packageId}::moonbags::buy_exact_in_with_lock`,
     typeArguments: [coinType],
     arguments: [
-      tx.object(cfg.configId),            // mut shared Configuration
-      tx.object(cfg.tokenLockConfigId),   // immut shared TokenLock Configuration
+      tx.object(cfg.configId),            // mut Configuration
+      tx.object(cfg.tokenLockConfigId),   // TokenLock Configuration
       suiCoin,                            // Coin<SUI>
+      tx.pure.u64(amountIn),              // amount_in
       tx.pure.u64(BigInt(minOutRaw)),     // min_out
-      tx.pure.u64(deadline),              // deadline
       tx.object(CLOCK_OBJ),               // Clock
     ],
   });
