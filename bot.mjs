@@ -54,6 +54,7 @@ import {
   fetchAllLaunchpadTokens,
   buildOdysseyBuyTx, buildOdysseySellTx,
   isOdysseyToken,
+  fetchAgentTokenByCoinType,
 } from './agent-launchpads.mjs';
 
 // ═══════════════════════════════════════════════════════════
@@ -1809,16 +1810,27 @@ async function executeSell(chatId, ct, pct) {
     let poolCoinA   = st.coinA  || null;
     let poolCoinB   = st.coinB  || null;
 
-    // If detectState didn't give us a poolId (unknown-state path), try all strategies.
+    // ── Pool ID resolution — 5-strategy priority chain ─────────────────────
+    // Strategy 0a: stored in the user's position record (populated since v.i buy fix)
     if (!tokenPoolId) {
-      // Strategy 1: standard findCetusPool (tries both orderings + GeckoTerminal)
+      const savedPos = (u.positions||[]).find(p => p.ct === ct && p.source === 'agent' && p.poolId);
+      if (savedPos?.poolId) { tokenPoolId = savedPos.poolId; }
+    }
+    // Strategy 0b: pd.agentTok (set when user opens the launchpad buy modal)
+    if (!tokenPoolId) {
+      const agTok = u.pd?.agentTok;
+      if (agTok && (agTok.coinType||'').toLowerCase() === ct.toLowerCase() && agTok.poolId)
+        { tokenPoolId = agTok.poolId; }
+    }
+    // Strategy 1: standard findCetusPool (GeckoTerminal + Cetus API, both orderings)
+    if (!tokenPoolId) {
       try {
         const ap = await findCetusPool(AGENT_T, ct);
         if (ap) { tokenPoolId = ap.poolId; poolCoinA = ap.coinA; poolCoinB = ap.coinB; }
       } catch {}
     }
+    // Strategy 2: Cetus pools_info by coinType — filter for AGENT counterpart
     if (!tokenPoolId) {
-      // Strategy 2: direct Cetus pools_info queried by token coin type, filter for AGENT counterpart
       try {
         const r = await ftch(
           `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type=${encodeURIComponent(ct)}&limit=10&order_by=tvl&order=desc`,
@@ -1840,8 +1852,8 @@ async function executeSell(chatId, ct, pct) {
         }
       } catch {}
     }
+    // Strategy 3: GeckoTerminal — walk token's pools, look for AGENT-paired Cetus pool
     if (!tokenPoolId) {
-      // Strategy 3: GeckoTerminal — iterate token pools, look for AGENT as counterpart
       try {
         const pkg = ct.split('::')[0];
         for (const addr of [ct, pkg]) {
@@ -1862,13 +1874,32 @@ async function executeSell(chatId, ct, pct) {
         }
       } catch {}
     }
-    if (!tokenPoolId) throw new Error(`No AGENT-paired Cetus pool found for ${sym}. The pool may not be indexed yet — retry in a moment.`);
+    // Strategy 4: Railway backend — authoritative source for all AGENT MemeLand pools.
+    // This is the most reliable source for newly-launched / low-TVL pools that aren't
+    // indexed by Cetus API or GeckoTerminal yet.
+    if (!tokenPoolId) {
+      try {
+        const backendTok = await fetchAgentTokenByCoinType(ct);
+        if (backendTok?.poolId) { tokenPoolId = backendTok.poolId; }
+      } catch {}
+    }
+    if (!tokenPoolId) throw new Error(
+      `Could not find a Cetus pool for ${sym} on AGENT MemeLand.\n` +
+      `This token's pool may not be live yet, or the token may have been delisted.\n` +
+      `Try selling directly on https://agent.land`
+    );
 
     // Re-read pool object to confirm exact coin orientation
     try {
       const obj = await sui.getObject({ id: tokenPoolId, options:{ showType:true } });
       const args = obj.data?.type?.match(/<(.+)>$/)?.[1]?.split(/,\s*/).map(s=>s.trim());
       if (args && args.length === 2) { poolCoinA = args[0]; poolCoinB = args[1]; }
+    } catch {}
+
+    // Cache poolId back into the position so future sells skip the lookup
+    try {
+      const savedPos = (u.positions||[]).find(p => p.ct === ct && p.source === 'agent');
+      if (savedPos && !savedPos.poolId) { savedPos.poolId = tokenPoolId; saveDB(); }
     } catch {}
 
     const memeIsA = (poolCoinA||'').toLowerCase() === ct.toLowerCase();
@@ -2400,6 +2431,15 @@ function updatePositionAfterSell(chatId, ct, pct) {
 async function getPnl(pos) {
   if (pos.source==='bonding'||!pos.tokens||pos.tokens<=0) return null;
   try {
+    // AGENT MemeLand tokens route MEME→AGENT→SUI (2 hops) so direct
+    // getSwapEstimate always returns 0. Use Railway backend priceSui instead.
+    if (pos.source === 'agent') {
+      const t = await fetchAgentTokenByCoinType(pos.ct).catch(() => null);
+      if (!t || t.priceSui == null) return null;
+      const cur = Number(t.priceSui) * pos.tokens;
+      if (!cur || cur <= 0) return null;
+      return { cur, pnl: cur - parseFloat(pos.spent), pct: (cur - parseFloat(pos.spent)) / parseFloat(pos.spent) * 100 };
+    }
     const amt = BigInt(Math.floor(pos.tokens * Math.pow(10, pos.dec||9)));
     const out = await getSwapEstimate(pos.ct, SUI_T, amt.toString());
     if (!out||out==='0') return null;
@@ -4210,7 +4250,7 @@ async function _agentBuyCA(chatId, msgId, amtSui) {
     const ab2  = await getActualDelta(res2.balanceChanges || res2.digest, t.coinType, u.walletAddress);
     const got  = ab2 && ab2 > 0n ? Number(ab2)/Math.pow(10, dec) : 0;
     const agentGot = Number(ab1)/1e9;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', poolId: t.poolId || null, tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
       `✅ *Bought ${sym}* via AGENT MemeLand\n\n` +
       `💰 Spent:    ${amtSui} SUI\n` +

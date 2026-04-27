@@ -96,6 +96,32 @@ export async function fetchAgentLaunchpadTokens(limit = 20) {
   }));
 }
 
+/**
+ * Fetch a single AGENT MemeLand token by its coinType from the Railway backend.
+ * Used by the sell flow to recover a poolId when the Cetus API doesn't index
+ * a low-TVL pool, and by the price engine to get live priceSui for positions.
+ * Returns null if not found or the backend is unavailable.
+ */
+export async function fetchAgentTokenByCoinType(coinType) {
+  try {
+    const j = await jget(`${AGENT_BACKEND_URL}/memeland/tokens`);
+    const arr = Array.isArray(j?.tokens) ? j.tokens : [];
+    const norm = (coinType || '').toLowerCase();
+    const t = arr.find(x => (x.coinType || '').toLowerCase() === norm);
+    if (!t) return null;
+    return {
+      coinType:   t.coinType,
+      symbol:     t.symbol     || '',
+      poolId:     t.poolId     || null,
+      priceSui:   t.priceSui   ?? null,
+      priceUsd:   t.priceUsd   ?? null,
+      marketCap:  t.marketCap  ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ════════════════════════════════════════════════════════════════
 // 2. ODYSSEY — moonbags bonding curve
 // ════════════════════════════════════════════════════════════════
