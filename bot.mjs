@@ -1613,10 +1613,12 @@ async function executeSell(chatId, ct, pct) {
     });
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
-    const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
-    const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+    const suiR    = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    const soldAmt = Number(sellAmt) / Math.pow(10, meta.decimals || 9);
+    const pnlD    = computeSellPnl(chatId, ct, pct, suiR, 0);
     updatePositionAfterSell(chatId, ct, pct);
-    return { digest:res.digest, feeSui:'N/A', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct };
+    return { digest:res.digest, feeSui:'0', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt };
   }
 
   const st = await detectState(ct);
@@ -1807,14 +1809,60 @@ async function executeSell(chatId, ct, pct) {
     let poolCoinA   = st.coinA  || null;
     let poolCoinB   = st.coinB  || null;
 
-    // If detectState didn't give us a poolId (unknown-state path), query the API
+    // If detectState didn't give us a poolId (unknown-state path), try all strategies.
     if (!tokenPoolId) {
+      // Strategy 1: standard findCetusPool (tries both orderings + GeckoTerminal)
       try {
         const ap = await findCetusPool(AGENT_T, ct);
         if (ap) { tokenPoolId = ap.poolId; poolCoinA = ap.coinA; poolCoinB = ap.coinB; }
       } catch {}
     }
-    if (!tokenPoolId) throw new Error(`No AGENT-paired pool found for ${sym}. Cannot execute 2-hop sell.`);
+    if (!tokenPoolId) {
+      // Strategy 2: direct Cetus pools_info queried by token coin type, filter for AGENT counterpart
+      try {
+        const r = await ftch(
+          `https://api-sui.cetus.zone/v2/sui/pools_info?coin_type=${encodeURIComponent(ct)}&limit=10&order_by=tvl&order=desc`,
+          { headers:{ Accept:'application/json' } }, 8000
+        );
+        if (r.ok) {
+          const d = await r.json();
+          const pools = d.data?.list || [];
+          const AGENT_NORM = AGENT_T.toLowerCase();
+          const hit = pools.find(p =>
+            (p.coin_type_a||'').toLowerCase() === AGENT_NORM ||
+            (p.coin_type_b||'').toLowerCase() === AGENT_NORM
+          );
+          if (hit) {
+            tokenPoolId = hit.pool_address || hit.id;
+            poolCoinA   = hit.coin_type_a;
+            poolCoinB   = hit.coin_type_b;
+          }
+        }
+      } catch {}
+    }
+    if (!tokenPoolId) {
+      // Strategy 3: GeckoTerminal — iterate token pools, look for AGENT as counterpart
+      try {
+        const pkg = ct.split('::')[0];
+        for (const addr of [ct, pkg]) {
+          if (tokenPoolId) break;
+          const gPools = await getGeckoPools(addr).catch(() => []);
+          for (const p of gPools.slice(0, 8)) {
+            const poolAddr = p.attributes?.address;
+            if (!poolAddr) continue;
+            const info = await getPoolFromRPC(poolAddr).catch(() => null);
+            if (!info || info.dex !== 'cetus') continue;
+            const AGENT_NORM = AGENT_T.toLowerCase();
+            if ((info.coinA||'').toLowerCase() === AGENT_NORM ||
+                (info.coinB||'').toLowerCase() === AGENT_NORM) {
+              tokenPoolId = poolAddr; poolCoinA = info.coinA; poolCoinB = info.coinB;
+              break;
+            }
+          }
+        }
+      } catch {}
+    }
+    if (!tokenPoolId) throw new Error(`No AGENT-paired Cetus pool found for ${sym}. The pool may not be indexed yet — retry in a moment.`);
 
     // Re-read pool object to confirm exact coin orientation
     try {
@@ -1876,10 +1924,12 @@ async function executeSell(chatId, ct, pct) {
       });
       const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
       if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
-      const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
-      const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+      const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+      const suiR    = sd && sd > 0n ? Number(sd)/1e9 : 0;
+      const soldAmt = Number(sellAmt) / Math.pow(10, meta.decimals || 9);
+      const pnlD    = computeSellPnl(chatId, ct, pct, suiR, 0);
       updatePositionAfterSell(chatId, ct, pct);
-      return { digest:res.digest, feeSui:'N/A', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct };
+      return { digest:res.digest, feeSui:'0', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt };
     }
   }
 
@@ -2568,29 +2618,232 @@ async function doBalance(chatId) {
   });
 }
 
+// ── Sell result formatter — unified rich message for all sell routes ──────────
+function formatSellResult(res) {
+  const pct = res.pct || 0;
+  const soldLine = res.soldAmt
+    ? `📤 Sold: *${pct}%* (~${Number(res.soldAmt).toLocaleString('en',{maximumFractionDigits:0})} ${res.sym})`
+    : `📤 Sold: *${pct}%*`;
+
+  const feeSuiNum = (res.feeSui && res.feeSui !== 'N/A' && res.feeSui !== '0')
+    ? parseFloat(res.feeSui) : 0;
+  const grossSui  = parseFloat(res.sui || '0');
+  const netSui    = Math.max(0, grossSui - feeSuiNum);
+
+  let feeLine;
+  if (feeSuiNum > 0) {
+    feeLine = `⚡ Platform Fee: \`${res.feeSui} SUI\`\n💳 Net Received: \`${netSui.toFixed(4)} SUI\``;
+  } else if (res.feeSui === 'N/A') {
+    feeLine = `⚡ Platform Fee: Included in launchpad pricing`;
+  } else if (res.route && res.route.toLowerCase().includes('odyssey')) {
+    feeLine = `⚡ Platform Fee: None  _(Odyssey curve fee is built into pricing)_`;
+  } else {
+    feeLine = `⚡ Platform Fee: None`;
+  }
+
+  let msg =
+    `🔴 *Sell Executed!*\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🪙 Token: *${res.sym}*\n` +
+    `${soldLine}\n` +
+    `💰 Received: \`${res.sui} SUI\`\n` +
+    `${feeLine}\n` +
+    `🔀 Route: ${res.route}`;
+
+  if (res.pnl) {
+    const s    = res.pnl.pnl >= 0 ? '+' : '';
+    const icon = res.pnl.pnl >= 0 ? '🟢 PROFIT' : '🔴 LOSS';
+    const returned = feeSuiNum > 0 ? netSui.toFixed(4) : res.sui;
+    msg +=
+      `\n\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `📊 *Trade P&L*  —  ${icon}\n\n` +
+      `💼 Invested:  \`${res.pnl.spent.toFixed(4)} SUI\`\n` +
+      `💳 Returned:  \`${returned} SUI\`\n` +
+      `📈 P&L: *${s}${res.pnl.pnl.toFixed(4)} SUI  (${s}${res.pnl.pnlPct.toFixed(2)}%)*\n` +
+      `${pnlBar(res.pnl.pnlPct)}`;
+  }
+
+  msg += `\n\n🔗 [View TX on SuiScan](${SUISCAN}${res.digest})`;
+  return msg;
+}
+
+// ── Full P&L report for all open positions ────────────────────────────────────
+async function doPositionsPnlReport(chatId) {
+  await guard(chatId, async(u) => {
+    const positions = u.positions || [];
+    if (!positions.length) { await bot.sendMessage(chatId, '📊 No open positions.'); return; }
+    const m = await bot.sendMessage(chatId, '📊 Generating full P&L report...');
+
+    let totalInvested = 0, totalValue = 0, posWithData = 0;
+    const lines = [
+      `📊 *Full P&L Report*`,
+      `📅 ${new Date().toUTCString()}`,
+      `📈 Positions: *${positions.length}*`,
+      ``,
+    ];
+
+    for (const pos of positions) {
+      const p    = await getPnl(pos).catch(() => null);
+      const sym  = pos.sym || 'UNKNOWN';
+      const spent = parseFloat(pos.spent || 0);
+      totalInvested += spent;
+
+      const srcMap = { bonding:'📊 Launchpad', agent:'🤖 AGENT MemeLand', odyssey:'🟣 Odyssey', dex:'🔵 DEX' };
+      const srcLabel = srcMap[pos.source] || '🔵 DEX';
+      const heldH   = pos.at ? Math.round((Date.now()-pos.at)/3600000) : 0;
+      const heldStr = heldH >= 24 ? `${Math.floor(heldH/24)}d ${heldH%24}h` : `${heldH}h`;
+      const tokStr  = pos.tokens ? pos.tokens.toLocaleString('en',{maximumFractionDigits:2}) : '?';
+
+      lines.push(`━━━━━━━━━━━━━━`);
+      lines.push(`🪙 *${sym}*   ${srcLabel}   ⏱ ${heldStr}`);
+      lines.push(`   📦 Held: \`${tokStr} ${sym}\``);
+      lines.push(`   💼 Invested: \`${spent.toFixed(4)} SUI\``);
+
+      if (p) {
+        posWithData++;
+        totalValue += p.cur;
+        const s    = p.pnl >= 0 ? '+' : '';
+        const icon = p.pnl >= 0 ? '🟢' : '🔴';
+        lines.push(`   💰 Value: \`${p.cur.toFixed(4)} SUI\``);
+        lines.push(`   ${icon} P&L: *${s}${p.pnl.toFixed(4)} SUI  (${s}${p.pct.toFixed(2)}%)*`);
+        lines.push(`   ${pnlBar(p.pct)}`);
+      } else {
+        lines.push(`   ⚪ Live price unavailable`);
+      }
+    }
+
+    lines.push(``);
+    lines.push(`━━━━━━━━━━━━━━`);
+    lines.push(`📊 *Portfolio Totals*`);
+    lines.push(`💼 Total Invested: \`${totalInvested.toFixed(4)} SUI\``);
+    if (posWithData > 0) {
+      const totalPnl = totalValue - totalInvested;
+      const totalPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+      const s    = totalPnl >= 0 ? '+' : '';
+      const icon = totalPnl >= 0 ? '🟢' : '🔴';
+      lines.push(`💰 Total Value:    \`${totalValue.toFixed(4)} SUI\``);
+      lines.push(`${icon} Net P&L: *${s}${totalPnl.toFixed(4)} SUI  (${s}${totalPct.toFixed(2)}%)*`);
+      lines.push(pnlBar(totalPct));
+    } else {
+      lines.push(`⚪ No live prices available for P&L summary`);
+    }
+
+    await bot.editMessageText(lines.join('\n'), {
+      chat_id: chatId, message_id: m.message_id, parse_mode: 'Markdown',
+    }).catch(async () => {
+      // If too long, send as new message
+      await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'Markdown' });
+    });
+  });
+}
+
 async function doPositions(chatId) {
-  await guard(chatId,async(u)=>{
-    if(!u.positions?.length){await bot.sendMessage(chatId,'📊 No open positions.\n\nBuy a token to start tracking!');return;}
-    const m=await bot.sendMessage(chatId,`📊 Loading ${u.positions.length} position(s)...`);
-    await bot.deleteMessage(chatId,m.message_id).catch(()=>{});
-    for(let i=0;i<u.positions.length;i++){
-      const pos=u.positions[i];
+  await guard(chatId, async(u) => {
+    if (!u.positions?.length) {
+      await bot.sendMessage(chatId,
+        `📊 *No Open Positions*\n\n` +
+        `You don't have any tracked positions.\n\n` +
+        `💡 Buy a token and it will appear here with live P&L tracking.`,
+        { parse_mode:'Markdown' }
+      );
+      return;
+    }
+
+    const count         = u.positions.length;
+    const totalInvested = u.positions.reduce((s, p) => s + parseFloat(p.spent || 0), 0);
+    const m = await bot.sendMessage(chatId, '📊 Fetching live prices...');
+    await bot.deleteMessage(chatId, m.message_id).catch(() => {});
+
+    // ── Portfolio header ────────────────────────────────────────────────────
+    await bot.sendMessage(chatId,
+      `📊 *Portfolio Overview*\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📈 Positions Open: *${count}*\n` +
+      `💼 Total Invested: *${totalInvested.toFixed(4)} SUI*`,
+      {
+        parse_mode:'Markdown',
+        reply_markup: { inline_keyboard: [
+          [{ text:'📊 Full P&L Report', callback_data:'qs:pnl' }],
+        ]},
+      }
+    );
+
+    // ── Per-position cards ──────────────────────────────────────────────────
+    for (let i = 0; i < u.positions.length; i++) {
+      const pos = u.positions[i];
       try {
-        const p=await getPnl(pos);
-        // Build sell buttons for this position
-        const sellKb={inline_keyboard:[[
-          {text:`💸 Sell 50%`,callback_data:`qs:${i}:50`},
-          {text:`💸 Sell 100%`,callback_data:`qs:${i}:100`},
-        ]]};
-        if(p){
-          const cap=pnlCaption(pos,p)+`\n\nTP: ${pos.tp?pos.tp+'%':'None'} | SL: ${pos.sl?pos.sl+'%':'None'}${pos.source==='bonding'?`\n📊 ${pos.lp}`:''}`;
-          try{await bot.sendPhoto(chatId,pnlChart(pos.sym,p.pct,pos.spent,p.cur),{caption:cap,parse_mode:'Markdown',reply_markup:sellKb});}
-          catch{await bot.sendMessage(chatId,cap,{parse_mode:'Markdown',reply_markup:sellKb});}
-        }else{
-          const cap=`${pos.source==='bonding'?'📊':'⚪'} *${pos.sym}*\nSpent: ${pos.spent} SUI${pos.source==='bonding'?`\n📊 ${pos.lp}`:''}`;
-          await bot.sendMessage(chatId,cap,{parse_mode:'Markdown',reply_markup:sellKb});
+        const p = await getPnl(pos);
+
+        const srcMap   = { bonding:'📊 Launchpad', agent:'🤖 AGENT', odyssey:'🟣 Odyssey', dex:'🔵 DEX' };
+        const srcLabel = srcMap[pos.source] || '🔵 DEX';
+        const dexTag   = pos.source === 'bonding' ? (pos.lp || 'Launchpad')
+                       : pos.source === 'agent'   ? 'AGENT MemeLand'
+                       : pos.source === 'odyssey' ? 'Odyssey'
+                       : 'DEX';
+        const heldH    = pos.at ? Math.round((Date.now() - pos.at) / 3600000) : 0;
+        const heldStr  = heldH >= 24 ? `${Math.floor(heldH/24)}d ${heldH%24}h` : `${heldH}h`;
+        const tokStr   = pos.tokens
+          ? pos.tokens.toLocaleString('en', { maximumFractionDigits: 2 })
+          : '?';
+        const entryStr = (pos.entry || 0).toFixed(8);
+        const spentStr = parseFloat(pos.spent || 0).toFixed(4);
+
+        let cap =
+          `${srcLabel} *${pos.sym}*  ·  ${dexTag}\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `📦 Tokens Held: \`${tokStr} ${pos.sym}\`\n` +
+          `💼 Invested:    \`${spentStr} SUI\`\n` +
+          `📌 Entry Price: \`${entryStr} SUI/${pos.sym}\`\n` +
+          `⏱️ Held For:    ${heldStr}\n`;
+
+        if (p) {
+          const s    = p.pnl >= 0 ? '+' : '';
+          const icon = p.pnl >= 0 ? '🟢' : '🔴';
+          cap +=
+            `\n💰 Current Value: \`${p.cur.toFixed(4)} SUI\`\n` +
+            `${icon} P&L: *${s}${p.pnl.toFixed(4)} SUI  (${s}${p.pct.toFixed(2)}%)*\n` +
+            `${pnlBar(p.pct)}`;
+        } else {
+          cap += `\n⚪ Live price not available`;
         }
-      }catch{await bot.sendMessage(chatId,`⚪ *${pos.sym}* — ${pos.spent} SUI`,{parse_mode:'Markdown'});}
+
+        if (pos.tp || pos.sl) {
+          cap += `\n\n🎯 TP: ${pos.tp ? '+' + pos.tp + '%' : '—'}   🛑 SL: ${pos.sl ? '-' + pos.sl + '%' : '—'}`;
+        }
+
+        const sellKb = { inline_keyboard: [[
+          { text:'💸 25%',    callback_data:`qs:${i}:25`     },
+          { text:'💸 50%',    callback_data:`qs:${i}:50`     },
+          { text:'💸 100%',   callback_data:`qs:${i}:100`    },
+          { text:'✏️ Custom', callback_data:`qs:${i}:custom` },
+        ]]};
+
+        if (p) {
+          try {
+            await bot.sendPhoto(chatId,
+              pnlChart(pos.sym, p.pct, parseFloat(pos.spent || 0), p.cur),
+              { caption: cap, parse_mode:'Markdown', reply_markup: sellKb }
+            );
+          } catch {
+            await bot.sendMessage(chatId, cap, { parse_mode:'Markdown', reply_markup: sellKb });
+          }
+        } else {
+          await bot.sendMessage(chatId, cap, { parse_mode:'Markdown', reply_markup: sellKb });
+        }
+      } catch {
+        const fallback =
+          `⚪ *${pos.sym}*\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `💼 Invested: \`${parseFloat(pos.spent||0).toFixed(4)} SUI\`\n` +
+          `⚪ Live price unavailable`;
+        const sellKb = { inline_keyboard: [[
+          { text:'💸 25%',    callback_data:`qs:${i}:25`     },
+          { text:'💸 50%',    callback_data:`qs:${i}:50`     },
+          { text:'💸 100%',   callback_data:`qs:${i}:100`    },
+          { text:'✏️ Custom', callback_data:`qs:${i}:custom` },
+        ]]};
+        await bot.sendMessage(chatId, fallback, { parse_mode:'Markdown', reply_markup: sellKb });
+      }
     }
   });
 }
@@ -2930,27 +3183,50 @@ bot.on('callback_query', async(q) => {
       return;
     }
 
-    // ── Quick sell from positions (instant, no extra confirm) ─
-    if(data.startsWith('qs:')){
-      const parts=data.split(':');
-      const idx=parseInt(parts[1]), pct=parseInt(parts[2]);
-      const u=getU(chatId); const pos=u?.positions?.[idx];
-      if(!pos){await bot.sendMessage(chatId,'❌ Position not found.');return;}
-      const m=await bot.sendMessage(chatId,`⚡ Selling ${pct}% of ${pos.sym}...`);
-      try{
-        const res=await executeSell(chatId,pos.ct,pct);
-        let sellMsg=`🔴 *Sell Executed!*\n\n🪙 Token: *${res.sym}*\n📤 Sold: ${pct}%\n💰 Received: \`${res.sui} SUI\`\n⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}`;
-        if(res.pnl){
-          const s=res.pnl.pnl>=0?'+':'',icon=res.pnl.pnl>=0?'🟢 PROFIT':'🔴 LOSS';
-          sellMsg+=`\n\n━━━━━━━━━━━━━━\n📊 *P&L Summary*\n${icon}\n\n💼 Invested: \`${res.pnl.spent.toFixed(4)} SUI\`\n💵 Returned: \`${res.sui} SUI\`\n📈 P&L: *${s}${res.pnl.pnl.toFixed(4)} SUI (${s}${res.pnl.pnlPct.toFixed(2)}%)*\n${pnlBar(res.pnl.pnlPct)}`;
+    // ── Quick sell / PnL report from positions ──────────────────────────────
+    if (data.startsWith('qs:')) {
+      const parts = data.split(':');
+
+      // qs:pnl → generate full P&L report
+      if (parts[1] === 'pnl') { await doPositionsPnlReport(chatId); return; }
+
+      const idx = parseInt(parts[1]);
+      const key = parts[2]; // "25" | "50" | "100" | "custom"
+      const u   = getU(chatId);
+      const pos = u?.positions?.[idx];
+      if (!pos) { await bot.sendMessage(chatId, '❌ Position not found. Use /positions to refresh.'); return; }
+
+      // qs:i:custom → prompt for custom sell amount
+      if (key === 'custom') {
+        updU(chatId, { state: 'qs_custom_sell', pd: { ...(u.pd||{}), qsIdx: idx } });
+        await bot.sendMessage(chatId,
+          `✏️ *Custom Sell — ${pos.sym}*\n\n` +
+          `Tokens held: \`${(pos.tokens||0).toLocaleString('en',{maximumFractionDigits:2})} ${pos.sym}\`\n\n` +
+          `Enter sell amount:\n` +
+          `• \`50\` or \`50%\` → sell 50% of position\n` +
+          `• \`1500t\` → sell 1500 tokens exactly\n` +
+          `• Any number > 100 without \`t\` treated as token count`,
+          { parse_mode:'Markdown' }
+        );
+        return;
+      }
+
+      const pct = parseInt(key);
+      if (!pct || pct <= 0 || pct > 100) { await bot.sendMessage(chatId, '❌ Invalid sell %.'); return; }
+
+      const m = await bot.sendMessage(chatId, `⚡ Selling *${pct}%* of *${pos.sym}*...`, { parse_mode:'Markdown' });
+      try {
+        const res = await executeSell(chatId, pos.ct, pct);
+        const sellMsg = formatSellResult(res);
+        await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
+        if (res.pnl) {
+          const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
+          const cap = `${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${pct}% Sell  |  P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  (${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI)`;
+          await bot.sendPhoto(chatId, chartUrl, { caption: cap }).catch(() => {});
         }
-        sellMsg+=`\n\n🔗 [View TX](${SUISCAN}${res.digest})`;
-        await bot.editMessageText(sellMsg,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
-        if(res.pnl){
-          const chartUrl=pnlChart(res.sym,res.pnl.pnlPct,res.pnl.spent,parseFloat(res.sui));
-          await bot.sendPhoto(chatId,chartUrl,{caption:`${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%`}).catch(()=>{});
-        }
-      }catch(e){await bot.editMessageText(`❌ Sell failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:m.message_id});}
+      } catch(e) {
+        await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown' });
+      }
       return;
     }
 
@@ -3004,21 +3280,15 @@ bot.on('callback_query', async(q) => {
       const sc_ct=u.pd.ct, sc_pct=u.pd.pct;
       await bot.editMessageText('⚡ Executing sell...',{chat_id:chatId,message_id:msgId});
       try{
-        const res=await executeSell(chatId,sc_ct,sc_pct);
-        let sellMsg=`🔴 *Sell Executed!*\n\n🪙 Token: *${res.sym}*\n📤 Sold: ${res.pct}%${res.soldAmt?` (~${res.soldAmt.toLocaleString('en',{maximumFractionDigits:2})} ${res.sym})`:''}\n💰 Received: \`${res.sui} SUI\`\n⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}`;
-        if(res.pnl){
-          const s=res.pnl.pnl>=0?'+':'', icon=res.pnl.pnl>=0?'🟢 PROFIT':'🔴 LOSS';
-          sellMsg+=`\n\n━━━━━━━━━━━━━━\n📊 *P&L Summary*\n${icon}\n\n💼 Invested: \`${res.pnl.spent.toFixed(4)} SUI\`\n💵 Returned: \`${res.sui} SUI\`\n📈 P&L: *${s}${res.pnl.pnl.toFixed(4)} SUI (${s}${res.pnl.pnlPct.toFixed(2)}%)*\n${pnlBar(res.pnl.pnlPct)}`;
+        const res = await executeSell(chatId, sc_ct, sc_pct);
+        const sellMsg = formatSellResult(res);
+        await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:msgId, parse_mode:'Markdown', disable_web_page_preview:true });
+        if (res.pnl) {
+          const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
+          const cap = `${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${sc_pct}% Sell  |  P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  (${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI)`;
+          await bot.sendPhoto(chatId, chartUrl, { caption: cap }).catch(() => {});
         }
-        sellMsg+=`\n\n🔗 [View TX](${SUISCAN}${res.digest})`;
-        await bot.editMessageText(sellMsg,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
-        // Send P&L chart image
-        if(res.pnl){
-          const chartUrl=pnlChart(res.sym,res.pnl.pnlPct,res.pnl.spent,parseFloat(res.sui));
-          const cap=`${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${res.pct}% Sell\nP&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  |  ${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI`;
-          await bot.sendPhoto(chatId,chartUrl,{caption:cap}).catch(()=>{});
-        }
-      }catch(e){await bot.editMessageText(`❌ Sell failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:msgId});}
+      }catch(e){await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});}
       updU(chatId,{pd:{}}); return;
     }
 
@@ -3230,6 +3500,48 @@ bot.on('message', async(msg) => {
     const pct=parseFloat(text); if(isNaN(pct)||pct<=0||pct>100){await bot.sendMessage(chatId,'❌ Enter 1-100');return;}
     const ct=u.pd?.ct; if(!ct){await bot.sendMessage(chatId,'❌ Session expired.');return;}
     updU(chatId,{pd:{...u.pd,pct}}); await showSellConfirm(chatId,ct,pct,null); return;
+  }
+
+  // qs_custom_sell — custom sell amount from positions panel
+  if (state === 'qs_custom_sell') {
+    updU(chatId, { state: null });
+    const posIdx = u.pd?.qsIdx;
+    if (posIdx === undefined || posIdx === null) { await bot.sendMessage(chatId, '❌ Session expired.'); return; }
+    const pos = (getU(chatId)?.positions || [])[posIdx];
+    if (!pos) { await bot.sendMessage(chatId, '❌ Position not found.'); return; }
+
+    // Parse: "50" or "50%" → percent; "1500t" or num > 100 → token amount
+    const raw    = text.trim();
+    const isPct  = raw.endsWith('%');
+    const isTok  = raw.toLowerCase().endsWith('t') || raw.toLowerCase().endsWith('tok');
+    const numStr = raw.replace(/%|tok?$/i, '').trim();
+    const val    = parseFloat(numStr);
+    if (isNaN(val) || val <= 0) { await bot.sendMessage(chatId, '❌ Invalid input. Example: `50`, `50%`, `1500t`', { parse_mode:'Markdown' }); return; }
+
+    let pct;
+    if (isPct || (!isTok && val <= 100)) {
+      pct = Math.min(100, Math.max(1, Math.round(val)));
+    } else {
+      // token amount → convert to %
+      const totalTok = pos.tokens || 0;
+      if (!totalTok) { await bot.sendMessage(chatId, '❌ No token count in position — use % instead.'); return; }
+      pct = Math.min(100, Math.max(1, Math.round((val / totalTok) * 100)));
+    }
+
+    const m = await bot.sendMessage(chatId, `⚡ Selling *${pct}%* of *${pos.sym}*...`, { parse_mode:'Markdown' });
+    try {
+      const res = await executeSell(chatId, pos.ct, pct);
+      const sellMsg = formatSellResult(res);
+      await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
+      if (res.pnl) {
+        const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
+        const cap = `${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${pct}% Sell  |  P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  (${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI)`;
+        await bot.sendPhoto(chatId, chartUrl, { caption: cap }).catch(() => {});
+      }
+    } catch(e) {
+      await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown' });
+    }
+    return;
   }
 
   if(state==='edit_amts'){
