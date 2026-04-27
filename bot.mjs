@@ -365,17 +365,20 @@ async function findCetusPool(coinA, coinB) {
     if (r.ok) {
       const d = await r.json();
       const pools = d.data?.list || [];
-      // Filter only SUI pools
-      const suiPools = pools.filter(p =>
-        (p.coin_type_a||'').toLowerCase() === SUI_T.toLowerCase() ||
-        (p.coin_type_b||'').toLowerCase() === SUI_T.toLowerCase()
+      // Bug fix: old code filtered to SUI-only pools, which dropped AGENT-paired pools
+      // when detectState step 4b calls findCetusPool(AGENT_T, ct).
+      // Now filter to pools that contain coinA (the requested "other side" coin).
+      const coinANorm = coinA.toLowerCase();
+      const matched = pools.filter(p =>
+        (p.coin_type_a||'').toLowerCase() === coinANorm ||
+        (p.coin_type_b||'').toLowerCase() === coinANorm
       );
-      if (suiPools.length) {
-        const best = suiPools[0];
+      if (matched.length) {
+        const best = matched[0];
         const poolId = best.pool_address || best.id;
         const actualA = best.coin_type_a;
         const actualB = best.coin_type_b;
-        const a2b = (actualA||'').toLowerCase() === SUI_T.toLowerCase();
+        const a2b = (actualA||'').toLowerCase() === coinA.toLowerCase();
         return { poolId, coinA:actualA, coinB:actualB, a2b, liq:parseFloat(best.tvl||0), dex:'cetus' };
       }
     }
@@ -837,6 +840,18 @@ async function detectState(ct) {
     }
   } catch {}
 
+  // 4b. AGENT MemeLand — AGENT/TOKEN Cetus pool (2-hop sell: MEME→AGENT→SUI)
+  // Tokens launched on AGENT MemeLand pair against AGENT, not SUI.
+  // detectState must recognise them as 'agent_cetus' so executeSell can route
+  // them through the existing 2-hop logic (mirrors _agentSellCA).
+  try {
+    const agentPool = await findCetusPool(AGENT_T, ct);
+    if (agentPool) {
+      const res = { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...agentPool, ts:Date.now() };
+      stateCache.set(ct, res); return res;
+    }
+  } catch {}
+
   // 5. GeckoTerminal — find pool address, then query Sui RPC for pool type.
   //    Uses shared geckoCache — no duplicate HTTP calls, no 429 rate limits.
   //    Checks ALL pools from ALL address variants before giving up.
@@ -877,6 +892,9 @@ async function detectState(ct) {
                         coinBl === SUI_NORM || coinBl.endsWith('::sui::sui');
         const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
 
+        const AGENT_NORM = AGENT_T.toLowerCase();
+        const hasAgent = coinAl === AGENT_NORM || coinBl === AGENT_NORM;
+
         if (!hasSui && hasPans && poolInfo.dex === 'cetus') {
           // TOKEN/PANS pool on Cetus — look for SUI/PANS hop pool via GeckoTerminal-resilient helper
           try {
@@ -892,6 +910,12 @@ async function detectState(ct) {
             }
           } catch {}
           continue;
+        }
+
+        // AGENT MemeLand token — TOKEN/AGENT Cetus pool (2-hop sell: MEME→AGENT→SUI)
+        if (!hasSui && hasAgent && poolInfo.dex === 'cetus') {
+          const res = { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...poolInfo, liq, ts: Date.now() };
+          stateCache.set(ct, res); return res;
         }
 
         if (!hasSui) continue;
@@ -1569,6 +1593,32 @@ async function executeSell(chatId, ct, pct) {
   if (sellAmt === 0n) throw new Error('Sell amount is zero.');
 
   const refWallet = resolveRefWallet(u);
+
+  // ── Early-exit: Odyssey bonding-curve token (not yet graduated) ──────────
+  // Before running detectState (which only scans DEX pools), check if this is
+  // a live Odyssey bonding-curve token — same guard as the buy flow.
+  // If detected and not completed, route to buildOdysseySellTx directly.
+  // Bug fix: only the isOdysseyToken() API lookup is wrapped in a non-fatal
+  // try/catch. The sell execution itself throws normally so errors aren't swallowed.
+  let _odyInfo = null;
+  try { _odyInfo = await isOdysseyToken(ct); } catch { /* API lookup failure — fall through */ }
+  if (_odyInfo && !_odyInfo.isCompleted && _odyInfo.moonbagsPackageId) {
+    const coins   = await sui.getCoins({ owner: u.walletAddress, coinType: ct });
+    const coinIds = (coins.data || []).map(c => c.coinObjectId);
+    if (!coinIds.length) throw new Error(`No ${sym} coin objects to sell on Odyssey`);
+    const tx = await buildOdysseySellTx({
+      suiClient: sui, walletAddress: u.walletAddress,
+      packageId: _odyInfo.moonbagsPackageId, coinType: ct,
+      tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
+    });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
+    const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+    const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    updatePositionAfterSell(chatId, ct, pct);
+    return { digest:res.digest, feeSui:'N/A', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct };
+  }
+
   const st = await detectState(ct);
 
   if (st.state === 'cetus') {
@@ -1744,7 +1794,96 @@ async function executeSell(chatId, ct, pct) {
     return { digest:res2.digest, feeSui:fSui(feeMist), route:'Cetus CLMM (TOKEN→PANS→SUI)', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9) };
   }
 
-  // Last resort: force-find Cetus pool
+  // ── AGENT MemeLand — 2-hop MEME → AGENT → SUI via Cetus ─────────────────
+  // Triggered when detectState returns 'agent_cetus' (AGENT-paired Cetus pool).
+  // Also triggered here as a safety net if detectState returned 'unknown' but
+  // the user's position has source='agent' (bought via the launchpad flow).
+  // Mirrors _agentSellCA but feeds the result back to executeSell callers.
+  if (st.state === 'agent_cetus' ||
+      (st.state === 'unknown' && (u.positions||[]).find(p => p.ct === ct && p.source === 'agent'))) {
+    // Re-read pool type fresh from chain to get correct coin orientation
+    // (st may have been populated from cache or from the position source check)
+    let tokenPoolId = st.poolId || null;
+    let poolCoinA   = st.coinA  || null;
+    let poolCoinB   = st.coinB  || null;
+
+    // If detectState didn't give us a poolId (unknown-state path), query the API
+    if (!tokenPoolId) {
+      try {
+        const ap = await findCetusPool(AGENT_T, ct);
+        if (ap) { tokenPoolId = ap.poolId; poolCoinA = ap.coinA; poolCoinB = ap.coinB; }
+      } catch {}
+    }
+    if (!tokenPoolId) throw new Error(`No AGENT-paired pool found for ${sym}. Cannot execute 2-hop sell.`);
+
+    // Re-read pool object to confirm exact coin orientation
+    try {
+      const obj = await sui.getObject({ id: tokenPoolId, options:{ showType:true } });
+      const args = obj.data?.type?.match(/<(.+)>$/)?.[1]?.split(/,\s*/).map(s=>s.trim());
+      if (args && args.length === 2) { poolCoinA = args[0]; poolCoinB = args[1]; }
+    } catch {}
+
+    const memeIsA = (poolCoinA||'').toLowerCase() === ct.toLowerCase();
+    const a2b1    = memeIsA; // MEME is INPUT; if MEME=coinA → swap_a2b (a2b=true) else swap_b2a (a2b=false)
+
+    // Hop 1: MEME → AGENT
+    const tx1 = await buildCetusSwapTx({
+      wallet: u.walletAddress, poolId: tokenPoolId,
+      coinA: poolCoinA, coinB: poolCoinB, a2b: a2b1,
+      coinInType: ct, amountIn: sellAmt.toString(), minAmountOut: '0',
+    });
+    const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
+    if (res1.effects?.status?.status !== 'success') throw new Error('AGENT sell hop1 (MEME→AGENT): ' + (res1.effects?.status?.error || 'TX failed'));
+
+    const agentGot = await getActualDelta(res1.balanceChanges || res1.digest, AGENT_T, u.walletAddress);
+    if (!agentGot || agentGot <= 0n) throw new Error('AGENT sell hop1 returned 0 AGENT');
+
+    await new Promise(r => setTimeout(r, 800));
+
+    // Hop 2: AGENT → SUI  (SUI_AGENT_POOL: coinA=AGENT, coinB=SUI; a2b=true → swap_a2b)
+    const tx2 = await buildCetusSwapTx({
+      wallet: u.walletAddress, poolId: SUI_AGENT_POOL,
+      coinA: AGENT_T, coinB: SUI_T, a2b: true,
+      coinInType: AGENT_T, amountIn: agentGot.toString(), minAmountOut: '0',
+    });
+    const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
+    if (res2.effects?.status?.status !== 'success') throw new Error('AGENT sell hop2 (AGENT→SUI): ' + (res2.effects?.status?.error || 'TX failed'));
+
+    const suiDelta = await getActualDelta(res2.balanceChanges || res2.digest, SUI_T, u.walletAddress);
+    const suiR = suiDelta && suiDelta > 0n ? Number(suiDelta)/1e9 : 0;
+    let feeMist2 = 0n;
+    try { feeMist2 = await postSellFee(kp, u, suiR); } catch (e) { console.error('AGENT executeSell postSellFee:', e?.message||e); }
+    const pnlD2 = computeSellPnl(chatId, ct, pct, suiR, Number(feeMist2)/1e9);
+    updatePositionAfterSell(chatId, ct, pct);
+    return { digest:res2.digest, feeSui:fSui(feeMist2), route:'Cetus (MEME→AGENT→SUI)', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD2, soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9) };
+  }
+
+  // ── Odyssey bonding-curve sell (fallback) ────────────────────────────────
+  // Defensive fallback: if detectState returned 'unknown' AND the early-exit
+  // above didn't catch it (e.g. isOdysseyToken API was down on first call),
+  // try again. Bug fix: same pattern as above — only the API lookup is non-fatal.
+  if (st.state === 'unknown') {
+    let _odyFallback = null;
+    try { _odyFallback = await isOdysseyToken(ct); } catch { /* API down — continue */ }
+    if (_odyFallback && !_odyFallback.isCompleted && _odyFallback.moonbagsPackageId) {
+      const coins   = await sui.getCoins({ owner: u.walletAddress, coinType: ct });
+      const coinIds = (coins.data || []).map(c => c.coinObjectId);
+      if (!coinIds.length) throw new Error(`No ${sym} coin objects to sell on Odyssey`);
+      const tx = await buildOdysseySellTx({
+        suiClient: sui, walletAddress: u.walletAddress,
+        packageId: _odyFallback.moonbagsPackageId, coinType: ct,
+        tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
+      });
+      const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
+      if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
+      const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+      const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+      updatePositionAfterSell(chatId, ct, pct);
+      return { digest:res.digest, feeSui:'N/A', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct };
+    }
+  }
+
+  // Last resort: force-find Cetus SUI-paired pool
   const pool = await findCetusPool(ct, SUI_T);
   if (pool) {
     const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType:ct, amountIn:sellAmt.toString(), minAmountOut:'0' });
@@ -3445,7 +3584,9 @@ async function _showOdyByCA(chatId, ct, info) {
   };
   updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), odyCA: tok } });
   const sym  = tok.symbol;
-  const prog = (tok.progress != null) ? `${(Number(tok.progress)*100).toFixed(2)}%` : 'n/a';
+  // Bug fix: API returns progress as 0-100 (percentage), NOT 0-1 (fraction).
+  // Old code did *100 which would show "7500%" instead of "75%".
+  const prog = (tok.progress != null) ? `${Number(tok.progress).toFixed(1)}%` : 'n/a';
   const txt =
     `🟣 *${sym}*  (Odyssey bonding curve, SUI-paired)\n` +
     `\`${ct.slice(0,46)}…\`\n\n` +
