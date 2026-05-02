@@ -50,11 +50,15 @@ import { createClient }                                              from 'redis
 
 // ─── Launchpad integration: AGENT (MemeLand) + Odyssey moonbags ──
 import {
-  AGENT_BACKEND_URL, ODYSSEY_API_URL,
+  AGENT_BACKEND_URL, ODYSSEY_API_URL, MOONBAGS_API_URL,
   fetchAllLaunchpadTokens,
   buildOdysseyBuyTx, buildOdysseySellTx,
   isOdysseyToken,
   fetchAgentTokenByCoinType,
+  // NEW (moonbags.io):
+  buildMoonbagsBuyTx, buildMoonbagsSellTx,
+  isMoonbagsToken,
+  fetchMoonbagsCoin,
 } from './agent-launchpads.mjs';
 
 // ═══════════════════════════════════════════════════════════
@@ -1622,6 +1626,27 @@ async function executeSell(chatId, ct, pct) {
     return { digest:res.digest, feeSui:'0', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt };
   }
 
+  // ── Early-exit: Moonbags bonding-curve token (not yet graduated) ─────────
+  let _mbInfo = null;
+  try { _mbInfo = await isMoonbagsToken(ct); } catch { /* API down — fall through */ }
+  if (_mbInfo && !_mbInfo.isCompleted) {
+    const coins   = await sui.getCoins({ owner: u.walletAddress, coinType: ct });
+    const coinIds = (coins.data || []).map(c => c.coinObjectId);
+    if (!coinIds.length) throw new Error(`No ${sym} coin objects to sell on Moonbags`);
+    const tx = await buildMoonbagsSellTx({
+      walletAddress: u.walletAddress, coinType: ct,
+      tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
+    });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Moonbags sell TX failed');
+    const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+    const suiR    = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    const soldAmt = Number(sellAmt) / Math.pow(10, meta.decimals || 9);
+    const pnlD    = computeSellPnl(chatId, ct, pct, suiR, 0);
+    updatePositionAfterSell(chatId, ct, pct);
+    return { digest:res.digest, feeSui:'0', route:'Moonbags bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt };
+  }
+
   const st = await detectState(ct);
 
   if (st.state === 'cetus') {
@@ -1961,6 +1986,26 @@ async function executeSell(chatId, ct, pct) {
       const pnlD    = computeSellPnl(chatId, ct, pct, suiR, 0);
       updatePositionAfterSell(chatId, ct, pct);
       return { digest:res.digest, feeSui:'0', route:'Odyssey bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt };
+    }
+    // Moonbags fallback (mirrors Odyssey fallback above)
+    let _mbFallback = null;
+    try { _mbFallback = await isMoonbagsToken(ct); } catch { /* API down */ }
+    if (_mbFallback && !_mbFallback.isCompleted) {
+      const coins   = await sui.getCoins({ owner: u.walletAddress, coinType: ct });
+      const coinIds = (coins.data || []).map(c => c.coinObjectId);
+      if (!coinIds.length) throw new Error(`No ${sym} coin objects to sell on Moonbags`);
+      const tx = await buildMoonbagsSellTx({
+        walletAddress: u.walletAddress, coinType: ct,
+        tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
+      });
+      const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
+      if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Moonbags sell TX failed');
+      const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+      const suiR    = sd && sd > 0n ? Number(sd)/1e9 : 0;
+      const soldAmt = Number(sellAmt) / Math.pow(10, meta.decimals || 9);
+      const pnlD    = computeSellPnl(chatId, ct, pct, suiR, 0);
+      updatePositionAfterSell(chatId, ct, pct);
+      return { digest:res.digest, feeSui:'0', route:'Moonbags bonding curve', sui:suiR>0?suiR.toFixed(4):'?', sym, pct, pnl:pnlD, soldAmt };
     }
   }
 
@@ -3475,6 +3520,13 @@ bot.on('message', async(msg) => {
         return;
       }
     } catch { /* ignore detect errors, fall through */ }
+    try {
+      const mb = await isMoonbagsToken(ct);
+      if (mb && !mb.isCompleted) {
+        await _showMbByCA(chatId, ct, mb);
+        return;
+      }
+    } catch { /* ignore detect errors, fall through */ }
     await guard(chatId,async()=>startBuy(chatId,ct)); return;
   }
 
@@ -3489,6 +3541,13 @@ bot.on('message', async(msg) => {
       const ody = await isOdysseyToken(ct);
       if (ody && !ody.isCompleted && (ody.pairType||'SUI') === 'SUI') {
         await _showOdyByCA(chatId, ct, ody);
+        return;
+      }
+    } catch { /* ignore detect errors, fall through */ }
+    try {
+      const mb = await isMoonbagsToken(ct);
+      if (mb && !mb.isCompleted) {
+        await _showMbByCA(chatId, ct, mb);
         return;
       }
     } catch { /* ignore detect errors, fall through */ }
@@ -3862,9 +3921,10 @@ async function doLaunchpadMenu(chatId) {
   await bot.sendMessage(chatId,
     '🚀 *Launchpad Hub*\n\nChoose a launchpad to browse fresh tokens:',
     { parse_mode:'Markdown', reply_markup:{ inline_keyboard:[
-      [{text:'🟢 AGENT MemeLand', callback_data:'lp:agent'}],
-      [{text:'🟣 Odyssey (theodyssey.fun)', callback_data:'lp:ody'}],
-      [{text:'🔄 Refresh both', callback_data:'lp:refresh'}],
+      [{text:'🟢 AGENT MemeLand',           callback_data:'lp:agent'}],
+      [{text:'🟣 Odyssey (theodyssey.fun)',  callback_data:'lp:ody'  }],
+      [{text:'🟠 Moonbags (moonbags.io)',    callback_data:'lp:mb'   }],
+      [{text:'🔄 Refresh all',               callback_data:'lp:refresh'}],
     ]}});
 }
 
@@ -4338,6 +4398,181 @@ async function _agentSellCA(chatId, msgId, pct) {
   }
 }
 
+// ── Moonbags (moonbags.io) launchpad UI ────────────────────────────
+async function _showMbList(chatId, msgId) {
+  const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching Moonbags tokens...');
+  try {
+    const { moonbags } = await _getLaunchpadTokens();
+    if (!moonbags.length) {
+      const txt = '🟠 *Moonbags*\n\nNo bonding-curve tokens available right now.';
+      const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
+      if (msgId) await bot.editMessageText(txt,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:kb});
+      else await bot.editMessageText(txt,{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown',reply_markup:kb});
+      return;
+    }
+    const lines = moonbags.slice(0,10).map((t,i)=>_fmtToken(t,i)).join('\n\n');
+    const txt = `🟠 *Moonbags* — ${moonbags.length} on bonding curve\n\n${lines}\n\n_Tap a token to buy/sell on the curve:_`;
+    const rows = moonbags.slice(0,10).map((t,i)=>([{text:`${i+1}. ${(t.symbol||'?').slice(0,8)}`, callback_data:`lp:mbpick:${i}`}]));
+    rows.push([{text:'🔄 Refresh', callback_data:'lp:mb'},{text:'⬅️ Back', callback_data:'lp:menu'}]);
+    const opts = { parse_mode:'Markdown', reply_markup:{ inline_keyboard:rows } };
+    if (msgId) await bot.editMessageText(txt,{chat_id:chatId,message_id:msgId,...opts});
+    else await bot.editMessageText(txt,{chat_id:chatId,message_id:m.message_id,...opts});
+  } catch(e) {
+    const txt = `❌ Couldn't load Moonbags tokens: ${(e.message||'').slice(0,140)}`;
+    if (m) await bot.editMessageText(txt,{chat_id:chatId,message_id:m.message_id});
+    else await bot.sendMessage(chatId, txt);
+  }
+}
+
+async function _showMbByCA(chatId, ct, info) {
+  const tok = {
+    coinType: ct,
+    symbol: info.symbol || (ct.split('::').pop() || '?'),
+    pairType: 'SUI',
+    progress: info.progress ?? null,
+    isCompleted: !!info.isCompleted,
+    source: 'Moonbags',
+  };
+  updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), mbCA: tok } });
+  const sym  = tok.symbol;
+  const prog = (tok.progress != null) ? `${Number(tok.progress).toFixed(1)}%` : 'n/a';
+  const txt =
+    `🟠 *${sym}*  (Moonbags bonding curve, SUI-paired)\n` +
+    `\`${ct.slice(0,46)}…\`\n\n` +
+    `Curve progress: *${prog}*\n\n` +
+    `_Pick a buy size:_`;
+  const rows = [
+    [{text:'💰 0.1 SUI', callback_data:'lp:mbbuyca:0.1'}, {text:'💰 0.5 SUI', callback_data:'lp:mbbuyca:0.5'}],
+    [{text:'💰 1 SUI',   callback_data:'lp:mbbuyca:1'  }, {text:'💰 5 SUI',   callback_data:'lp:mbbuyca:5'  }],
+    [{text:'💸 Sell 25%', callback_data:'lp:mbsellca:25'}, {text:'💸 Sell 100%', callback_data:'lp:mbsellca:100'}],
+    [{text:'⬅️ Back', callback_data:'lp:menu'}],
+  ];
+  await bot.sendMessage(chatId, txt, {parse_mode:'Markdown', reply_markup:{inline_keyboard:rows}});
+}
+
+async function _showMbToken(chatId, msgId, idx) {
+  const { moonbags } = await _getLaunchpadTokens();
+  const t = moonbags[idx];
+  if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
+  const sym = t.symbol || '?';
+  const mc  = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
+  const prog= t.progress != null ? `${Math.round(t.progress)}%` : 'n/a';
+  const ct  = (t.coinType || '').slice(0,46);
+  const txt = `🟠 *${sym}* — ${t.name||''}\n\nMCAP: ${mc}\nBonding: ${prog}\nCA: \`${ct}...\`\n\nChoose buy amount (SUI):`;
+  const kb = { inline_keyboard:[
+    [{text:'0.1', callback_data:`lp:mbbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:mbbuy:${idx}:0.5`}],
+    [{text:'1',   callback_data:`lp:mbbuy:${idx}:1`  },{text:'2',   callback_data:`lp:mbbuy:${idx}:2`  }],
+    [{text:'5',   callback_data:`lp:mbbuy:${idx}:5`  },{text:'10',  callback_data:`lp:mbbuy:${idx}:10` }],
+    [{text:'📤 Sell 25%', callback_data:`lp:mbsell:${idx}:25`},{text:'Sell 50%', callback_data:`lp:mbsell:${idx}:50`},{text:'Sell 100%', callback_data:`lp:mbsell:${idx}:100`}],
+    [{text:'⬅️ Back', callback_data:'lp:mb'}],
+  ]};
+  await bot.editMessageText(txt,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:kb});
+}
+
+async function _mbBuyCommon(chatId, msgId, t, amtSui, backCb) {
+  const u = getU(chatId);
+  if (!u || !u.encryptedKey) { await bot.editMessageText('❌ No wallet. Use /start first.', {chat_id:chatId,message_id:msgId}); return; }
+  if (t.isCompleted) {
+    await bot.editMessageText(
+      `ℹ️ *${t.symbol}* has graduated off the moonbags curve.\n\nUse the regular *💰 Buy* with the CA — it now trades on Cetus.`,
+      {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:backCb}]]}});
+    return;
+  }
+  await bot.editMessageText(`⏳ Buying ${amtSui} SUI of *${t.symbol}* on Moonbags...`,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+  try {
+    const kp = getKP(u);
+    const amtMist = BigInt(Math.floor(parseFloat(amtSui) * Number(MIST)));
+    const slipBps = BigInt(Math.floor((u.settings?.slippage ?? 5) * 100));
+    const tx = await buildMoonbagsBuyTx({
+      suiClient: sui, walletAddress: u.walletAddress,
+      coinType: t.coinType, amountInMist: amtMist, slippageBps: slipBps,
+    });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
+    const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'moonbags', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    await bot.editMessageText(
+      `✅ *Bought ${t.symbol}* on Moonbags\n\n` +
+      `💰 Spent:    ${amtSui} SUI\n` +
+      `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\n\n` +
+      `🔗 [View TX](${SUISCAN}${res.digest})`,
+      {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:backCb}]]}});
+  } catch(e) {
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ Buy failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:backCb}]]}});
+  }
+}
+
+async function _mbSellCommon(chatId, msgId, t, pct, backCb) {
+  const u = getU(chatId);
+  if (!u || !u.encryptedKey) { await bot.editMessageText('❌ No wallet.', {chat_id:chatId,message_id:msgId}); return; }
+  await bot.editMessageText(`⏳ Selling ${pct}% of *${t.symbol}*...`,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+  try {
+    const bal = await sui.getBalance({ owner: u.walletAddress, coinType: t.coinType });
+    const total = BigInt(bal.totalBalance || 0);
+    if (total === 0n) throw new Error('No balance');
+    const sellAmt = (total * BigInt(pct)) / 100n;
+    const coins = await sui.getCoins({ owner: u.walletAddress, coinType: t.coinType });
+    const coinIds = (coins.data || []).map(c => c.coinObjectId);
+    if (!coinIds.length) throw new Error('No coin objects to sell');
+    const kp = getKP(u);
+    const tx = await buildMoonbagsSellTx({
+      walletAddress: u.walletAddress, coinType: t.coinType,
+      tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
+    });
+    const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
+    if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
+    const meta = await getMeta(t.coinType) || {};
+    const dec  = meta.decimals || 9;
+    const sold = Number(sellAmt)/Math.pow(10, dec);
+    const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
+    const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    if (u.positions) {
+      const pos = u.positions.find(p => p.ct === t.coinType);
+      if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
+    }
+    await bot.editMessageText(
+      `✅ *Sold ${pct}% of ${t.symbol}* on Moonbags\n\n` +
+      `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${t.symbol}\n` +
+      `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n\n` +
+      `🔗 [View TX](${SUISCAN}${res.digest})`,
+      {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:backCb}]]}});
+  } catch(e) {
+    const msg = String(e?.message || e || 'unknown error');
+    await bot.editMessageText(`❌ Sell failed:\n\`${msg.slice(0,500)}\``,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:backCb}]]}});
+  }
+}
+
+async function _mbBuy(chatId, msgId, idx, amtSui) {
+  const { moonbags } = await _getLaunchpadTokens();
+  const t = moonbags[idx];
+  if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  return _mbBuyCommon(chatId, msgId, t, amtSui, `lp:mbpick:${idx}`);
+}
+async function _mbSell(chatId, msgId, idx, pct) {
+  const { moonbags } = await _getLaunchpadTokens();
+  const t = moonbags[idx];
+  if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  return _mbSellCommon(chatId, msgId, t, pct, `lp:mbpick:${idx}`);
+}
+async function _mbBuyCA(chatId, msgId, amtSui) {
+  const u = getU(chatId);
+  const t = u?.pd?.mbCA;
+  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const m = await bot.sendMessage(chatId, `⏳ Buying ${amtSui} SUI of *${t.symbol}* on Moonbags...`, {parse_mode:'Markdown'});
+  return _mbBuyCommon(chatId, m.message_id, t, amtSui, 'lp:menu');
+}
+async function _mbSellCA(chatId, msgId, pct) {
+  const u = getU(chatId);
+  const t = u?.pd?.mbCA;
+  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const m = await bot.sendMessage(chatId, `⏳ Selling ${pct}% of *${t.symbol}*...`, {parse_mode:'Markdown'});
+  return _mbSellCommon(chatId, m.message_id, t, pct, 'lp:menu');
+}
+
 bot.onText(/\/launchpad/, async(msg)=>doLaunchpadMenu(msg.chat.id));
 
 bot.on('callback_query', async(q)=>{
@@ -4365,6 +4600,12 @@ bot.on('callback_query', async(q)=>{
     }
     if (parts[1] === 'agbuyca')  return _agentBuyCA(chatId, msgId, parts[2]);
     if (parts[1] === 'agsellca') return _agentSellCA(chatId, msgId, parseInt(parts[2],10));
+    if (parts[1] === 'mb')        return _showMbList(chatId, msgId);
+    if (parts[1] === 'mbpick')    return _showMbToken(chatId, msgId, parseInt(parts[2],10));
+    if (parts[1] === 'mbbuy')     return _mbBuy(chatId, msgId, parseInt(parts[2],10), parts[3]);
+    if (parts[1] === 'mbsell')    return _mbSell(chatId, msgId, parseInt(parts[2],10), parseInt(parts[3],10));
+    if (parts[1] === 'mbbuyca')   return _mbBuyCA(chatId, msgId, parts[2]);
+    if (parts[1] === 'mbsellca')  return _mbSellCA(chatId, msgId, parseInt(parts[2],10));
   } catch(e) {
     await bot.sendMessage(chatId, `❌ Launchpad error: ${(e.message||'').slice(0,140)}`).catch(()=>{});
   }
