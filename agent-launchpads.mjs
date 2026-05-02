@@ -639,25 +639,379 @@ export async function executeMoonbagsSell({
 }
 
 // ════════════════════════════════════════════════════════════════
+// 4. HOP.FUN — bonding curve via package 0x3b2612ad…  (NEW v7.4)
+// ════════════════════════════════════════════════════════════════
+// Reverse-engineered from on-chain inspection (verified May 2026):
+//   • Curve package:   0x3b2612ad888338fb054bd485513095646a0c113b2d491fcc6feba46db0967aa3
+//   • Events package:  0x4cf881ad2ba05c0eb54b599897b3606b438b10136f5a6eb52d56781ef5d6f37e
+//   • HopConfig:       0x1e9e187c0877b6cf059370259b24ac6a7733961f69dfbdc8ffd808815521b377
+//   • DynamicFee:      0x3bc5dd26cb2e4215623d4c0fd51376bf660c119d0a57b2e0db0b7294e46c26ca
+//   • LaunchConfig:    0xbb8d6f6e4f6a3b11965dc4c3aa487f0d3b98a6f458f2a98b00fab05fc34c0297
+//   • Reference BUY:   32LRmG6QnM3VWfEphRMrM3S7r2yqczLTrMpEKCp3tw8M
+//   • Reference SELL:  BzcP6HSSUAv7Asbm9ZRjyKNyCVY8JsEYCfXwK9HZ1wTj
+//
+//   Buy fn:   curve::buy<T>(
+//               &HopConfig,
+//               &DynamicFee,
+//               &mut BondingCurve<T>,
+//               &LaunchConfig,
+//               Coin<SUI>,
+//               min_amount_out: u64,
+//               &mut TxContext,
+//             )
+//   Sell fn:  curve::sell<T>(
+//               &mut BondingCurve<T>,
+//               &LaunchConfig,
+//               Coin<T>,
+//               min_sui_out:    u64,
+//               &mut TxContext,
+//             )
+//
+// Per-token state (reserves) lives on the BondingCurve<T> shared object.
+// We discover curve_id by paginating BondingCurveCreated events and
+// matching the curve object's type parameter to the wanted coin type.
+// ════════════════════════════════════════════════════════════════
+
+export const HOPFUN_PKG          = '0x3b2612ad888338fb054bd485513095646a0c113b2d491fcc6feba46db0967aa3';
+export const HOPFUN_CONFIG       = '0x1e9e187c0877b6cf059370259b24ac6a7733961f69dfbdc8ffd808815521b377';
+export const HOPFUN_DYNAMIC_FEE  = '0x3bc5dd26cb2e4215623d4c0fd51376bf660c119d0a57b2e0db0b7294e46c26ca';
+export const HOPFUN_LAUNCH_CFG   = '0xbb8d6f6e4f6a3b11965dc4c3aa487f0d3b98a6f458f2a98b00fab05fc34c0297';
+export const HOPFUN_EVENTS_PKG   = '0x4cf881ad2ba05c0eb54b599897b3606b438b10136f5a6eb52d56781ef5d6f37e';
+
+// Total fee on input: 0.70% swap_fee_bps + 0.20% creator_fee_bps = 0.90%
+// (read from LaunchConfig fields — matches actual on-chain trade event).
+const HOPFUN_FEE_BPS = 90n;
+
+// In-process resolver: coinType -> { curveId, ts }.
+const _hfCurveCache = new Map();
+const HF_CURVE_TTL_MS = 6 * 60 * 60 * 1000;
+const HF_PAGE_SIZE   = 50;
+const HF_MAX_PAGES   = 6;
+
+function _hfCanon(t) { return (t || '').replace(/^0x0*/, '0x'); }
+
+async function _hfScanPage(suiClient, cursor) {
+  const page = await suiClient.queryEvents({
+    query: { MoveEventType: `${HOPFUN_EVENTS_PKG}::events::BondingCurveCreated` },
+    cursor, limit: HF_PAGE_SIZE, order: 'descending',
+  });
+  const ids = (page.data || [])
+    .map(e => e.parsedJson?.curve_id)
+    .filter(Boolean);
+  if (!ids.length) return { entries: [], next: page.nextCursor, hasNext: page.hasNextPage };
+  // Batch-fetch curve objects to extract their coin type from the type param.
+  const objs = await suiClient.multiGetObjects({
+    ids,
+    options: { showType: true, showContent: true },
+  });
+  const entries = objs.map((o, i) => {
+    const m = (o?.data?.type || '').match(/BondingCurve<(.+)>$/);
+    if (!m) return null;
+    const coinType = m[1];
+    const f = o?.data?.content?.fields || {};
+    return {
+      curveId: ids[i],
+      coinType,
+      isOpen: f.open === true,
+      virtualSuiReserves:    BigInt(f.virtual_sui_amount || 0) + BigInt(f.sui_balance || 0),
+      virtualTokenReserves:  BigInt(f.token_balance || 0),
+      availableTokenReserves:BigInt(f.available_token_reserves || 0),
+      totalSupply:           BigInt(f.total_supply || 0),
+      creator:               f.creator || null,
+      creatorFees:           BigInt(f.creator_fees || 0),
+    };
+  }).filter(Boolean);
+  // Side-effect: warm the curveId cache for everything we just scanned.
+  for (const e of entries) {
+    _hfCurveCache.set(e.coinType, { curveId: e.curveId, ts: Date.now() });
+  }
+  return { entries, next: page.nextCursor, hasNext: page.hasNextPage };
+}
+
+export async function resolveHopFunCurveId(suiClient, coinType) {
+  if (!suiClient || !coinType) return null;
+  const ck = _hfCanon(coinType);
+  const cached = _hfCurveCache.get(coinType) || _hfCurveCache.get(ck);
+  if (cached && Date.now() - cached.ts < HF_CURVE_TTL_MS) return cached.curveId;
+
+  let cursor = null;
+  for (let i = 0; i < HF_MAX_PAGES; i++) {
+    const { entries, next, hasNext } = await _hfScanPage(suiClient, cursor);
+    for (const e of entries) {
+      if (_hfCanon(e.coinType) === ck) return e.curveId;
+    }
+    if (!hasNext) break;
+    cursor = next;
+  }
+  return null;
+}
+
+export async function fetchHopFunCoin(suiClient, coinType) {
+  if (!suiClient || !coinType) return null;
+  const curveId = await resolveHopFunCurveId(suiClient, coinType);
+  if (!curveId) return null;
+  const obj = await suiClient.getObject({
+    id: curveId,
+    options: { showContent: true, showType: true },
+  }).catch(() => null);
+  const f = obj?.data?.content?.fields || {};
+  if (!f.id) return null;
+  return {
+    coinType,
+    symbol: (coinType.split('::').pop() || '').slice(0, 12),
+    curveId,
+    isOpen: f.open === true,
+    isCompleted: f.open !== true,
+    virtualSuiReserves:   BigInt(f.virtual_sui_amount || 0) + BigInt(f.sui_balance || 0),
+    virtualTokenReserves: BigInt(f.token_balance || 0),
+    availableTokenReserves: BigInt(f.available_token_reserves || 0),
+    totalSupply: BigInt(f.total_supply || 0),
+    creatorFees: BigInt(f.creator_fees || 0),
+    pairType: 'SUI',
+    source: 'hop.fun',
+  };
+}
+
+export async function isHopFunToken(suiClient, coinType) {
+  const t = await fetchHopFunCoin(suiClient, coinType).catch(() => null);
+  if (!t) return null;
+  return {
+    coinType: t.coinType,
+    symbol: t.symbol,
+    curveId: t.curveId,
+    progress: null,
+    pairType: 'SUI',
+    isCompleted: !t.isOpen,
+    virtualSuiReserves: t.virtualSuiReserves,
+    virtualTokenReserves: t.virtualTokenReserves,
+  };
+}
+
+/**
+ * List recent OPEN hop.fun bonding-curve tokens for the /launchpad menu.
+ * Walks BondingCurveCreated events newest-first, batches curve-object reads,
+ * filters for `open=true` (graduated tokens trade as plain Cetus pools and
+ * are already supported by the bot's standard /buy flow).
+ *
+ * Returns shape compatible with the bot's `_fmtToken` renderer.
+ */
+export async function fetchHopFunTokens(suiClient, { limit = 12 } = {}) {
+  if (!suiClient) return [];
+  const out = [];
+  const seen = new Set();
+  let cursor = null;
+  for (let i = 0; i < 3 && out.length < limit; i++) {
+    const { entries, next, hasNext } = await _hfScanPage(suiClient, cursor);
+    for (const e of entries) {
+      if (seen.has(e.curveId) || !e.isOpen) continue;
+      seen.add(e.curveId);
+      // Curve progress estimate — % of token supply already sold off the curve.
+      // (avail_reserves never quite hits zero; this is a best-effort UX hint.)
+      let progress = null;
+      if (e.totalSupply > 0n && e.availableTokenReserves >= 0n) {
+        // curve_supply_bps = 8000 (80% of total supply on curve)
+        const curveSupply = (e.totalSupply * 8000n) / 10000n;
+        const sold = curveSupply > e.availableTokenReserves
+          ? curveSupply - e.availableTokenReserves : 0n;
+        progress = curveSupply > 0n
+          ? Math.min(100, Number((sold * 1000n) / curveSupply) / 10) : null;
+      }
+      out.push({
+        coinType: e.coinType,
+        name:     (e.coinType.split('::').pop() || ''),
+        symbol:   (e.coinType.split('::').pop() || '').slice(0, 12),
+        image:    null,
+        poolId:   e.curveId,
+        creator:  e.creator,
+        pairType: 'SUI',
+        progress,
+        marketCap: null,
+        priceUsd:  null,
+        isCompleted: false,
+        isHopFun:  true,
+        source:    'hop.fun',
+        // pre-warm reserves so the buy estimator doesn't need a 2nd RPC
+        virtualSuiReserves:   e.virtualSuiReserves,
+        virtualTokenReserves: e.virtualTokenReserves,
+      });
+      if (out.length >= limit) break;
+    }
+    if (!hasNext) break;
+    cursor = next;
+  }
+  return out;
+}
+
+/**
+ * Constant-product estimator for hop.fun bonding curve.
+ *  fee taken from input (0.90% protocol+creator):
+ *    suiInNet = suiInGross * (1 - 90/10000)
+ *    out      = (vtr * suiInNet) / (vsr + suiInNet)
+ *  where vsr = virtual_sui_amount + sui_balance (effective SUI reserves)
+ *        vtr = token_balance (raw tokens left in curve)
+ *
+ * Returns { amountOutRaw, suiInNet }. All inputs/outputs are bigints.
+ */
+export function estimateHopFunBuy({ virtualSuiReserves, virtualTokenReserves, suiInMistGross }) {
+  const vsr = BigInt(virtualSuiReserves);
+  const vtr = BigInt(virtualTokenReserves);
+  const amtIn = BigInt(suiInMistGross);
+  if (vsr <= 0n || vtr <= 0n || amtIn <= 0n) return { amountOutRaw: 0n, suiInNet: 0n };
+  const suiInNet = (amtIn * (10_000n - HOPFUN_FEE_BPS)) / 10_000n;
+  const amountOutRaw = (vtr * suiInNet) / (vsr + suiInNet);
+  return { amountOutRaw, suiInNet };
+}
+
+/**
+ * Build a PTB that BUYS a hop.fun bonding-curve token for SUI.
+ *
+ * If you already know the curve_id (e.g. it came from `fetchHopFunTokens`),
+ * pass it via `curveOverride` to skip the events-scan resolver.
+ *
+ * Verified shape against tx 32LRmG6QnM3VWfEphRMrM3S7r2yqczLTrMpEKCp3tw8M.
+ */
+export async function buildHopFunBuyTx({
+  suiClient,
+  walletAddress,
+  coinType,
+  amountInMist,         // bigint — gross SUI to spend
+  slippageBps = 500n,
+  curveOverride = null,
+  reservesOverride = null,
+}) {
+  const amountIn = BigInt(amountInMist);
+  if (amountIn <= 0n) throw new Error('amountInMist must be > 0');
+
+  const curveId = curveOverride || await resolveHopFunCurveId(suiClient, coinType);
+  if (!curveId) throw new Error(`hop.fun curve not found for ${coinType}`);
+
+  let vsr, vtr;
+  if (reservesOverride && reservesOverride.vsr && reservesOverride.vtr) {
+    vsr = BigInt(reservesOverride.vsr);
+    vtr = BigInt(reservesOverride.vtr);
+  } else {
+    const tok = await fetchHopFunCoin(suiClient, coinType);
+    if (!tok)            throw new Error(`hop.fun curve state unavailable for ${coinType}`);
+    if (tok.isCompleted) throw new Error(`${tok.symbol} has graduated off the hop.fun curve — trade it on Cetus`);
+    vsr = tok.virtualSuiReserves;
+    vtr = tok.virtualTokenReserves;
+  }
+
+  const { amountOutRaw } = estimateHopFunBuy({
+    virtualSuiReserves: vsr, virtualTokenReserves: vtr, suiInMistGross: amountIn,
+  });
+  if (amountOutRaw <= 0n) throw new Error('Estimated amount_out is zero — reserves stale or amount too small');
+  const amountOutMin = (amountOutRaw * (10_000n - BigInt(slippageBps))) / 10_000n;
+
+  const tx = new Transaction();
+  tx.setGasBudget(50_000_000);
+  tx.setSender(walletAddress);
+
+  const [coinIn] = tx.splitCoins(tx.gas, [tx.pure.u64(amountIn)]);
+  tx.moveCall({
+    target: `${HOPFUN_PKG}::curve::buy`,
+    typeArguments: [coinType],
+    arguments: [
+      tx.object(HOPFUN_CONFIG),       // &HopConfig
+      tx.object(HOPFUN_DYNAMIC_FEE),  // &DynamicFee
+      tx.object(curveId),             // &mut BondingCurve<T>
+      tx.object(HOPFUN_LAUNCH_CFG),   // &LaunchConfig
+      coinIn,                         // Coin<SUI>
+      tx.pure.u64(amountOutMin),      // min_amount_out
+    ],
+  });
+  return tx;
+}
+
+/**
+ * Build a PTB that SELLS a hop.fun bonding-curve token for SUI.
+ *
+ * Verified shape against tx BzcP6HSSUAv7Asbm9ZRjyKNyCVY8JsEYCfXwK9HZ1wTj.
+ */
+export async function buildHopFunSellTx({
+  suiClient,
+  walletAddress,
+  coinType,
+  tokenCoinIdsToMerge,
+  amountToSellRaw,
+  minSuiOutMist = 0n,
+  curveOverride = null,
+}) {
+  if (!Array.isArray(tokenCoinIdsToMerge) || !tokenCoinIdsToMerge.length) {
+    throw new Error('No token coin objects provided to sell');
+  }
+  const curveId = curveOverride || await resolveHopFunCurveId(suiClient, coinType);
+  if (!curveId) throw new Error(`hop.fun curve not found for ${coinType}`);
+
+  const tx = new Transaction();
+  tx.setGasBudget(50_000_000);
+  tx.setSender(walletAddress);
+
+  const primary = tx.object(tokenCoinIdsToMerge[0]);
+  if (tokenCoinIdsToMerge.length > 1) {
+    tx.mergeCoins(primary, tokenCoinIdsToMerge.slice(1).map(id => tx.object(id)));
+  }
+  const [coinToSell] = tx.splitCoins(primary, [tx.pure.u64(BigInt(amountToSellRaw))]);
+
+  tx.moveCall({
+    target: `${HOPFUN_PKG}::curve::sell`,
+    typeArguments: [coinType],
+    arguments: [
+      tx.object(curveId),             // &mut BondingCurve<T>
+      tx.object(HOPFUN_LAUNCH_CFG),   // &LaunchConfig
+      coinToSell,                     // Coin<T>
+      tx.pure.u64(BigInt(minSuiOutMist)),
+    ],
+  });
+  return tx;
+}
+
+export async function executeHopFunBuy({
+  suiClient, signAndExecute, walletAddress, coinType, amountInMist,
+  slippageBps = 500n, curveOverride = null, reservesOverride = null,
+}) {
+  const tx = await buildHopFunBuyTx({
+    suiClient, walletAddress, coinType, amountInMist, slippageBps, curveOverride, reservesOverride,
+  });
+  return await signAndExecute(tx);
+}
+
+export async function executeHopFunSell({
+  suiClient, signAndExecute, walletAddress, coinType,
+  tokenCoinIdsToMerge, amountToSellRaw, minSuiOutMist = 0n, curveOverride = null,
+}) {
+  const tx = await buildHopFunSellTx({
+    suiClient, walletAddress, coinType, tokenCoinIdsToMerge, amountToSellRaw, minSuiOutMist, curveOverride,
+  });
+  return await signAndExecute(tx);
+}
+
+// ════════════════════════════════════════════════════════════════
 // Combined launchpad-list helper for the /launchpad menu
 // ════════════════════════════════════════════════════════════════
 
 /**
- * Returns { agent, odyssey, moonbags } — best-effort, never throws.
+ * Returns { agent, odyssey, moonbags, hopfun } — best-effort, never throws.
  * Used by the /launchpad menu in bot.mjs.
+ *
+ * Pass `suiClient` to populate hopfun (which has no public REST API and
+ * resolves entirely via on-chain event scans).
  */
-export async function fetchAllLaunchpadTokens({ limit = 10 } = {}) {
-  const [agentRes, odyRes, mbRes] = await Promise.allSettled([
+export async function fetchAllLaunchpadTokens({ suiClient = null, limit = 10 } = {}) {
+  const [agentRes, odyRes, mbRes, hfRes] = await Promise.allSettled([
     fetchAgentLaunchpadTokens(limit),
     fetchOdysseyTokens({ limit }),
     fetchMoonbagsTokens({ limit }),
+    suiClient ? fetchHopFunTokens(suiClient, { limit }) : Promise.resolve([]),
   ]);
   return {
     agent:    agentRes.status === 'fulfilled' ? agentRes.value : [],
     odyssey:  odyRes.status   === 'fulfilled' ? odyRes.value   : [],
     moonbags: mbRes.status    === 'fulfilled' ? mbRes.value    : [],
+    hopfun:   hfRes.status    === 'fulfilled' ? hfRes.value    : [],
     agentError:    agentRes.status === 'rejected' ? String(agentRes.reason?.message || agentRes.reason) : null,
     odysseyError:  odyRes.status   === 'rejected' ? String(odyRes.reason?.message   || odyRes.reason)   : null,
     moonbagsError: mbRes.status    === 'rejected' ? String(mbRes.reason?.message    || mbRes.reason)    : null,
+    hopfunError:   hfRes.status    === 'rejected' ? String(hfRes.reason?.message    || hfRes.reason)    : null,
   };
 }
