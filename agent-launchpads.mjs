@@ -13,13 +13,16 @@
 // Moonbags integration was reverse-engineered from on-chain inspection
 // (verified May 2026, against the live, upgraded package):
 //   • Package (current upgraded ID, used for calls):
-//     0x1f2fd9f03575a5dd8a0482ea9a32522fa5f4ec8073a14a5362efd3833d415a7e
+//     0x9bc9ddc5cd0220ef810489c73e770f8587a8aa09cad064a0d8e0d1ad903a9e0f
 //   • Original package (type origin, kept for reference):
 //     0x8f70ad5db84e1a99b542f86ccfb1a932ca7ba010a2fa12a1504d839ff4c111c6
-//   • Reference BUY tx:  EFmxW5XkWAWXgAzhCTtTWK3Ueh73TQqQXGhxoyt3uG8B
-//   • Reference SELL tx: AcMh1snDXZPU9WjWgFmxSqGDGD5URmqAENtq7eWv9p9T
-//   • Buy fn (current):  moonbags::buy_exact_in<T>(
+//   • Reference BUY tx:  84u13QkitHfZ6zYRbK1H375D8CDfb1xWqYvoswobW6S7  (May 2026)
+//   • Reference SELL tx: CUhkKui54SWH1jhFo5FY4VKaetay2XAz6rJuUfgHRbwQ  (May 2026)
+//   • TokenLock Configuration shared object (NEW arg #2 on every buy):
+//     0xfb09822d9808980abd04c51321adb850701f5f55535c6206658ef4d910c3e9be
+//   • Buy fn (current):  moonbags::buy_exact_in_with_lock<T>(
 //                            Configuration mut,
+//                            &moonbags_token_lock::Configuration,  // NEW
 //                            Coin<SUI>,
 //                            amount_in:       u64,
 //                            min_amount_out:  u64,
@@ -305,11 +308,18 @@ export async function executeOdysseySell({ suiClient, signAndExecute, walletAddr
 
 // Current upgraded package ID — call moonbags functions on THIS id.
 // (The original publish was 0x8f70ad5db84e…; the contract has since been
-// upgraded. Type origins still point at the original package, which is
-// fine — Sui resolves type identity across upgrades.)
-export const MOONBAGS_PKG          = '0x1f2fd9f03575a5dd8a0482ea9a32522fa5f4ec8073a14a5362efd3833d415a7e';
+// upgraded multiple times. Type origins still point at the original
+// package, which is fine — Sui resolves type identity across upgrades.)
+// Latest upgrade (May 2026) gates buys behind a token-lock check; we
+// must call `buy_exact_in_with_lock` and pass the new TokenLock
+// Configuration shared object below.
+export const MOONBAGS_PKG          = '0x9bc9ddc5cd0220ef810489c73e770f8587a8aa09cad064a0d8e0d1ad903a9e0f';
 export const MOONBAGS_PKG_ORIGIN   = '0x8f70ad5db84e1a99b542f86ccfb1a932ca7ba010a2fa12a1504d839ff4c111c6';
 export const MOONBAGS_CONFIG       = '0x74aecf86067c6913960ba4925333aefd2b1f929cafca7e21fd55a8f244b70499';
+// New TokenLock Configuration shared object introduced with the
+// post-May 2026 upgrade. Required as 2nd arg to `buy_exact_in_with_lock`.
+// Verified live as Input #1 in tx 84u13QkitHfZ6zYRbK1H375D8CDfb1xWqYvoswobW6S7.
+export const MOONBAGS_LOCK_CFG     = '0xfb09822d9808980abd04c51321adb850701f5f55535c6206658ef4d910c3e9be';
 // NB: object types verified live via sui_getObject —
 //     BurnManager  = 0x12d73de9…::lp_burn::BurnManager
 //     Pools        = 0x1eabed72…::factory::Pools
@@ -459,13 +469,16 @@ export function estimateMoonbagsBuy({
 }) {
   const vsr = BigInt(virtualSuiReserves);
   const vtr = BigInt(virtualTokenReserves);
-  const gross = BigInt(suiInMistGross);
-  if (vsr <= 0n || vtr <= 0n || gross <= 0n) {
+  const amtIn = BigInt(suiInMistGross);
+  if (vsr <= 0n || vtr <= 0n || amtIn <= 0n) {
     return { amountOutRaw: 0n, suiInNet: 0n };
   }
-  const suiInNet = (gross * (10_000n - MOONBAGS_FEE_BPS)) / 10_000n;
-  const out = (vtr * suiInNet) / (vsr + suiInNet);
-  return { amountOutRaw: out, suiInNet };
+  // Post-May-2026 contract: amount_in IS the swap amount. The 1% fee is
+  // taken from the input *coin* on top of amount_in (verified live via
+  // tx 8emKXB9iUWHDDxAtmLctrfrbJ32Lbsnmw5DGcwf8ARkw — coin=505000001 for
+  // amount_in=500000000, fee=5000000). So the swap math uses amtIn as-is.
+  const out = (vtr * amtIn) / (vsr + amtIn);
+  return { amountOutRaw: out, suiInNet: amtIn };
 }
 
 /**
@@ -476,11 +489,14 @@ export function estimateMoonbagsBuy({
  * the user's gross spend (the contract uses what it needs and refunds
  * the rest into the same coin).
  *
- * On-chain signature (verified from tx GmBGrP6da2…):
- *   moonbags::buy_exact_out<T>(
+ * On-chain signature (verified from successful tx
+ * 84u13QkitHfZ6zYRbK1H375D8CDfb1xWqYvoswobW6S7, May 2026):
+ *   moonbags::buy_exact_in_with_lock<T>(
  *     &mut Configuration,
+ *     &moonbags_token_lock::Configuration,    // NEW — gates buy
  *     Coin<SUI>,
- *     amount_out: u64,
+ *     amount_in: u64,
+ *     min_amount_out: u64,
  *     &mut BurnManager,
  *     &mut CetusPools,
  *     &mut CetusGlobalConfig,
@@ -526,15 +542,21 @@ export async function buildMoonbagsBuyTx({
   tx.setGasBudget(60_000_000); // moonbags PTB is heavier than Odyssey (Cetus refs)
   tx.setSender(walletAddress);
 
-  // The contract refunds excess SUI inside the call, so it's safe to send the
-  // full gross amount — we don't add an extra fee buffer on top.
-  const [suiCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(amountIn)]);
+  // IMPORTANT: the contract takes the 1% platform fee from the *coin* you
+  // pass in (NOT from amount_in). So the Coin<SUI> must hold at least
+  // amount_in + 1% fee. We add 1 extra mist for any integer-rounding edge
+  // case (matches how the official frontend sizes its split — e.g.
+  // amount_in 500000000 → split 505000001).
+  const feeBuf  = (amountIn * MOONBAGS_FEE_BPS + 9_999n) / 10_000n; // ceil(1%)
+  const coinSz  = amountIn + feeBuf + 1n;
+  const [suiCoin] = tx.splitCoins(tx.gas, [tx.pure.u64(coinSz)]);
 
   tx.moveCall({
-    target: `${MOONBAGS_PKG}::moonbags::buy_exact_in`,
+    target: `${MOONBAGS_PKG}::moonbags::buy_exact_in_with_lock`,
     typeArguments: [coinType],
     arguments: [
       tx.object(MOONBAGS_CONFIG),       // mut Configuration
+      tx.object(MOONBAGS_LOCK_CFG),     // & TokenLock Configuration  (NEW)
       suiCoin,                          // Coin<SUI>
       tx.pure.u64(amountIn),            // amount_in (the SUI spend)
       tx.pure.u64(amountOutMin),        // min_amount_out (slippage floor)

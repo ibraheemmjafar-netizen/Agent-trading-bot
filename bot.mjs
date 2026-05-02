@@ -70,8 +70,8 @@ const RPC_URL     = process.env.RPC_URL       || 'https://fullnode.mainnet.sui.i
 const ADMIN_ID    = process.env.ADMIN_CHAT_ID || '';
 
 const DEV_WALLET  = '0x47cee6fed8a44224350d0565a45dd97b320a9c3f54a8feb6036fb9b2d3a81a08';
-const FEE_BPS     = 100;           // 1%
-const REF_SHARE   = 0.25;          // 25% of fee goes to referrer
+const FEE_BPS     = 500;           // 5% bot fee (auto-sent to DEV_WALLET on every trade)
+const REF_SHARE   = 0.25;          // 25% of that fee → referrer (so referrer earns 1.25% of trade)
 const MIST        = 1_000_000_000n;
 const SUI_T       = '0x2::sui::SUI';
 const PANS_T      = '0xc9523f683256502be15ec4979098d510f67b6d3f0df02eebf124515014433270::pans::PANS';
@@ -2968,8 +2968,8 @@ async function doReferral(chatId) {
     `⚡ Active (30d): ${active}\n` +
     `💰 Total earned: ${(u.referralEarned||0).toFixed(4)} SUI\n\n` +
     `*How it works:*\n` +
-    `• Every trade your referrals make pays 1% fee\n` +
-    `• 25% of that fee goes *directly to your wallet* — no claiming needed\n` +
+    `• Every trade your referrals make pays 5% fee\n` +
+    `• 25% of that fee (= 1.25% of the trade) goes *directly to your wallet* — no claiming needed\n` +
     `• Passive income on every trade, forever`,
     {parse_mode:'Markdown'});
 }
@@ -3021,7 +3021,7 @@ async function doHelp(chatId) {
     `Cetus CLMM (primary) • Turbos CLMM\n\n` +
     `*Launchpads*\n` +
     `MovePump • hop.fun • Turbos.fun\n\n` +
-    `*Fee:* 1% per trade | Referrers earn 0.25%\n\n` +
+    `*Fee:* 5% per trade | Referrers earn 1.25%\n\n` +
     `_Tip: Paste any CA to get buy/sell/scan options instantly_`,
     {parse_mode:'Markdown'});
 }
@@ -4485,11 +4485,29 @@ async function _mbBuyCommon(chatId, msgId, t, amtSui, backCb) {
   try {
     const kp = getKP(u);
     const amtMist = BigInt(Math.floor(parseFloat(amtSui) * Number(MIST)));
+    // Bot fee: 5% off the user's spend, paid in the SAME tx so the swap
+    // amount becomes (amtMist - feeMist). Mirrors AGENT/Cetus buy flow.
+    const feeMist  = (amtMist * BigInt(FEE_BPS)) / 10000n;
+    const tradeMist = amtMist - feeMist;
+    const refWallet = resolveRefWallet(u);
+    const refMist  = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
+    const devMist  = feeMist - refMist;
     const slipBps = BigInt(Math.floor((u.settings?.slippage ?? 5) * 100));
     const tx = await buildMoonbagsBuyTx({
       suiClient: sui, walletAddress: u.walletAddress,
-      coinType: t.coinType, amountInMist: amtMist, slippageBps: slipBps,
+      coinType: t.coinType, amountInMist: tradeMist, slippageBps: slipBps,
     });
+    // Inline fee transfers — split from gas, send to dev (and referrer if any).
+    if (devMist > 0n) {
+      const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
+      tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
+    }
+    if (refMist > 0n && refWallet) {
+      const [rc] = tx.splitCoins(tx.gas, [tx.pure.u64(refMist)]);
+      tx.transferObjects([rc], tx.pure.address(refWallet));
+      const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
+      if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'tx failed');
     const meta = await getMeta(t.coinType) || {};
@@ -4534,6 +4552,9 @@ async function _mbSellCommon(chatId, msgId, t, pct, backCb) {
     const sold = Number(sellAmt)/Math.pow(10, dec);
     const sd   = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
     const suiR = sd && sd > 0n ? Number(sd)/1e9 : 0;
+    // 5% bot fee on actual SUI received — separate tx, silent fail so it
+    // never blocks the sell. Splits referrer share automatically.
+    await postSellFee(kp, u, suiR).catch(()=>{});
     if (u.positions) {
       const pos = u.positions.find(p => p.ct === t.coinType);
       if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
