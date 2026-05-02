@@ -4478,7 +4478,10 @@ async function _mbBuyCommon(chatId, msgId, t, amtSui, backCb) {
       {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:backCb}]]}});
     return;
   }
-  await bot.editMessageText(`⏳ Buying ${amtSui} SUI of *${t.symbol}* on Moonbags...`,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+  // Telegram throws "message is not modified" if the new text matches the
+  // current text exactly. The CA path pre-sends the same string so we wrap
+  // this status edit in a try/catch — it's a UX nicety, never a hard step.
+  try { await bot.editMessageText(`⏳ Submitting Moonbags buy: ${amtSui} SUI for *${t.symbol}*...`, {chat_id:chatId, message_id:msgId, parse_mode:'Markdown'}); } catch {}
   try {
     const kp = getKP(u);
     const amtMist = BigInt(Math.floor(parseFloat(amtSui) * Number(MIST)));
@@ -4509,7 +4512,8 @@ async function _mbBuyCommon(chatId, msgId, t, amtSui, backCb) {
 async function _mbSellCommon(chatId, msgId, t, pct, backCb) {
   const u = getU(chatId);
   if (!u || !u.encryptedKey) { await bot.editMessageText('❌ No wallet.', {chat_id:chatId,message_id:msgId}); return; }
-  await bot.editMessageText(`⏳ Selling ${pct}% of *${t.symbol}*...`,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+  // Same Telegram "not modified" guard as the buy path.
+  try { await bot.editMessageText(`⏳ Submitting Moonbags sell: ${pct}% of *${t.symbol}*...`, {chat_id:chatId, message_id:msgId, parse_mode:'Markdown'}); } catch {}
   try {
     const bal = await sui.getBalance({ owner: u.walletAddress, coinType: t.coinType });
     const total = BigInt(bal.totalBalance || 0);

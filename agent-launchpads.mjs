@@ -334,10 +334,15 @@ const MOONBAGS_FEE_BPS = 100n; // 1.00%
  * already supported by the bot's standard /buy flow.
  */
 export async function fetchMoonbagsTokens({ limit = 20, includeCompleted = false } = {}) {
-  const j = await jget(`${MOONBAGS_API_URL}/api/v1/coin?page=1&limit=${Math.max(limit, 20)}&sortBy=mcap`);
+  // NB: sortBy=mcap returns mostly graduated tokens (the biggest caps are
+  // already listed on Cetus). To surface live bonding-curve tokens we sort
+  // by createdAt (newest), filter out graduated ones, then re-sort the
+  // active set by bonding-curve progress (closer to grad = more action).
+  const j = await jget(`${MOONBAGS_API_URL}/api/v1/coin?page=1&limit=100&sortBy=createdAt`);
   const arr = Array.isArray(j?.docs) ? j.docs : [];
   let list = arr;
   if (!includeCompleted) list = list.filter(t => !t.listedPoolId); // listedPoolId set ⇢ graduated to Cetus
+  list.sort((a, b) => (Number(b.bondingCurve) || 0) - (Number(a.bondingCurve) || 0));
   return list.slice(0, limit).map(t => ({
     coinType: t.tokenAddress,
     name: t.name || t.symbol || 'Unknown',
@@ -397,7 +402,10 @@ export async function isMoonbagsToken(coinType) {
   // Fast path: cached list
   if (Date.now() - _mbIndex.at > MB_INDEX_TTL_MS) {
     try {
-      const j = await jget(`${MOONBAGS_API_URL}/api/v1/coin?page=1&limit=100&sortBy=mcap`);
+      // Index newest tokens (these are the ones still on bonding curve).
+      // Top-mcap is dominated by graduated tokens — useless for "is this
+      // a moonbags bonding-curve token?".
+      const j = await jget(`${MOONBAGS_API_URL}/api/v1/coin?page=1&limit=100&sortBy=createdAt`);
       _mbIndex.at = Date.now();
       _mbIndex.byCoin.clear();
       for (const t of (j?.docs || [])) {
