@@ -3180,8 +3180,8 @@ async function startBuy(chatId, ct) {
     await bot.editMessageText(buyCard(d,ct,st),{
       chat_id:chatId, message_id:lm.message_id, parse_mode:'Markdown',
       reply_markup:{inline_keyboard:[
-        [{text:'≡ Menu',callback_data:'go_home'},{text:'📍 Positions',callback_data:'go_pos'},{text:'🔄 Refresh',callback_data:`rbuy:${ct}`}],
-        [{text:'✅ Buy',callback_data:'noop'},{text:'💸 Sell',callback_data:`sell_here:${ct}`}],
+        [{text:'≡ Menu',callback_data:'go_home'},{text:'📍 Positions',callback_data:'go_pos'},{text:'🔄 Refresh',callback_data:'rbuy'}],
+        [{text:'✅ Buy',callback_data:'noop'},{text:'💸 Sell',callback_data:'shr'}],
         [{text:'----- Settings -----',callback_data:'noop'}],
         [{text:`✏️ Slippage: ${s.slippage}%`,callback_data:'open_slip'},{text:'❌ Cancel',callback_data:'ca'}],
         [{text:'----- Buy Amount -----',callback_data:'noop'}],
@@ -3200,7 +3200,7 @@ async function startBuy(chatId, ct) {
     await bot.editMessageText(
       `*${sym}/SUI*\n\`${ct}\`\n\n⚠️ _Token data unavailable — routing to best price_`,
       {chat_id:chatId,message_id:lm.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[
-        [{text:'≡ Menu',callback_data:'go_home'},{text:'🔄 Refresh',callback_data:`rbuy:${ct}`}],
+        [{text:'≡ Menu',callback_data:'go_home'},{text:'🔄 Refresh',callback_data:'rbuy'}],
         [{text:`✏️ Slippage: ${s.slippage}%`,callback_data:'open_slip'},{text:'❌ Cancel',callback_data:'ca'}],
         [{text:'----- Buy Amount -----',callback_data:'noop'}],
         ...amtRows,
@@ -3469,10 +3469,15 @@ bot.on('callback_query', async(q) => {
     if(data==='go_home'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu)await bot.sendMessage(chatId,'≡ *Main Menu*',{parse_mode:'Markdown',reply_markup:MAIN_KB});return;}
     if(data==='go_pos'){await bot.answerCallbackQuery(q.id).catch(()=>{});await doPositions(chatId);return;}
     if(data==='open_slip'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu){updU(chatId,{state:'edit_slip'});await bot.sendMessage(chatId,'✏️ Enter slippage % (e.g. 1, 2, 5):');}return;}
-    if(data.startsWith('rbuy:')){await bot.answerCallbackQuery(q.id).catch(()=>{});await startBuy(chatId,data.slice(5));return;}
-    if(data.startsWith('sell_here:')){
+    if(data==='rbuy'){
       await bot.answerCallbackQuery(q.id).catch(()=>{});
-      const sct=data.slice(10);
+      const u=getU(chatId); if(!u?.pd?.ct){await bot.sendMessage(chatId,'❌ Session expired. Paste the CA again.');return;}
+      await startBuy(chatId,u.pd.ct); return;
+    }
+    if(data==='shr'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const u=getU(chatId); if(!u?.pd?.ct){await bot.sendMessage(chatId,'❌ Session expired. Paste the CA again.');return;}
+      const sct=u.pd.ct;
       const smeta=await getMeta(sct).catch(()=>null);
       const ssym=smeta?.symbol||trunc(sct);
       await guard(chatId,async()=>showSellPct(chatId,sct,ssym,null));
