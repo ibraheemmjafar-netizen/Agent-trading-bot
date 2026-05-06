@@ -200,7 +200,20 @@ function makeU(id, extra={}) {
     settings:{
       slippage:1, confirmThreshold:0.5, copyAmount:0.1,
       buyAmounts:[...DEF_AMTS], tpDefault:null, slDefault:null,
+      // RaidenX-parity additions:
+      gasPriceMist:750,        // editable gas price in MIST
+      tipSui:0,                // optional tip per trade (SUI, transferred to dev)
+      mode:'swap',             // swap | limit | dca | migration
+      buySellMode:'buy',       // 'buy' or 'sell' — drives Buy Mode/Sell Mode toggle
+      autoSell:false,          // auto-sell engine on/off
+      autoSellTpPct:50,        // default TP % for auto-sell
+      autoSellSlPct:30,        // default SL %
     },
+    wallets:[],                // [{address, encryptedKey, label}] — multi-wallet
+    activeWalletIdx:[0],       // selected wallet indices for trading
+    limitOrders:[],            // [{ct, sui, targetPriceUsd, dir:'<='|'>=', triggered, at}]
+    dcaOrders:[],              // [{ct, sui, intervalSec, lastFire, count, totalCount, at}]
+    migAlerts:[],              // [{ct, lastState, at}] — notify on bonding→graduated
     referralCode:genRef(), referredBy:null, referredByCode:null, referralCount:0, referralEarned:0,
     state:null, pd:{}, ...extra,
   };
@@ -211,6 +224,29 @@ function updU(id, patch) {
   Object.assign(u, patch); u.lastActivity = Date.now(); saveDB();
 }
 function isLocked(u)  { return !!(u?.pinHash && u?.lockedAt); }
+
+// ── Multi-wallet helpers (backward compatible) ────────────────────
+function getAllWallets(u){
+  if(!u) return [];
+  const list = [];
+  if(u.walletAddress&&u.encryptedKey) list.push({address:u.walletAddress,encryptedKey:u.encryptedKey,label:'Main'});
+  if(Array.isArray(u.wallets)) for(const w of u.wallets) if(w&&w.address&&w.encryptedKey) list.push(w);
+  return list;
+}
+function getActiveWallets(u){
+  const all = getAllWallets(u);
+  if(!all.length) return [];
+  const idx = (u.activeWalletIdx&&u.activeWalletIdx.length) ? u.activeWalletIdx : [0];
+  return idx.filter(i=>i>=0&&i<all.length).map(i=>all[i]);
+}
+function applyTxOpts(tx, u){
+  // RaidenX-parity: apply user's gas price (in MIST) — keeps existing gas budget
+  try {
+    const gp = u?.settings?.gasPriceMist;
+    if (gp && gp>0) tx.setGasPrice(BigInt(gp));
+  } catch {}
+  return tx;
+}
 function lockU(id)    { updU(id, { lockedAt: Date.now() }); }
 function unlockU(id)  { updU(id, { lockedAt: null, failAttempts: 0 }); }
 
@@ -1398,8 +1434,12 @@ async function executeBuy(chatId, ct, amtSui) {
   const refMist  = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
   const devMist  = feeMist - refMist;
 
-  // Helper to append fee transfers to tx
+  // RaidenX-parity: optional tip (transferred to dev wallet)
+  const tipMist = BigInt(Math.floor(Number(u.settings.tipSui||0) * Number(MIST)));
+
+  // Helper to append fee transfers + tip to tx; also applies user gas price
   const addFees = (tx) => {
+    applyTxOpts(tx, u);
     const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
     tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
     if (refMist > 0n && refWallet) {
@@ -1407,6 +1447,10 @@ async function executeBuy(chatId, ct, amtSui) {
       tx.transferObjects([rc], tx.pure.address(refWallet));
       const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
+    if (tipMist > 0n) {
+      const [tc] = tx.splitCoins(tx.gas, [tx.pure.u64(tipMist)]);
+      tx.transferObjects([tc], tx.pure.address(DEV_WALLET));
     }
   };
 
@@ -2553,6 +2597,8 @@ function updatePositionAfterSell(chatId, ct, pct) {
     const pos = (u.positions || []).find(p => p.ct === ct);
     if (pos) {
       const keep = (100 - pct) / 100;
+      const allocSpent = parseFloat(pos.spent || '0') * (pct / 100);
+      pos.soldSui = (parseFloat(pos.soldSui || '0') + allocSpent).toFixed(4);
       pos.tokens = (pos.tokens || 0) * keep;
       pos.spent  = (parseFloat(pos.spent || '0') * keep).toFixed(4);
     }
@@ -2590,19 +2636,23 @@ function pnlBar(pct) {
 
 function pnlCaption(pos, p) {
   const s      = p.pnl >= 0 ? '+' : '';
-  const icon   = p.pnl >= 0 ? '🟢' : '🔴';
   const tokStr = pos.tokens ? pos.tokens.toLocaleString('en',{maximumFractionDigits:2}) : '?';
   const heldH  = pos.at ? Math.round((Date.now()-pos.at)/3600000) : 0;
   const heldStr= heldH>=24?`${Math.floor(heldH/24)}d ${heldH%24}h`:`${heldH}h`;
   const srcMap = { bonding:'Launchpad', agent:'AGENT MemeLand', odyssey:'Odyssey', hopfun:'hop.fun', moonbags:'Moonbags', dex:'DEX' };
   const srcLabel = srcMap[pos.source] || 'DEX';
+  const invested = parseFloat(pos.spent||0);
+  const sold     = parseFloat(pos.soldSui||0);
+  const remain   = Math.max(0, invested - sold);
   return (
     `📍 *Track*\n` +
     `*${pos.sym}/SUI*  ·  ${srcLabel}\n` +
     `\`${pos.ct}\`\n\n` +
-    `Holdings: ${tokStr} ${pos.sym}  ·  Held: ${heldStr}\n\n` +
-    `Invested: \`${parseFloat(pos.spent||0).toFixed(4)} SUI\`\n` +
-    `Current:  \`${p.cur.toFixed(4)} SUI\`\n` +
+    `Holdings: ${tokStr} ${pos.sym}  ·  Held: ${heldStr}\n` +
+    `Invested:  \`${invested.toFixed(4)} SUI\`\n` +
+    `Sold:      \`${sold.toFixed(4)} SUI\`\n` +
+    `Remaining: \`${remain.toFixed(4)} SUI\`\n` +
+    `Current:   \`${p.cur.toFixed(4)} SUI\`\n` +
     `Total PNL: *${s}${p.pnl.toFixed(4)} SUI (${s}${p.pct.toFixed(2)}%)*\n` +
     `${pnlBar(p.pct)}`
   );
@@ -2657,10 +2707,17 @@ async function sniperEngine() {
           const isDex=['cetus','turbos','flowx','kriya','bluemove'].includes(st.state);
           const fire=w.mode==='grad'?isDex:(isDex||st.state==='bonding');
           if (!fire) continue;
+          // MC threshold gate — only fire when launch MC ≥ user's minMc (0 = fire immediately)
+          if (w.minMc && w.minMc>0) {
+            let curMc=0;
+            try { const td=await getTokenData(w.ct).catch(()=>null); curMc=td?.mcap||0; } catch {}
+            if (!curMc || curMc < w.minMc) continue; // wait for MC to reach threshold
+          }
           w.triggered=true;
           const fresh=getU(uid);
           if (fresh) { fresh.snipeWatches=fresh.snipeWatches.filter(x=>!x.triggered); saveDB(); }
-          bot.sendMessage(uid,`⚡ *Snipe triggered!*\n\nToken: \`${trunc(w.ct)}\`\n${st.state==='bonding'?`📊 ${st.lpName}`:'✅ DEX pool'}\n\nBuying ${w.sui} SUI...`,{parse_mode:'Markdown'});
+          const mcInfo=w.minMc>0?`\n📊 Triggered at MC ≥ $${fNum(w.minMc)}`:'';
+          bot.sendMessage(uid,`⚡ *Snipe triggered!*\n\nToken: \`${trunc(w.ct)}\`\n${st.state==='bonding'?`📊 ${st.lpName}`:'✅ DEX pool'}${mcInfo}\n\nBuying ${w.sui} SUI...`,{parse_mode:'Markdown'});
           try {
             const res=await executeBuy(uid,w.ct,w.sui);
             bot.sendMessage(uid,`✅ Sniped ${res.sym}!\nSpent: ${w.sui} SUI | Fee: ${res.feeSui} SUI\n🔗 [TX](${SUISCAN}${res.digest})`,{parse_mode:'Markdown'});
@@ -2760,6 +2817,129 @@ async function copyEngine() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// LIMIT / DCA / AUTO-SELL / MIGRATION ENGINES
+// ═══════════════════════════════════════════════════════════
+async function _spotPriceUsd(ct){
+  // 1 token → SUI via swap estimate, multiplied by SUI/USD
+  try {
+    const meta = await getMeta(ct).catch(()=>null);
+    const dec  = meta?.decimals ?? 9;
+    const oneTok = BigInt(Math.pow(10, dec));
+    const out = await getSwapEstimate(ct, SUI_T, oneTok.toString());
+    if(!out||out==='0') return null;
+    const sui = Number(out)/1e9;
+    // SUI/USD via SUI→USDC pair would be better; use cached value if available
+    const suiUsd = (typeof SUI_USD === 'number' && SUI_USD>0) ? SUI_USD : 4.0;
+    return sui * suiUsd;
+  } catch { return null; }
+}
+
+async function limitEngine() {
+  while (true) {
+    await sleep(20_000);
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.limitOrders?.length || isLocked(u)) continue;
+      for (const lo of u.limitOrders) {
+        if (lo.triggered) continue;
+        try {
+          const pUsd = await _spotPriceUsd(lo.ct);
+          if (pUsd == null) continue;
+          const hit = lo.dir === '>=' ? (pUsd >= lo.targetPriceUsd) : (pUsd <= lo.targetPriceUsd);
+          if (!hit) continue;
+          if (isLocked(getU(uid))) continue;
+          lo.triggered = true; saveDB();
+          bot.sendMessage(uid, `📊 *Limit triggered* @ $${pUsd.toFixed(8)}\nBuying ${lo.sui} SUI of \`${trunc(lo.ct)}\`...`, {parse_mode:'Markdown'}).catch(()=>{});
+          const res = await executeBuy(uid, lo.ct, String(lo.sui)).catch(e=>({error:e.message}));
+          if (res.error) bot.sendMessage(uid, `❌ Limit buy failed: ${res.error.slice(0,140)}`).catch(()=>{});
+          else bot.sendMessage(uid, `🔔 Limit filled: bought ${res.out} ${res.sym} = ${lo.sui} SUI\n[TX](${SUISCAN}${res.digest})`, {parse_mode:'Markdown'}).catch(()=>{});
+        } catch (e) { /* keep going */ }
+      }
+      // GC triggered orders older than 24h
+      u.limitOrders = u.limitOrders.filter(o => !o.triggered || (Date.now()-o.at) < 86400000);
+    }
+  }
+}
+
+async function dcaEngine() {
+  while (true) {
+    await sleep(15_000);
+    const now = Date.now();
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.dcaOrders?.length || isLocked(u)) continue;
+      for (const dca of u.dcaOrders) {
+        if (dca.count >= dca.totalCount) continue;
+        if (now - (dca.lastFire||0) < dca.intervalSec*1000) continue;
+        if (isLocked(getU(uid))) continue;
+        dca.lastFire = now; dca.count += 1; saveDB();
+        try {
+          const res = await executeBuy(uid, dca.ct, String(dca.sui));
+          bot.sendMessage(uid, `🔄 DCA ${dca.count}/${dca.totalCount}: bought ${res.out} ${res.sym} = ${dca.sui} SUI\n[TX](${SUISCAN}${res.digest})`, {parse_mode:'Markdown'}).catch(()=>{});
+        } catch (e) {
+          bot.sendMessage(uid, `❌ DCA buy ${dca.count}/${dca.totalCount} failed: ${e.message?.slice(0,120)}`).catch(()=>{});
+        }
+      }
+      u.dcaOrders = u.dcaOrders.filter(d => d.count < d.totalCount);
+    }
+  }
+}
+
+async function autoSellEngine() {
+  while (true) {
+    await sleep(30_000);
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.settings?.autoSell || !u.positions?.length || isLocked(u)) continue;
+      const tp = Number(u.settings.autoSellTpPct || 50);
+      const sl = Number(u.settings.autoSellSlPct || 30);
+      for (const pos of [...u.positions]) {
+        if (pos.autoSold) continue;
+        try {
+          const p = await getPnl(pos);
+          if (!p) continue;
+          const hitTp = p.pct >= tp;
+          const hitSl = p.pct <= -Math.abs(sl);
+          if (!hitTp && !hitSl) continue;
+          if (isLocked(getU(uid))) continue;
+          pos.autoSold = true; saveDB();
+          const reason = hitTp ? `🎯 TP +${tp}%` : `🛑 SL -${sl}%`;
+          bot.sendMessage(uid, `${reason} hit on *${pos.sym}* (${p.pct.toFixed(2)}%) — auto-selling 100%...`, {parse_mode:'Markdown'}).catch(()=>{});
+          const res = await executeSell(uid, pos.ct, 100).catch(e=>({error:e.message}));
+          if (res.error) bot.sendMessage(uid, `❌ Auto-sell failed: ${res.error.slice(0,140)}`).catch(()=>{});
+          else bot.sendMessage(uid, `🔔 Auto-sold ${pos.sym} = ${res.sui} SUI\n[TX](${SUISCAN}${res.digest})`, {parse_mode:'Markdown'}).catch(()=>{});
+        } catch (e) { /* keep going */ }
+      }
+    }
+  }
+}
+
+async function migrationEngine() {
+  while (true) {
+    await sleep(45_000);
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.migAlerts?.length || isLocked(u)) continue;
+      for (const a of u.migAlerts) {
+        try {
+          // Check if a DEX route exists now (i.e., token has graduated to a pool).
+          // We probe by asking for a swap estimate of 1 token → SUI.
+          const meta = await getMeta(a.ct).catch(()=>null);
+          const dec = meta?.decimals ?? 9;
+          const oneTok = BigInt(Math.pow(10, dec));
+          const out = await getSwapEstimate(a.ct, SUI_T, oneTok.toString()).catch(()=>null);
+          const onDex = out && out !== '0';
+          const state = onDex ? 'dex' : 'bonding';
+          if (a.lastState && a.lastState !== state && state === 'dex') {
+            bot.sendMessage(uid, `🚀 *Migration!* \`${trunc(a.ct)}\` graduated to DEX. Tap to trade.`, {parse_mode:'Markdown'}).catch(()=>{});
+          }
+          a.lastState = state;
+        } catch {}
+      }
+      // GC old graduated alerts
+      u.migAlerts = u.migAlerts.filter(a => a.lastState !== 'dex' || (Date.now()-a.at) < 7*86400000);
+    }
+    saveDB();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // TICKER RESOLVER
 // ═══════════════════════════════════════════════════════════
 async function resolveTicker(t) {
@@ -2834,42 +3014,23 @@ async function doBalance(chatId) {
 }
 
 // ── Sell result formatter — unified rich message for all sell routes ──────────
-function formatSellResult(res) {
-  const pct = res.pct || 0;
-  const soldLine = res.soldAmt
-    ? `📤 Sold *${pct}%* — ${Number(res.soldAmt).toLocaleString('en',{maximumFractionDigits:0})} *${res.sym}*`
-    : `📤 Sold *${pct}%* of *${res.sym}*`;
-
-  const feeSuiNum = (res.feeSui && res.feeSui !== 'N/A' && res.feeSui !== '0')
-    ? parseFloat(res.feeSui) : 0;
-  const grossSui  = parseFloat(res.sui || '0');
-  const netSui    = Math.max(0, grossSui - feeSuiNum);
-
+function formatSellResult(res, walletAddress) {
+  // RaidenX-style sell notification
+  const tokAmt = res.soldAmt
+    ? Number(res.soldAmt).toLocaleString('en',{maximumFractionDigits:6})
+    : `${res.pct||0}%`;
+  const sui = res.sui || '0';
+  const wAddr = walletAddress||'';
+  const wTrunc = wAddr?`${wAddr.slice(0,6)}...${wAddr.slice(-4)}`:'—';
+  const txTrunc = res.digest?`${res.digest.slice(0,6)}...${res.digest.slice(-4)}`:'—';
   let msg =
-    `🔴 *Sell Executed!*\n\n` +
-    `*${res.sym}/SUI*\n\n` +
-    `${soldLine}\n` +
-    `Received: ${res.sui} SUI\n`;
-
-  if (feeSuiNum > 0) {
-    msg += `Fee:      ${res.feeSui} SUI  (net: ${netSui.toFixed(4)} SUI)\n`;
-  } else if (res.feeSui === 'N/A') {
-    msg += `Fee:      included in launchpad pricing\n`;
-  }
-  msg += `Route:    ${res.route}`;
-
+    `🔔 You sold ${tokAmt} ${res.sym} = ${sui} Sui on Sui\n\n` +
+    `Wallet: \`${wTrunc}\`\n` +
+    `View on explorer: [${txTrunc}](${SUISCAN}${res.digest})`;
   if (res.pnl) {
-    const s     = res.pnl.pnl >= 0 ? '+' : '';
-    const label = res.pnl.pnl >= 0 ? '🟢 PROFIT' : '🔴 LOSS';
-    msg +=
-      `\n\n${label}\n` +
-      `Invested: ${res.pnl.spent.toFixed(4)} SUI\n` +
-      `Returned: ${feeSuiNum>0?netSui.toFixed(4):res.sui} SUI\n` +
-      `Total PNL: *${s}${res.pnl.pnl.toFixed(4)} SUI (${s}${res.pnl.pnlPct.toFixed(2)}%)*\n` +
-      `${pnlBar(res.pnl.pnlPct)}`;
+    const s = res.pnl.pnl >= 0 ? '+' : '';
+    msg += `\n\nP&L: *${s}${res.pnl.pnlPct.toFixed(2)}%* (${s}${res.pnl.pnl.toFixed(4)} SUI)`;
   }
-
-  msg += `\n\n🔗 [View TX](${SUISCAN}${res.digest})`;
   return msg;
 }
 
@@ -3001,6 +3162,7 @@ async function doPositions(chatId) {
         }
 
         const sellKb = { inline_keyboard: [
+          [{text:'📍 Close track',callback_data:`close_track:${i}`},{text:'✨ Flex',callback_data:`flex:${i}`}],
           [
             {text:'💸 25%',  callback_data:`qs:${i}:25` },
             {text:'💸 50%',  callback_data:`qs:${i}:50` },
@@ -3164,13 +3326,46 @@ async function doSellMenu(chatId, u) {
   }
 }
 
-async function startBuy(chatId, ct) {
+// ── Full RaidenX-style buy keyboard ───────────────────────────────
+function fullBuyKb(u, ct, amtRows){
+  const s=u.settings||{};
+  const wallets=getAllWallets(u);
+  const sel=(u.activeWalletIdx&&u.activeWalletIdx.length)?u.activeWalletIdx:[0];
+  const buyOn=s.buySellMode!=='sell';
+  const sellOn=s.buySellMode==='sell';
+  const m=s.mode||'swap';
+  const tip=Number(s.tipSui||0);
+  const gp=Number(s.gasPriceMist||750);
+  const auto=s.autoSell?'🟢 Auto Sell: ON':'⚪ Auto Sell: OFF';
+  return [
+    [{text:'≡ Menu',callback_data:'go_home'},{text:'📍 Track',callback_data:'go_pos'},{text:'🔄 Refresh',callback_data:'rbuy'}],
+    [{text:(buyOn?'✅ Buy Mode':'Buy Mode'),callback_data:'mode_buy'},{text:(sellOn?'✅ Sell Mode':'Sell Mode'),callback_data:'mode_sell'}],
+    [
+      {text:(m==='swap'?'✅ Swap':'Swap'),callback_data:'mode_swap'},
+      {text:(m==='limit'?'✅ Limit':'Limit'),callback_data:'mode_limit'},
+      {text:(m==='dca'?'✅ DCA':'DCA'),callback_data:'mode_dca'},
+      {text:(m==='migration'?'✅ Migration':'Migration'),callback_data:'mode_migration'},
+    ],
+    [{text:'----- Settings -----',callback_data:'noop'}],
+    [{text:`✏️ Slippage: ${s.slippage||1}%`,callback_data:'open_slip'},{text:`✏️ Gas Price: ${gp} MIST`,callback_data:'gas_edit'}],
+    [{text:`✏️ Tip Amount: ${tip} SUI`,callback_data:'tip_edit'}],
+    [{text:auto,callback_data:'auto_sell_toggle'}],
+    [{text:`----- Select Wallets (${sel.length}/${wallets.length||1}) -----`,callback_data:'wallet_panel'}],
+    ...amtRows,
+  ];
+}
+
+async function startBuy(chatId, ct, editMsgId) {
   const u=getU(chatId); if(!u) return;
-  const lm=await bot.sendMessage(chatId,'⏳ Fetching token info...');
+  let mid=editMsgId;
+  if(!mid){
+    const lm=await bot.sendMessage(chatId,'⏳ Fetching token info...');
+    mid=lm.message_id;
+  }
   const s=u.settings;
   try {
     const [d,st]=await Promise.all([getTokenData(ct, u.walletAddress), detectState(ct).catch(()=>null)]);
-    updU(chatId,{pd:{ct,sym:d.symbol}});
+    updU(chatId,{pd:{ct,sym:d.symbol,buyMsgId:mid}});
     const amts=s.buyAmounts||DEF_AMTS;
     // 3-column rocket grid — RaidenX style
     const amtBtns=amts.map((a,i)=>({text:`🚀 ${a} SUI`,callback_data:`ba:${i}`}));
@@ -3178,20 +3373,13 @@ async function startBuy(chatId, ct) {
     const amtRows=[];
     for(let i=0;i<amtBtns.length;i+=3) amtRows.push(amtBtns.slice(i,i+3));
     await bot.editMessageText(buyCard(d,ct,st),{
-      chat_id:chatId, message_id:lm.message_id, parse_mode:'Markdown',
-      reply_markup:{inline_keyboard:[
-        [{text:'≡ Menu',callback_data:'go_home'},{text:'📍 Positions',callback_data:'go_pos'},{text:'🔄 Refresh',callback_data:'rbuy'}],
-        [{text:'✅ Buy',callback_data:'noop'},{text:'💸 Sell',callback_data:'shr'}],
-        [{text:'----- Settings -----',callback_data:'noop'}],
-        [{text:`✏️ Slippage: ${s.slippage}%`,callback_data:'open_slip'},{text:'❌ Cancel',callback_data:'ca'}],
-        [{text:'----- Buy Amount -----',callback_data:'noop'}],
-        ...amtRows,
-      ]},
-    });
+      chat_id:chatId, message_id:mid, parse_mode:'Markdown',
+      reply_markup:{inline_keyboard:fullBuyKb(u,ct,amtRows)},
+    }).catch(e=>{ if(!String(e.message||'').includes('not modified')) throw e; });
   } catch(e) {
     const meta=await getMeta(ct).catch(()=>null);
     const sym=meta?.symbol||trunc(ct);
-    updU(chatId,{pd:{ct,sym}});
+    updU(chatId,{pd:{ct,sym,buyMsgId:mid}});
     const amts=s.buyAmounts||DEF_AMTS;
     const amtBtns=amts.map((a,i)=>({text:`🚀 ${a} SUI`,callback_data:`ba:${i}`}));
     amtBtns.push({text:'✏️ x SUI',callback_data:'ba:c'});
@@ -3199,12 +3387,7 @@ async function startBuy(chatId, ct) {
     for(let i=0;i<amtBtns.length;i+=3) amtRows.push(amtBtns.slice(i,i+3));
     await bot.editMessageText(
       `*${sym}/SUI*\n\`${ct}\`\n\n⚠️ _Token data unavailable — routing to best price_`,
-      {chat_id:chatId,message_id:lm.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[
-        [{text:'≡ Menu',callback_data:'go_home'},{text:'🔄 Refresh',callback_data:'rbuy'}],
-        [{text:`✏️ Slippage: ${s.slippage}%`,callback_data:'open_slip'},{text:'❌ Cancel',callback_data:'ca'}],
-        [{text:'----- Buy Amount -----',callback_data:'noop'}],
-        ...amtRows,
-      ]}}
+      {chat_id:chatId,message_id:mid,parse_mode:'Markdown',reply_markup:{inline_keyboard:fullBuyKb(u,ct,amtRows)}}
     );
   }
 }
@@ -3303,11 +3486,29 @@ bot.onText(/\/start(.*)/, async(msg, match) => {
     updU(chatId,{state:null});
   }
   if(u.walletAddress){
-    await bot.sendMessage(chatId,`👋 *Welcome back!*\n\n💼 Wallet:\n\`${u.walletAddress}\`\n\n_Paste any CA to trade instantly_`,{parse_mode:'Markdown',reply_markup:MAIN_KB});
+    let bal='—';
+    try { const bi=await sui.getBalance({owner:u.walletAddress,coinType:SUI_T}); bal=(Number(bi.totalBalance)/1e9).toFixed(4); } catch {}
+    const refLink=u.referralCode?`https://t.me/${BOT_USERNAME||'Sui_agent_bot'}?start=${u.referralCode}`:'';
+    const msg =
+      `*Agent — Sui Trading Bot* 🌊\n\n` +
+      `Welcome back! The fastest way to trade on Sui.\n\n` +
+      `💼 *Wallet*\n\`${u.walletAddress}\`\n` +
+      `Balance: *${bal} SUI*\n\n` +
+      `_Paste any CA to instantly buy a token._\n` +
+      (refLink?`\n🔗 *Referral:* \`${u.referralCode}\`\n`:'');
+    await bot.sendMessage(chatId,msg,{parse_mode:'Markdown',disable_web_page_preview:true,reply_markup:MAIN_KB});
   }else{
     await bot.sendMessage(chatId,
-      `👋 Welcome to *AGENT TRADING BOT*\n\nThe fastest trading bot on Sui.\n\nConnect your wallet to start trading:`,
-      {parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'🔑 Import Wallet',callback_data:'import_wallet'}],[{text:'✨ Create New Wallet',callback_data:'gen_wallet'}]]}});
+      `*Agent — Sui Trading Bot* 🌊\n\n` +
+      `The fastest trading bot on Sui.\n\n` +
+      `▪️ Buy & sell with one tap\n` +
+      `▪️ Snipe new launches the moment LP is added\n` +
+      `▪️ Track positions & P&L in real time\n\n` +
+      `Connect your wallet to start trading:`,
+      {parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+        [{text:'🔑 Import Wallet',callback_data:'import_wallet'}],
+        [{text:'✨ Create New Wallet',callback_data:'gen_wallet'}],
+      ]}});
   }
 });
 
@@ -3452,7 +3653,7 @@ bot.on('callback_query', async(q) => {
       const m = await bot.sendMessage(chatId, `⚡ Selling *${pct}%* of *${pos.sym}*...`, { parse_mode:'Markdown' });
       try {
         const res = await executeSell(chatId, pos.ct, pct);
-        const sellMsg = formatSellResult(res);
+        const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
         await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
         if (res.pnl) {
           const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
@@ -3466,18 +3667,121 @@ bot.on('callback_query', async(q) => {
     }
 
     // ── Navigation callbacks (RaidenX-style) ─────────────
+    // Mode toggles — Buy Mode / Sell Mode / Swap / Limit / DCA / Migration
+    if(data==='mode_buy'||data==='mode_sell'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId); if(uu){uu.settings.buySellMode=(data==='mode_sell')?'sell':'buy';saveDB();}
+      // Re-render in place
+      const ct=uu?.pd?.ct; if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+      return;
+    }
+    if(data==='mode_swap'||data==='mode_limit'||data==='mode_dca'||data==='mode_migration'){
+      await bot.answerCallbackQuery(q.id,{text:`Mode: ${data.slice(5).toUpperCase()}`}).catch(()=>{});
+      const uu=getU(chatId); if(uu){uu.settings.mode=data.slice(5);saveDB();}
+      const ct=uu?.pd?.ct;
+      if(data==='mode_limit'&&ct){updU(chatId,{state:'limit_target',pd:{...uu.pd}});await bot.sendMessage(chatId,`📊 *Set Limit Order*\n\nFormat: \`<sui_amount> <target_price_usd> <above|below>\`\n_Example: \`1 0.0005 below\` — buy 1 SUI when price drops to $0.0005_`,{parse_mode:'Markdown'});return;}
+      if(data==='mode_dca'&&ct){updU(chatId,{state:'dca_setup',pd:{...uu.pd}});await bot.sendMessage(chatId,`🔄 *Set DCA*\n\nFormat: \`<sui_per_buy> <interval_minutes> <total_buys>\`\n_Example: \`0.5 60 10\` — buy 0.5 SUI every 60min, 10 times_`,{parse_mode:'Markdown'});return;}
+      if(data==='mode_migration'&&ct){
+        const uu2=getU(chatId); uu2.migAlerts=uu2.migAlerts||[];
+        if(!uu2.migAlerts.find(a=>a.ct===ct)){uu2.migAlerts.push({ct,lastState:null,at:Date.now()});saveDB();}
+        await bot.sendMessage(chatId,`🚀 *Migration alert set*\n\nYou'll be notified when this token graduates from launchpad to a DEX.`,{parse_mode:'Markdown'});
+        return;
+      }
+      if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+      return;
+    }
+    // Gas / Tip / Auto-Sell editors
+    if(data==='gas_edit'){await bot.answerCallbackQuery(q.id).catch(()=>{});updU(chatId,{state:'edit_gas'});await bot.sendMessage(chatId,'⛽ Enter gas price in MIST (default 750):');return;}
+    if(data==='tip_edit'){await bot.answerCallbackQuery(q.id).catch(()=>{});updU(chatId,{state:'edit_tip'});await bot.sendMessage(chatId,'💰 Enter tip amount in SUI (0 to disable):');return;}
+    if(data==='auto_sell_toggle'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId); if(uu){uu.settings.autoSell=!uu.settings.autoSell;saveDB();}
+      const onOff=uu.settings.autoSell?'ON':'OFF';
+      await bot.sendMessage(chatId,`Auto Sell is now *${onOff}*\nDefaults: TP +${uu.settings.autoSellTpPct||50}%  ·  SL -${uu.settings.autoSellSlPct||30}%\nEdit per-position from Track view.`,{parse_mode:'Markdown'});
+      const ct=uu?.pd?.ct; if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+      return;
+    }
+    // Wallet panel
+    if(data==='wallet_panel'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId); const wallets=getAllWallets(uu);
+      const sel=new Set((uu.activeWalletIdx||[0]));
+      const rows=wallets.map((w,i)=>[{text:`${sel.has(i)?'✅':'⬜'} ${w.label||'W'+i}: ${w.address.slice(0,6)}...${w.address.slice(-4)}`,callback_data:`wt:${i}`}]);
+      rows.push([{text:'🔘 Select All',callback_data:'wt:all'},{text:'➕ Add Wallet',callback_data:'wt:add'}]);
+      rows.push([{text:'⬅️ Back',callback_data:'rbuy'}]);
+      await bot.sendMessage(chatId,`*Select Wallets (${sel.size}/${wallets.length||1})*`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:rows}});
+      return;
+    }
+    if(data.startsWith('wt:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const arg=data.slice(3);
+      const uu=getU(chatId); const wallets=getAllWallets(uu);
+      uu.activeWalletIdx=uu.activeWalletIdx||[0];
+      if(arg==='all'){uu.activeWalletIdx=wallets.map((_,i)=>i);}
+      else if(arg==='add'){await bot.sendMessage(chatId,'➕ To add another wallet, send /import in a private message. (Multi-wallet trading executes the same trade across all selected wallets.)');return;}
+      else {const i=parseInt(arg); if(!isNaN(i)){const s=new Set(uu.activeWalletIdx); s.has(i)?s.delete(i):s.add(i); if(s.size===0) s.add(0); uu.activeWalletIdx=[...s].sort();}}
+      saveDB();
+      const sel=new Set(uu.activeWalletIdx);
+      const rows=wallets.map((w,i)=>[{text:`${sel.has(i)?'✅':'⬜'} ${w.label||'W'+i}: ${w.address.slice(0,6)}...${w.address.slice(-4)}`,callback_data:`wt:${i}`}]);
+      rows.push([{text:'🔘 Select All',callback_data:'wt:all'},{text:'➕ Add Wallet',callback_data:'wt:add'}]);
+      rows.push([{text:'⬅️ Back',callback_data:'rbuy'}]);
+      await bot.editMessageReplyMarkup({inline_keyboard:rows},{chat_id:chatId,message_id:q.message.message_id}).catch(()=>{});
+      return;
+    }
+    // Track view buttons
+    if(data==='track_last'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId);
+      const last=uu?.positions?.[uu.positions.length-1];
+      if(!last){await bot.sendMessage(chatId,'No position found.');return;}
+      await doPositions(chatId); return;
+    }
+    if(data.startsWith('close_track:')){
+      await bot.answerCallbackQuery(q.id,{text:'Position closed from tracking'}).catch(()=>{});
+      const uu=getU(chatId); const idx=parseInt(data.split(':')[1]);
+      if(uu&&uu.positions&&!isNaN(idx)){uu.positions.splice(idx,1);saveDB();}
+      try{await bot.deleteMessage(chatId,q.message.message_id);}catch{}
+      return;
+    }
+    if(data.startsWith('flex:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId); const idx=parseInt(data.split(':')[1]);
+      const pos=uu?.positions?.[idx]; if(!pos){return;}
+      try {
+        const p=await getPnl(pos);
+        if(!p){await bot.sendMessage(chatId,'No PnL data available.');return;}
+        const cap=`${p.pnl>=0?'🚀':'💀'} *${pos.sym}/SUI*\n\nEntry → Current\nP&L: *${p.pnl>=0?'+':''}${p.pct.toFixed(2)}%* (${p.pnl>=0?'+':''}${p.pnl.toFixed(4)} SUI)\n\n_Shared via Agent Trading Bot_`;
+        await bot.sendPhoto(chatId,pnlChart(pos.sym,p.pct,parseFloat(pos.spent||0),p.cur),{caption:cap,parse_mode:'Markdown'});
+      } catch(e){await bot.sendMessage(chatId,`Couldn't generate flex card: ${e.message?.slice(0,80)}`);}
+      return;
+    }
+
     if(data==='go_home'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu)await bot.sendMessage(chatId,'≡ *Main Menu*',{parse_mode:'Markdown',reply_markup:MAIN_KB});return;}
     if(data==='go_pos'){await bot.answerCallbackQuery(q.id).catch(()=>{});await doPositions(chatId);return;}
     if(data==='open_slip'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu){updU(chatId,{state:'edit_slip'});await bot.sendMessage(chatId,'✏️ Enter slippage % (e.g. 1, 2, 5):');}return;}
     if(data==='rbuy'){
-      await bot.answerCallbackQuery(q.id).catch(()=>{});
-      const u=getU(chatId); if(!u?.pd?.ct){await bot.sendMessage(chatId,'❌ Session expired. Paste the CA again.');return;}
-      await startBuy(chatId,u.pd.ct); return;
+      await bot.answerCallbackQuery(q.id,{text:'🔄 Refreshing...'}).catch(()=>{});
+      const u=getU(chatId);
+      // Recover CA from the message body if session was lost
+      let ct=u?.pd?.ct;
+      if(!ct){
+        const body=q.message?.text||q.message?.caption||'';
+        const m=body.match(/0x[a-fA-F0-9]{6,}(?:::[A-Za-z0-9_]+){0,2}/);
+        if(m) ct=m[0];
+      }
+      if(!ct){await bot.answerCallbackQuery(q.id,{text:'Paste the CA again',show_alert:true}).catch(()=>{});return;}
+      await startBuy(chatId,ct,q.message.message_id); return;
     }
     if(data==='shr'){
       await bot.answerCallbackQuery(q.id).catch(()=>{});
-      const u=getU(chatId); if(!u?.pd?.ct){await bot.sendMessage(chatId,'❌ Session expired. Paste the CA again.');return;}
-      const sct=u.pd.ct;
+      const u=getU(chatId);
+      let sct=u?.pd?.ct;
+      if(!sct){
+        const body=q.message?.text||q.message?.caption||'';
+        const mm=body.match(/0x[a-fA-F0-9]{6,}(?:::[A-Za-z0-9_]+){0,2}/);
+        if(mm) sct=mm[0];
+      }
+      if(!sct){await bot.sendMessage(chatId,'❌ Paste the CA again to sell.');return;}
       const smeta=await getMeta(sct).catch(()=>null);
       const ssym=smeta?.symbol||trunc(sct);
       await guard(chatId,async()=>showSellPct(chatId,sct,ssym,null));
@@ -3501,11 +3805,17 @@ bot.on('callback_query', async(q) => {
       try{
         const res=await executeBuy(chatId,bc_ct,bc_amt);
         const gotTok=res.out&&res.out!='?';
-        const recvLine=gotTok?`✅ Received: *${Number(res.out).toLocaleString('en',{maximumFractionDigits:6})} ${res.sym}*\n`:'';
-        const priceLine=gotTok?`💹 Price: *${(parseFloat(bc_amt)/parseFloat(res.out)).toFixed(8)} SUI/${res.sym}*\n`:'';
+        const tokAmt=gotTok?Number(res.out).toLocaleString('en',{maximumFractionDigits:6}):'?';
+        const wAddr=u.walletAddress||'';
+        const wTrunc=wAddr?`${wAddr.slice(0,6)}...${wAddr.slice(-4)}`:'—';
+        const txTrunc=res.digest?`${res.digest.slice(0,6)}...${res.digest.slice(-4)}`:'—';
+        // RaidenX-style buy notification
         await bot.editMessageText(
-          `🟢 *Buy Executed!*\n━━━━━━━━━━━━━━━━━━━━\n🪙 Token: *${res.sym}*\n💸 Spent:    \`${bc_amt} SUI\`\n${recvLine}${priceLine}⚡ Fee:      \`${res.feeSui} SUI\`\n🔀 Route:   ${res.route}\n${res.bonding?`📊 Launchpad: ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
-          {chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+          `🔔 You bought ${tokAmt} ${res.sym} = ${bc_amt} Sui on Sui\n\n` +
+          `Wallet: \`${wTrunc}\`\n` +
+          `View on explorer: [${txTrunc}](${SUISCAN}${res.digest})`,
+          {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',disable_web_page_preview:true,
+           reply_markup:{inline_keyboard:[[{text:'📍 Track',callback_data:'track_last'}]]}});
       }catch(e){await bot.editMessageText(`❌ Buy failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:msgId});}
       updU(chatId,{pd:{}}); return;
     }
@@ -3535,7 +3845,7 @@ bot.on('callback_query', async(q) => {
       await bot.editMessageText('⚡ Executing sell...',{chat_id:chatId,message_id:msgId});
       try{
         const res = await executeSell(chatId, sc_ct, sc_pct);
-        const sellMsg = formatSellResult(res);
+        const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
         await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:msgId, parse_mode:'Markdown', disable_web_page_preview:true });
         if (res.pnl) {
           const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
@@ -3765,10 +4075,39 @@ bot.on('message', async(msg) => {
   if(state==='snipe_amount'){
     const amt=parseFloat(text); if(isNaN(amt)||amt<=0){await bot.sendMessage(chatId,'❌ Invalid amount.');return;}
     const pd=u.pd||{};
+    updU(chatId,{state:'snipe_mc',pd:{...pd,sniAmt:amt}});
+    await bot.sendMessage(chatId,
+      `📊 *Set MC trigger* (optional)\n\n` +
+      `Snipe will fire when token launches at this market cap *or higher*.\n\n` +
+      `_Examples:_\n` +
+      `• \`50000\` — snipe only if MC ≥ $50K at launch\n` +
+      `• \`skip\` — snipe immediately when LP is added (no MC filter)\n\n` +
+      `Send a number or "skip":`,
+      {parse_mode:'Markdown'});
+    return;
+  }
+
+  if(state==='snipe_mc'){
+    const pd=u.pd||{};
+    let minMc=0;
+    const t=text.trim().toLowerCase();
+    if(t!=='skip'&&t!=='0'&&t!==''){
+      const n=parseFloat(text.replace(/[, _$]/g,''));
+      if(isNaN(n)||n<0){await bot.sendMessage(chatId,'❌ Send a number (e.g. 50000) or "skip".');return;}
+      minMc=n;
+    }
     u.snipeWatches=u.snipeWatches||[];
-    u.snipeWatches.push({ct:pd.sniToken,sui:amt,mode:'any',triggered:false,at:Date.now()});
+    u.snipeWatches.push({ct:pd.sniToken,sui:pd.sniAmt,mode:'any',minMc,triggered:false,at:Date.now()});
     updU(chatId,{state:null,pd:{},snipeWatches:u.snipeWatches});
-    await bot.sendMessage(chatId,`⚡ *Snipe set!*\n\nToken: \`${trunc(pd.sniToken)}\`\nBuy: ${amt} SUI\n\nWatching for pool creation...`,{parse_mode:'Markdown'}); return;
+    const mcLine=minMc>0?`MC trigger: *≥ $${fNum(minMc)}*`:`MC trigger: _none — snipe on LP_`;
+    await bot.sendMessage(chatId,
+      `⚡ *Snipe set!*\n\n` +
+      `Token: \`${trunc(pd.sniToken)}\`\n` +
+      `Buy: *${pd.sniAmt} SUI*\n` +
+      `${mcLine}\n\n` +
+      `_Watching for pool creation..._`,
+      {parse_mode:'Markdown'});
+    return;
   }
 
   if(state==='buy_custom'){
@@ -3814,7 +4153,7 @@ bot.on('message', async(msg) => {
     const m = await bot.sendMessage(chatId, `⚡ Selling *${pct}%* of *${pos.sym}*...`, { parse_mode:'Markdown' });
     try {
       const res = await executeSell(chatId, pos.ct, pct);
-      const sellMsg = formatSellResult(res);
+      const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
       await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
       if (res.pnl) {
         const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
@@ -3824,6 +4163,49 @@ bot.on('message', async(msg) => {
     } catch(e) {
       await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown' });
     }
+    return;
+  }
+
+  if(state==='edit_gas'){
+    updU(chatId,{state:null});
+    const n=parseInt(text.replace(/\D/g,''));
+    if(isNaN(n)||n<100||n>100000){await bot.sendMessage(chatId,'❌ Send a value between 100 and 100000 MIST.');return;}
+    const uu=getU(chatId); if(uu){uu.settings.gasPriceMist=n;saveDB();}
+    await bot.sendMessage(chatId,`✅ Gas price set to ${n} MIST`); return;
+  }
+  if(state==='edit_tip'){
+    updU(chatId,{state:null});
+    const n=parseFloat(text);
+    if(isNaN(n)||n<0||n>10){await bot.sendMessage(chatId,'❌ Send a number between 0 and 10 SUI.');return;}
+    const uu=getU(chatId); if(uu){uu.settings.tipSui=n;saveDB();}
+    await bot.sendMessage(chatId,`✅ Tip set to ${n} SUI per trade`); return;
+  }
+  if(state==='limit_target'){
+    updU(chatId,{state:null});
+    const parts=text.trim().split(/\s+/);
+    const sui=parseFloat(parts[0]); const target=parseFloat(parts[1]); const dir=(parts[2]||'').toLowerCase();
+    if(isNaN(sui)||sui<=0||isNaN(target)||target<=0||!['above','below','>=','<='].includes(dir)){
+      await bot.sendMessage(chatId,'❌ Format: `<sui> <target_usd> <above|below>`',{parse_mode:'Markdown'});return;
+    }
+    const ct=u.pd?.ct; if(!ct){await bot.sendMessage(chatId,'❌ No token in context.');return;}
+    const uu=getU(chatId); uu.limitOrders=uu.limitOrders||[];
+    uu.limitOrders.push({ct,sui,targetPriceUsd:target,dir:(dir==='above'||dir==='>=')?'>=':'<=',triggered:false,at:Date.now()});
+    saveDB();
+    await bot.sendMessage(chatId,`✅ *Limit order set*\nBuy ${sui} SUI when price ${dir==='above'||dir==='>='?'≥':'≤'} $${target}`,{parse_mode:'Markdown'});
+    return;
+  }
+  if(state==='dca_setup'){
+    updU(chatId,{state:null});
+    const parts=text.trim().split(/\s+/);
+    const sui=parseFloat(parts[0]); const intMin=parseFloat(parts[1]); const total=parseInt(parts[2]);
+    if(isNaN(sui)||sui<=0||isNaN(intMin)||intMin<1||isNaN(total)||total<1||total>100){
+      await bot.sendMessage(chatId,'❌ Format: `<sui> <interval_min> <total_buys>` (interval ≥ 1, total ≤ 100)',{parse_mode:'Markdown'});return;
+    }
+    const ct=u.pd?.ct; if(!ct){await bot.sendMessage(chatId,'❌ No token in context.');return;}
+    const uu=getU(chatId); uu.dcaOrders=uu.dcaOrders||[];
+    uu.dcaOrders.push({ct,sui,intervalSec:Math.floor(intMin*60),lastFire:0,count:0,totalCount:total,at:Date.now()});
+    saveDB();
+    await bot.sendMessage(chatId,`✅ *DCA started*\n${sui} SUI every ${intMin}min × ${total} buys`,{parse_mode:'Markdown'});
     return;
   }
 
@@ -5143,6 +5525,10 @@ async function main() {
   positionMonitor().catch(e=>console.error('Monitor:', e));
   sniperEngine().catch(e=>console.error('Sniper:', e));
   copyEngine().catch(e=>console.error('Copy:', e));
+  limitEngine().catch(e=>console.error('Limit:', e));
+  dcaEngine().catch(e=>console.error('DCA:', e));
+  autoSellEngine().catch(e=>console.error('AutoSell:', e));
+  migrationEngine().catch(e=>console.error('Migration:', e));
 
   console.log('  Bot is live! 🚀');
   if(ADMIN_ID) bot.sendMessage(ADMIN_ID,'🟢 AGENT TRADING BOT v6 online.').catch(()=>{});
