@@ -69,10 +69,10 @@ import {
 // ═══════════════════════════════════════════════════════════
 // CONFIG — set via environment variables
 // ═══════════════════════════════════════════════════════════
-const TG_TOKEN    = process.env.TG_BOT_TOKEN  || '';
-const ENC_KEY     = process.env.ENCRYPT_KEY   || '';
+const TG_TOKEN    = process.env.TG_BOT_TOKEN  || process.env.BOT_TOKEN || '';
+const ENC_KEY     = process.env.ENCRYPT_KEY   || process.env.SESSION_SECRET || '';
 const RPC_URL     = process.env.RPC_URL       || 'https://fullnode.mainnet.sui.io:443';
-const ADMIN_ID    = process.env.ADMIN_CHAT_ID || '';
+const ADMIN_ID    = process.env.ADMIN_CHAT_ID || process.env.ADMIN_ID || '';
 
 const DEV_WALLET  = '0x47cee6fed8a44224350d0565a45dd97b320a9c3f54a8feb6036fb9b2d3a81a08';
 const FEE_BPS     = 500;           // 5% bot fee (auto-sent to DEV_WALLET on every trade)
@@ -88,8 +88,13 @@ const SUI_AGENT_POOL = '0xe8bf297251264d4474a6f6115ebeeeea4a3e50d534d3b663691e22
 const SUISCAN     = 'https://suiscan.xyz/mainnet/tx/';
 
 // ─── Redis client (persists users.json across Railway deployments) ───
-const redisClient = createClient({ url: process.env.REDIS_URL });
-redisClient.on('error', e => console.error('Redis error:', e.message));
+// Falls back to local file `./bot-db.json` when REDIS_URL is not set.
+const REDIS_ENABLED = !!process.env.REDIS_URL;
+const DB_FILE = process.env.DB_FILE || './bot-db.json';
+const redisClient = REDIS_ENABLED
+  ? createClient({ url: process.env.REDIS_URL, socket:{ reconnectStrategy:r=>r>3?false:Math.min(r*500,3000) } })
+  : { connect:async()=>{}, get:async()=>null, set:async()=>{}, on:()=>{} };
+if (REDIS_ENABLED) redisClient.on('error', e => console.error('Redis error:', e.message));
 const GECKO       = 'https://api.geckoterminal.com/api/v2';
 const GECKO_NET   = 'sui-network';
 const BB_KEY      = '9W0M5OHgX2gF05Si1AG7kPUm6hxg6P';
@@ -176,19 +181,37 @@ function trunc(a)    { return (!a || a.length < 12) ? (a || '') : a.slice(0,6)+'
 // ═══════════════════════════════════════════════════════════
 let DB = {};
 async function loadDB() {
-  try {
-    await redisClient.connect();
-    const raw = await redisClient.get('agent_bot_db');
-    DB = raw ? JSON.parse(raw) : {};
-    console.log(`✅ DB loaded from Redis — ${Object.keys(DB).length} users`);
-  } catch(e) {
-    console.error('Redis loadDB failed, starting empty:', e.message);
-    DB = {};
+  if (REDIS_ENABLED) {
+    try {
+      await redisClient.connect();
+      const raw = await redisClient.get('agent_bot_db');
+      DB = raw ? JSON.parse(raw) : {};
+      console.log(`✅ DB loaded from Redis — ${Object.keys(DB).length} users`);
+      return;
+    } catch(e) {
+      console.error('Redis loadDB failed, falling back to file:', e.message);
+    }
   }
+  try {
+    if (existsSync(DB_FILE)) {
+      DB = JSON.parse(readFileSync(DB_FILE, 'utf8'));
+      console.log(`✅ DB loaded from ${DB_FILE} — ${Object.keys(DB).length} users`);
+    } else { DB = {}; console.log(`✅ DB starting empty (file-mode, will write to ${DB_FILE})`); }
+  } catch(e) { console.error('File loadDB failed, starting empty:', e.message); DB = {}; }
 }
+let _saveTimer = null;
 function saveDB() {
-  redisClient.set('agent_bot_db', JSON.stringify(DB))
-    .catch(e => console.error('Redis saveDB error:', e.message));
+  if (REDIS_ENABLED) {
+    redisClient.set('agent_bot_db', JSON.stringify(DB))
+      .catch(e => console.error('Redis saveDB error:', e.message));
+    return;
+  }
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    try { writeFileSync(DB_FILE, JSON.stringify(DB)); }
+    catch(e) { console.error('File saveDB error:', e.message); }
+  }, 300);
 }
 function getU(id)    { return DB[String(id)] || null; }
 function makeU(id, extra={}) {
@@ -1665,6 +1688,7 @@ async function executeSell(chatId, ct, pct) {
       packageId: _odyInfo.moonbagsPackageId, coinType: ct,
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
     const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -1686,6 +1710,7 @@ async function executeSell(chatId, ct, pct) {
       walletAddress: u.walletAddress, coinType: ct,
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Moonbags sell TX failed');
     const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -1708,6 +1733,7 @@ async function executeSell(chatId, ct, pct) {
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
       curveOverride: _hfInfo.curveId || null,
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'hop.fun sell TX failed');
     const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -1740,6 +1766,7 @@ async function executeSell(chatId, ct, pct) {
       minAmountOut: minOut.toString(),
     });
 
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Sell TX failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1758,6 +1785,7 @@ async function executeSell(chatId, ct, pct) {
       coinInType,
       amountIn: sellAmt.toString(),
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1770,6 +1798,7 @@ async function executeSell(chatId, ct, pct) {
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1782,6 +1811,7 @@ async function executeSell(chatId, ct, pct) {
       wallet: u.walletAddress, poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1794,6 +1824,7 @@ async function executeSell(chatId, ct, pct) {
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1836,6 +1867,7 @@ async function executeSell(chatId, ct, pct) {
       amountIn:     sellAmt.toString(),
       minAmountOut: '0',
     });
+    try{applyTxOpts(tx1, u);}catch{}
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
     if (res1.effects?.status?.status !== 'success') throw new Error('PANS sell hop1 (TOKEN→PANS): ' + (res1.effects?.status?.error || 'TX failed'));
 
@@ -1865,6 +1897,7 @@ async function executeSell(chatId, ct, pct) {
       amountIn:     pansReceived.toString(),
       minAmountOut: '0',
     });
+    try{applyTxOpts(tx2, u);}catch{}
     const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
     if (res2.effects?.status?.status !== 'success') throw new Error('PANS sell hop2 (PANS→SUI): ' + (res2.effects?.status?.error || 'TX failed'));
 
@@ -1885,6 +1918,7 @@ async function executeSell(chatId, ct, pct) {
         const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
         if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
       }
+      try{applyTxOpts(feeTx, u);}catch{}
       await sui.signAndExecuteTransaction({ signer:kp, transaction:feeTx, options:{showEffects:true} }).catch(()=>{});
     }
 
@@ -2007,6 +2041,7 @@ async function executeSell(chatId, ct, pct) {
       coinA: poolCoinA, coinB: poolCoinB, a2b: a2b1,
       coinInType: ct, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx1, u);}catch{}
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
     if (res1.effects?.status?.status !== 'success') throw new Error('AGENT sell hop1 (MEME→AGENT): ' + (res1.effects?.status?.error || 'TX failed'));
 
@@ -2021,6 +2056,7 @@ async function executeSell(chatId, ct, pct) {
       coinA: AGENT_T, coinB: SUI_T, a2b: true,
       coinInType: AGENT_T, amountIn: agentGot.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx2, u);}catch{}
     const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
     if (res2.effects?.status?.status !== 'success') throw new Error('AGENT sell hop2 (AGENT→SUI): ' + (res2.effects?.status?.error || 'TX failed'));
 
@@ -2049,6 +2085,7 @@ async function executeSell(chatId, ct, pct) {
         packageId: _odyFallback.moonbagsPackageId, coinType: ct,
         tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
       });
+      try{applyTxOpts(tx, u);}catch{}
       const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
       if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
       const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -2069,6 +2106,7 @@ async function executeSell(chatId, ct, pct) {
         walletAddress: u.walletAddress, coinType: ct,
         tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
       });
+      try{applyTxOpts(tx, u);}catch{}
       const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
       if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Moonbags sell TX failed');
       const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -2090,6 +2128,7 @@ async function executeSell(chatId, ct, pct) {
         tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
         curveOverride: _hfFallback.curveId || null,
       });
+      try{applyTxOpts(tx, u);}catch{}
       const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
       if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'hop.fun sell TX failed');
       const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -2105,6 +2144,7 @@ async function executeSell(chatId, ct, pct) {
   const pool = await findCetusPool(ct, SUI_T);
   if (pool) {
     const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType:ct, amountIn:sellAmt.toString(), minAmountOut:'0' });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const pnlD=computeSellPnl(chatId,ct,pct,suiR,0); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:'0',route:'Cetus',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD}; }
@@ -2836,7 +2876,7 @@ async function _spotPriceUsd(ct){
 
 async function limitEngine() {
   while (true) {
-    await sleep(20_000);
+    await sleep(10_000);
     for (const [uid, u] of Object.entries(DB)) {
       if (!u.limitOrders?.length || isLocked(u)) continue;
       for (const lo of u.limitOrders) {
@@ -2862,7 +2902,7 @@ async function limitEngine() {
 
 async function dcaEngine() {
   while (true) {
-    await sleep(15_000);
+    await sleep(10_000);
     const now = Date.now();
     for (const [uid, u] of Object.entries(DB)) {
       if (!u.dcaOrders?.length || isLocked(u)) continue;
@@ -2885,7 +2925,7 @@ async function dcaEngine() {
 
 async function autoSellEngine() {
   while (true) {
-    await sleep(30_000);
+    await sleep(15_000);
     for (const [uid, u] of Object.entries(DB)) {
       if (!u.settings?.autoSell || !u.positions?.length || isLocked(u)) continue;
       const tp = Number(u.settings.autoSellTpPct || 50);
@@ -2913,7 +2953,7 @@ async function autoSellEngine() {
 
 async function migrationEngine() {
   while (true) {
-    await sleep(45_000);
+    await sleep(30_000);
     for (const [uid, u] of Object.entries(DB)) {
       if (!u.migAlerts?.length || isLocked(u)) continue;
       for (const a of u.migAlerts) {
@@ -3679,8 +3719,26 @@ bot.on('callback_query', async(q) => {
       await bot.answerCallbackQuery(q.id,{text:`Mode: ${data.slice(5).toUpperCase()}`}).catch(()=>{});
       const uu=getU(chatId); if(uu){uu.settings.mode=data.slice(5);saveDB();}
       const ct=uu?.pd?.ct;
-      if(data==='mode_limit'&&ct){updU(chatId,{state:'limit_target',pd:{...uu.pd}});await bot.sendMessage(chatId,`📊 *Set Limit Order*\n\nFormat: \`<sui_amount> <target_price_usd> <above|below>\`\n_Example: \`1 0.0005 below\` — buy 1 SUI when price drops to $0.0005_`,{parse_mode:'Markdown'});return;}
-      if(data==='mode_dca'&&ct){updU(chatId,{state:'dca_setup',pd:{...uu.pd}});await bot.sendMessage(chatId,`🔄 *Set DCA*\n\nFormat: \`<sui_per_buy> <interval_minutes> <total_buys>\`\n_Example: \`0.5 60 10\` — buy 0.5 SUI every 60min, 10 times_`,{parse_mode:'Markdown'});return;}
+      if(data==='mode_limit'&&ct){
+        // Step 1 of 3: pick SUI amount with quick-pick buttons
+        updU(chatId,{state:'wiz_limit_amt',pd:{...uu.pd,wiz:{}}});
+        await bot.sendMessage(chatId,`📊 *Set Limit Order — Step 1 of 3*\n\nHow much SUI do you want to spend when triggered?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'0.1 SUI',callback_data:'wiz:lamt:0.1'},{text:'0.5 SUI',callback_data:'wiz:lamt:0.5'},{text:'1 SUI',callback_data:'wiz:lamt:1'}],
+          [{text:'2 SUI',callback_data:'wiz:lamt:2'},{text:'5 SUI',callback_data:'wiz:lamt:5'},{text:'10 SUI',callback_data:'wiz:lamt:10'}],
+          [{text:'✏️ Custom amount',callback_data:'wiz:lamt:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
+      if(data==='mode_dca'&&ct){
+        // Step 1 of 3: SUI per buy
+        updU(chatId,{state:'wiz_dca_amt',pd:{...uu.pd,wiz:{}}});
+        await bot.sendMessage(chatId,`🔄 *Set DCA — Step 1 of 3*\n\nHow much SUI per buy?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'0.1 SUI',callback_data:'wiz:damt:0.1'},{text:'0.5 SUI',callback_data:'wiz:damt:0.5'},{text:'1 SUI',callback_data:'wiz:damt:1'}],
+          [{text:'2 SUI',callback_data:'wiz:damt:2'},{text:'5 SUI',callback_data:'wiz:damt:5'},{text:'10 SUI',callback_data:'wiz:damt:10'}],
+          [{text:'✏️ Custom amount',callback_data:'wiz:damt:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
       if(data==='mode_migration'&&ct){
         const uu2=getU(chatId); uu2.migAlerts=uu2.migAlerts||[];
         if(!uu2.migAlerts.find(a=>a.ct===ct)){uu2.migAlerts.push({ct,lastState:null,at:Date.now()});saveDB();}
@@ -3691,8 +3749,100 @@ bot.on('callback_query', async(q) => {
       return;
     }
     // Gas / Tip / Auto-Sell editors
-    if(data==='gas_edit'){await bot.answerCallbackQuery(q.id).catch(()=>{});updU(chatId,{state:'edit_gas'});await bot.sendMessage(chatId,'⛽ Enter gas price in MIST (default 750):');return;}
-    if(data==='tip_edit'){await bot.answerCallbackQuery(q.id).catch(()=>{});updU(chatId,{state:'edit_tip'});await bot.sendMessage(chatId,'💰 Enter tip amount in SUI (0 to disable):');return;}
+    if(data==='gas_edit'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      await bot.sendMessage(chatId,'⛽ *Set Gas Price*\n\nHigher gas = faster confirmation. Default 750 MIST works in normal conditions.',{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+        [{text:'750 (default)',callback_data:'gas:750'},{text:'1000 (fast)',callback_data:'gas:1000'}],
+        [{text:'2000 (fastest)',callback_data:'gas:2000'},{text:'5000 (turbo)',callback_data:'gas:5000'}],
+        [{text:'✏️ Custom MIST',callback_data:'gas:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+      ]}});
+      return;
+    }
+    if(data==='tip_edit'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      await bot.sendMessage(chatId,'💰 *Set Tip Amount*\n\nOptional priority tip per trade (extra SUI sent to dev wallet to support the bot).',{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+        [{text:'0 (off)',callback_data:'tip:0'},{text:'0.001',callback_data:'tip:0.001'},{text:'0.01',callback_data:'tip:0.01'}],
+        [{text:'0.05',callback_data:'tip:0.05'},{text:'0.1',callback_data:'tip:0.1'},{text:'0.5',callback_data:'tip:0.5'}],
+        [{text:'✏️ Custom SUI',callback_data:'tip:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+      ]}});
+      return;
+    }
+    // Gas / Tip quick-pick callbacks
+    if(data.startsWith('gas:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const arg=data.slice(4);
+      if(arg==='custom'){updU(chatId,{state:'edit_gas'});await bot.sendMessage(chatId,'⛽ Enter custom gas price in MIST (100–100000):');return;}
+      const n=parseInt(arg); if(isNaN(n)){return;}
+      const uu=getU(chatId); uu.settings.gasPriceMist=n; saveDB();
+      await bot.sendMessage(chatId,`✅ Gas price set to *${n} MIST*`,{parse_mode:'Markdown'});
+      return;
+    }
+    if(data.startsWith('tip:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const arg=data.slice(4);
+      if(arg==='custom'){updU(chatId,{state:'edit_tip'});await bot.sendMessage(chatId,'💰 Enter custom tip in SUI (0–10):');return;}
+      const n=parseFloat(arg); if(isNaN(n)){return;}
+      const uu=getU(chatId); uu.settings.tipSui=n; saveDB();
+      await bot.sendMessage(chatId,`✅ Tip set to *${n} SUI* per trade`,{parse_mode:'Markdown'});
+      return;
+    }
+    // ── Wizard dispatcher (Limit / DCA step-by-step) ──
+    if(data.startsWith('wiz:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const parts=data.split(':'); const tag=parts[1]; const arg=parts[2];
+      const uu=getU(chatId); if(!uu) return;
+      if(tag==='cancel'){updU(chatId,{state:null}); if(uu.pd) delete uu.pd.wiz; saveDB(); await bot.sendMessage(chatId,'❌ Cancelled.');return;}
+      // ── LIMIT WIZARD ──
+      if(tag==='lamt'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_limit_amt_custom'});await bot.sendMessage(chatId,'✏️ Enter custom SUI amount (e.g. 1.5):');return;}
+        uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=parseFloat(arg); saveDB();
+        updU(chatId,{state:'wiz_limit_target'});
+        await bot.sendMessage(chatId,`📊 *Step 2 of 3* — Target price (USD)\n\nBuy ${arg} SUI when price reaches what?\n\nSend the target USD price (e.g. \`0.0005\`):`,{parse_mode:'Markdown'});
+        return;
+      }
+      if(tag==='ldir'){
+        // Step 3: direction (above/below)
+        uu.pd.wiz.dir=arg; saveDB();
+        const w=uu.pd.wiz; const ct=uu.pd.ct;
+        uu.limitOrders=uu.limitOrders||[];
+        uu.limitOrders.push({ct,sui:w.sui,targetPriceUsd:w.target,dir:arg==='above'?'>=':'<=',triggered:false,at:Date.now()});
+        saveDB(); updU(chatId,{state:null});
+        await bot.sendMessage(chatId,`✅ *Limit order set*\n\n• Spend: ${w.sui} SUI\n• Trigger: when price ${arg==='above'?'≥':'≤'} $${w.target}\n• Token: \`${trunc(ct)}\`\n\nThe bot will auto-buy when conditions match.`,{parse_mode:'Markdown'});
+        return;
+      }
+      // ── DCA WIZARD ──
+      if(tag==='damt'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_dca_amt_custom'});await bot.sendMessage(chatId,'✏️ Enter custom SUI per buy (e.g. 0.25):');return;}
+        uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=parseFloat(arg); saveDB();
+        await bot.sendMessage(chatId,`🔄 *Step 2 of 3* — How often to buy?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'Every 5 min',callback_data:'wiz:dint:5'},{text:'Every 15 min',callback_data:'wiz:dint:15'}],
+          [{text:'Every 30 min',callback_data:'wiz:dint:30'},{text:'Every 1 hour',callback_data:'wiz:dint:60'}],
+          [{text:'Every 6 hours',callback_data:'wiz:dint:360'},{text:'Every 24 hours',callback_data:'wiz:dint:1440'}],
+          [{text:'✏️ Custom minutes',callback_data:'wiz:dint:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
+      if(tag==='dint'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_dca_int_custom'});await bot.sendMessage(chatId,'✏️ Enter interval in minutes (1–10080):');return;}
+        uu.pd.wiz.intMin=parseInt(arg); saveDB();
+        await bot.sendMessage(chatId,`🔄 *Step 3 of 3* — How many total buys?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'5',callback_data:'wiz:dnum:5'},{text:'10',callback_data:'wiz:dnum:10'},{text:'20',callback_data:'wiz:dnum:20'}],
+          [{text:'50',callback_data:'wiz:dnum:50'},{text:'100',callback_data:'wiz:dnum:100'}],
+          [{text:'✏️ Custom count',callback_data:'wiz:dnum:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
+      if(tag==='dnum'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_dca_num_custom'});await bot.sendMessage(chatId,'✏️ Enter total number of buys (1–100):');return;}
+        const total=parseInt(arg); const w=uu.pd.wiz; const ct=uu.pd.ct;
+        uu.dcaOrders=uu.dcaOrders||[];
+        uu.dcaOrders.push({ct,sui:w.sui,intervalSec:w.intMin*60,lastFire:0,count:0,totalCount:total,at:Date.now()});
+        saveDB(); updU(chatId,{state:null});
+        await bot.sendMessage(chatId,`✅ *DCA started*\n\n• ${w.sui} SUI per buy\n• Every ${w.intMin} min\n• ${total} total buys\n• Token: \`${trunc(ct)}\`\n\nFirst buy fires within ${Math.min(15,w.intMin*60)}s.`,{parse_mode:'Markdown'});
+        return;
+      }
+      return;
+    }
     if(data==='auto_sell_toggle'){
       await bot.answerCallbackQuery(q.id).catch(()=>{});
       const uu=getU(chatId); if(uu){uu.settings.autoSell=!uu.settings.autoSell;saveDB();}
@@ -3718,7 +3868,18 @@ bot.on('callback_query', async(q) => {
       const uu=getU(chatId); const wallets=getAllWallets(uu);
       uu.activeWalletIdx=uu.activeWalletIdx||[0];
       if(arg==='all'){uu.activeWalletIdx=wallets.map((_,i)=>i);}
-      else if(arg==='add'){await bot.sendMessage(chatId,'➕ To add another wallet, send /import in a private message. (Multi-wallet trading executes the same trade across all selected wallets.)');return;}
+      else if(arg==='add'){
+        await bot.sendMessage(chatId,
+          `➕ *Add a new wallet*\n\n`+
+          `For your security, wallet imports use the dedicated /import command (never paste a seed phrase into a button menu).\n\n`+
+          `*How to add:*\n`+
+          `1. Tap or send /import\n`+
+          `2. Send your 12/24-word mnemonic OR a Sui private key\n`+
+          `3. Give it a label (e.g. "Trading 2")\n\n`+
+          `Once added it will appear here automatically. Multi-wallet trading executes the same buy/sell across every selected wallet in parallel.`,
+          {parse_mode:'Markdown'});
+        return;
+      }
       else {const i=parseInt(arg); if(!isNaN(i)){const s=new Set(uu.activeWalletIdx); s.has(i)?s.delete(i):s.add(i); if(s.size===0) s.add(0); uu.activeWalletIdx=[...s].sort();}}
       saveDB();
       const sel=new Set(uu.activeWalletIdx);
@@ -4180,32 +4341,58 @@ bot.on('message', async(msg) => {
     const uu=getU(chatId); if(uu){uu.settings.tipSui=n;saveDB();}
     await bot.sendMessage(chatId,`✅ Tip set to ${n} SUI per trade`); return;
   }
-  if(state==='limit_target'){
-    updU(chatId,{state:null});
-    const parts=text.trim().split(/\s+/);
-    const sui=parseFloat(parts[0]); const target=parseFloat(parts[1]); const dir=(parts[2]||'').toLowerCase();
-    if(isNaN(sui)||sui<=0||isNaN(target)||target<=0||!['above','below','>=','<='].includes(dir)){
-      await bot.sendMessage(chatId,'❌ Format: `<sui> <target_usd> <above|below>`',{parse_mode:'Markdown'});return;
-    }
-    const ct=u.pd?.ct; if(!ct){await bot.sendMessage(chatId,'❌ No token in context.');return;}
-    const uu=getU(chatId); uu.limitOrders=uu.limitOrders||[];
-    uu.limitOrders.push({ct,sui,targetPriceUsd:target,dir:(dir==='above'||dir==='>=')?'>=':'<=',triggered:false,at:Date.now()});
-    saveDB();
-    await bot.sendMessage(chatId,`✅ *Limit order set*\nBuy ${sui} SUI when price ${dir==='above'||dir==='>='?'≥':'≤'} $${target}`,{parse_mode:'Markdown'});
+  // ── Limit-order wizard text steps ──
+  if(state==='wiz_limit_amt_custom'){
+    const n=parseFloat(text);
+    if(isNaN(n)||n<=0||n>10000){await bot.sendMessage(chatId,'❌ Enter a positive number ≤ 10000. Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=n; saveDB();
+    updU(chatId,{state:'wiz_limit_target'});
+    await bot.sendMessage(chatId,`📊 *Step 2 of 3* — Target price (USD)\n\nBuy ${n} SUI when price reaches what?\n\nSend the target USD price (e.g. \`0.0005\`):`,{parse_mode:'Markdown'});
     return;
   }
-  if(state==='dca_setup'){
-    updU(chatId,{state:null});
-    const parts=text.trim().split(/\s+/);
-    const sui=parseFloat(parts[0]); const intMin=parseFloat(parts[1]); const total=parseInt(parts[2]);
-    if(isNaN(sui)||sui<=0||isNaN(intMin)||intMin<1||isNaN(total)||total<1||total>100){
-      await bot.sendMessage(chatId,'❌ Format: `<sui> <interval_min> <total_buys>` (interval ≥ 1, total ≤ 100)',{parse_mode:'Markdown'});return;
-    }
-    const ct=u.pd?.ct; if(!ct){await bot.sendMessage(chatId,'❌ No token in context.');return;}
-    const uu=getU(chatId); uu.dcaOrders=uu.dcaOrders||[];
-    uu.dcaOrders.push({ct,sui,intervalSec:Math.floor(intMin*60),lastFire:0,count:0,totalCount:total,at:Date.now()});
-    saveDB();
-    await bot.sendMessage(chatId,`✅ *DCA started*\n${sui} SUI every ${intMin}min × ${total} buys`,{parse_mode:'Markdown'});
+  if(state==='wiz_limit_target'){
+    const target=parseFloat(text);
+    if(isNaN(target)||target<=0){await bot.sendMessage(chatId,'❌ Enter a positive USD price (e.g. 0.0005). Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz.target=target; saveDB();
+    updU(chatId,{state:'wiz_limit_dir'});
+    await bot.sendMessage(chatId,`📊 *Step 3 of 3* — Trigger direction\n\nBuy ${uu.pd.wiz.sui} SUI when price goes:`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+      [{text:`📈 Above $${target}`,callback_data:'wiz:ldir:above'},{text:`📉 Below $${target}`,callback_data:'wiz:ldir:below'}],
+      [{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+    ]}});
+    return;
+  }
+  // ── DCA wizard text steps ──
+  if(state==='wiz_dca_amt_custom'){
+    const n=parseFloat(text);
+    if(isNaN(n)||n<=0||n>10000){await bot.sendMessage(chatId,'❌ Enter a positive number ≤ 10000. Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=n; saveDB(); updU(chatId,{state:null});
+    await bot.sendMessage(chatId,`🔄 *Step 2 of 3* — How often to buy?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+      [{text:'Every 5 min',callback_data:'wiz:dint:5'},{text:'Every 15 min',callback_data:'wiz:dint:15'}],
+      [{text:'Every 30 min',callback_data:'wiz:dint:30'},{text:'Every 1 hour',callback_data:'wiz:dint:60'}],
+      [{text:'Every 6 hours',callback_data:'wiz:dint:360'},{text:'Every 24 hours',callback_data:'wiz:dint:1440'}],
+      [{text:'✏️ Custom minutes',callback_data:'wiz:dint:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+    ]}});
+    return;
+  }
+  if(state==='wiz_dca_int_custom'){
+    const n=parseInt(text);
+    if(isNaN(n)||n<1||n>10080){await bot.sendMessage(chatId,'❌ Enter minutes between 1 and 10080. Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz.intMin=n; saveDB(); updU(chatId,{state:null});
+    await bot.sendMessage(chatId,`🔄 *Step 3 of 3* — How many total buys?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+      [{text:'5',callback_data:'wiz:dnum:5'},{text:'10',callback_data:'wiz:dnum:10'},{text:'20',callback_data:'wiz:dnum:20'}],
+      [{text:'50',callback_data:'wiz:dnum:50'},{text:'100',callback_data:'wiz:dnum:100'}],
+      [{text:'✏️ Custom count',callback_data:'wiz:dnum:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+    ]}});
+    return;
+  }
+  if(state==='wiz_dca_num_custom'){
+    const total=parseInt(text);
+    if(isNaN(total)||total<1||total>100){await bot.sendMessage(chatId,'❌ Enter a number between 1 and 100. Try again:');return;}
+    const uu=getU(chatId); const w=uu.pd.wiz; const ct=uu.pd.ct;
+    uu.dcaOrders=uu.dcaOrders||[];
+    uu.dcaOrders.push({ct,sui:w.sui,intervalSec:w.intMin*60,lastFire:0,count:0,totalCount:total,at:Date.now()});
+    saveDB(); updU(chatId,{state:null});
+    await bot.sendMessage(chatId,`✅ *DCA started*\n\n• ${w.sui} SUI per buy\n• Every ${w.intMin} min\n• ${total} total buys\n• Token: \`${trunc(ct)}\`\n\nFirst buy fires within ${Math.min(15,w.intMin*60)}s.`,{parse_mode:'Markdown'});
     return;
   }
 
@@ -4483,6 +4670,33 @@ async function _getLaunchpadTokens() {
   return data;
 }
 
+// ── Cross-contamination fix ─────────────────────────────────────────
+// The global _lpCache refreshes every 60s. If we encoded `lp:odpick:2`
+// into a button at t=0 and the user tapped it at t=70, idx=2 would
+// resolve to a DIFFERENT token in the freshly-fetched list. We pin
+// the exact list shown to the user on their session, so taps always
+// resolve to the token they clicked — even after cache refresh.
+function _pinLp(chatId, key, list) {
+  const u = getU(chatId); if (!u) return;
+  u.pd = u.pd || {};
+  u.pd.lpSnap = u.pd.lpSnap || {};
+  u.pd.lpSnap[key] = (list||[]).map(t => ({...t,
+    virtualSuiReserves: t.virtualSuiReserves != null ? String(t.virtualSuiReserves) : null,
+    virtualTokenReserves: t.virtualTokenReserves != null ? String(t.virtualTokenReserves) : null,
+  }));
+  saveDB();
+}
+function _pinnedLp(chatId, key, idx) {
+  const u = getU(chatId);
+  const t = u?.pd?.lpSnap?.[key]?.[idx];
+  if (!t) return null;
+  // Restore BigInts that were string-encoded for JSON safety
+  return {...t,
+    virtualSuiReserves: t.virtualSuiReserves != null ? BigInt(t.virtualSuiReserves) : null,
+    virtualTokenReserves: t.virtualTokenReserves != null ? BigInt(t.virtualTokenReserves) : null,
+  };
+}
+
 function _fmtToken(t, idx) {
   const sym  = (t.symbol || '?').slice(0, 12);
   const name = (t.name   || '').slice(0, 20);
@@ -4515,6 +4729,7 @@ async function _showAgentList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching AGENT MemeLand tokens...');
   try {
     const { agent } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'agent', agent);
     if (!agent.length) {
       const txt = '🟢 *AGENT MemeLand*\n\nNo tokens available right now.\n\nLaunched tokens trade as direct Cetus pools — paste any CA into Buy.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -4541,6 +4756,7 @@ async function _showOdyList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching Odyssey tokens...');
   try {
     const { odyssey } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'odyssey', odyssey);
     if (!odyssey.length) {
       const txt = '🟣 *Odyssey*\n\nNo bonding-curve tokens available right now.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -4598,8 +4814,7 @@ async function _showOdyByCA(chatId, ct, info) {
 }
 
 async function _showOdyToken(chatId, msgId, idx) {
-  const { odyssey } = await _getLaunchpadTokens();
-  const t = odyssey[idx];
+  const t = _pinnedLp(chatId, 'odyssey', idx) || ((await _getLaunchpadTokens()).odyssey||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
   const sym  = t.symbol || '?';
   const mc   = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
@@ -4632,8 +4847,7 @@ async function _showOdyToken(chatId, msgId, idx) {
 async function _odyBuy(chatId, msgId, idx, amtSui) {
   const u = getU(chatId);
   if (!u || !u.encryptedKey) { await bot.editMessageText('❌ No wallet. Use /start first.', {chat_id:chatId,message_id:msgId}); return; }
-  const { odyssey } = await _getLaunchpadTokens();
-  const t = odyssey[idx];
+  const t = _pinnedLp(chatId, 'odyssey', idx) || ((await _getLaunchpadTokens()).odyssey||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   // Guard: this entry only supports SUI-paired curves
   const pair = t.pairType || 'SUI';
@@ -4680,8 +4894,7 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
 async function _odySell(chatId, msgId, idx, pct) {
   const u = getU(chatId);
   if (!u || !u.encryptedKey) { await bot.editMessageText('❌ No wallet.', {chat_id:chatId,message_id:msgId}); return; }
-  const { odyssey } = await _getLaunchpadTokens();
-  const t = odyssey[idx];
+  const t = _pinnedLp(chatId, 'odyssey', idx) || ((await _getLaunchpadTokens()).odyssey||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   await bot.editMessageText(`⏳ Selling ${pct}% of *${t.symbol}*...`,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
   try {
@@ -5000,6 +5213,7 @@ async function _showMbList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching Moonbags tokens...');
   try {
     const { moonbags } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'moonbags', moonbags);
     if (!moonbags.length) {
       const txt = '🟠 *Moonbags*\n\nNo bonding-curve tokens available right now.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -5051,8 +5265,7 @@ async function _showMbByCA(chatId, ct, info) {
 }
 
 async function _showMbToken(chatId, msgId, idx) {
-  const { moonbags } = await _getLaunchpadTokens();
-  const t = moonbags[idx];
+  const t = _pinnedLp(chatId, 'moonbags', idx) || ((await _getLaunchpadTokens()).moonbags||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
   const sym  = t.symbol || '?';
   const mc   = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
@@ -5181,14 +5394,12 @@ async function _mbSellCommon(chatId, msgId, t, pct, backCb) {
 }
 
 async function _mbBuy(chatId, msgId, idx, amtSui) {
-  const { moonbags } = await _getLaunchpadTokens();
-  const t = moonbags[idx];
+  const t = _pinnedLp(chatId, 'moonbags', idx) || ((await _getLaunchpadTokens()).moonbags||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   return _mbBuyCommon(chatId, msgId, t, amtSui, `lp:mbpick:${idx}`);
 }
 async function _mbSell(chatId, msgId, idx, pct) {
-  const { moonbags } = await _getLaunchpadTokens();
-  const t = moonbags[idx];
+  const t = _pinnedLp(chatId, 'moonbags', idx) || ((await _getLaunchpadTokens()).moonbags||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   return _mbSellCommon(chatId, msgId, t, pct, `lp:mbpick:${idx}`);
 }
@@ -5212,6 +5423,7 @@ async function _showHfList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching hop.fun tokens...');
   try {
     const { hopfun } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'hopfun', hopfun);
     if (!hopfun.length) {
       const txt = '🔵 *hop.fun*\n\nNo bonding-curve tokens available right now.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -5234,6 +5446,7 @@ async function _showHfList(chatId, msgId) {
 }
 
 async function _showHfByCA(chatId, ct, info) {
+  // BigInts can't survive JSON.stringify in saveDB() — string-encode for storage.
   const tok = {
     coinType: ct,
     symbol: info.symbol || (ct.split('::').pop() || '?'),
@@ -5241,8 +5454,8 @@ async function _showHfByCA(chatId, ct, info) {
     progress: info.progress ?? null,
     isCompleted: !!info.isCompleted,
     curveId: info.curveId || null,
-    virtualSuiReserves:   info.virtualSuiReserves   || null,
-    virtualTokenReserves: info.virtualTokenReserves || null,
+    virtualSuiReserves:   info.virtualSuiReserves   != null ? String(info.virtualSuiReserves)   : null,
+    virtualTokenReserves: info.virtualTokenReserves != null ? String(info.virtualTokenReserves) : null,
     source: 'hop.fun',
   };
   updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), hfCA: tok } });
@@ -5266,8 +5479,7 @@ async function _showHfByCA(chatId, ct, info) {
 }
 
 async function _showHfToken(chatId, msgId, idx) {
-  const { hopfun } = await _getLaunchpadTokens();
-  const t = hopfun[idx];
+  const t = _pinnedLp(chatId, 'hopfun', idx) || ((await _getLaunchpadTokens()).hopfun||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
   const sym  = t.symbol || '?';
   const mc   = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
@@ -5395,29 +5607,51 @@ async function _hfSellCommon(chatId, msgId, t, pct, backCb) {
   }
 }
 
+// Pinned snapshots can hold stale reserves (curves move fast). Refetch fresh
+// reserves before quoting so min-out math stays current. Token IDENTITY still
+// comes from the snapshot (the whole point of the cross-contamination fix).
+async function _hfFreshen(t) {
+  try {
+    const fresh = await fetchHopFunCoin(sui, t.coinType);
+    if (fresh && fresh.coinType?.toLowerCase() === t.coinType?.toLowerCase()) {
+      return { ...t, virtualSuiReserves: fresh.virtualSuiReserves, virtualTokenReserves: fresh.virtualTokenReserves, curveId: fresh.curveId || t.curveId, progress: fresh.progress ?? t.progress, isCompleted: !!fresh.isCompleted };
+    }
+  } catch {}
+  return t;
+}
+// Restore string-encoded BigInts from session persistence
+function _hfHydrate(t) {
+  if (!t) return t;
+  return { ...t,
+    virtualSuiReserves:   t.virtualSuiReserves   != null && typeof t.virtualSuiReserves   === 'string' ? BigInt(t.virtualSuiReserves)   : t.virtualSuiReserves,
+    virtualTokenReserves: t.virtualTokenReserves != null && typeof t.virtualTokenReserves === 'string' ? BigInt(t.virtualTokenReserves) : t.virtualTokenReserves,
+  };
+}
 async function _hfBuy(chatId, msgId, idx, amtSui) {
-  const { hopfun } = await _getLaunchpadTokens();
-  const t = hopfun[idx];
-  if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const pinned = _pinnedLp(chatId, 'hopfun', idx) || ((await _getLaunchpadTokens()).hopfun||[])[idx];
+  if (!pinned) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const t = await _hfFreshen(_hfHydrate(pinned));
   return _hfBuyCommon(chatId, msgId, t, amtSui, `lp:hfpick:${idx}`);
 }
 async function _hfSell(chatId, msgId, idx, pct) {
-  const { hopfun } = await _getLaunchpadTokens();
-  const t = hopfun[idx];
-  if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const pinned = _pinnedLp(chatId, 'hopfun', idx) || ((await _getLaunchpadTokens()).hopfun||[])[idx];
+  if (!pinned) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const t = await _hfFreshen(_hfHydrate(pinned));
   return _hfSellCommon(chatId, msgId, t, pct, `lp:hfpick:${idx}`);
 }
 async function _hfBuyCA(chatId, msgId, amtSui) {
   const u = getU(chatId);
-  const t = u?.pd?.hfCA;
-  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const raw = u?.pd?.hfCA;
+  if (!raw) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const t = await _hfFreshen(_hfHydrate(raw));
   const m = await bot.sendMessage(chatId, `⏳ Buying ${amtSui} SUI of *${t.symbol}* on hop.fun...`, {parse_mode:'Markdown'});
   return _hfBuyCommon(chatId, m.message_id, t, amtSui, 'lp:menu');
 }
 async function _hfSellCA(chatId, msgId, pct) {
   const u = getU(chatId);
-  const t = u?.pd?.hfCA;
-  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const raw = u?.pd?.hfCA;
+  if (!raw) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const t = await _hfFreshen(_hfHydrate(raw));
   const m = await bot.sendMessage(chatId, `⏳ Selling ${pct}% of *${t.symbol}*...`, {parse_mode:'Markdown'});
   return _hfSellCommon(chatId, m.message_id, t, pct, 'lp:menu');
 }
@@ -5441,8 +5675,7 @@ bot.on('callback_query', async(q)=>{
     if (parts[1] === 'odsellca') return _odySellCA(chatId, msgId, parseInt(parts[2],10));
     if (parts[1] === 'agbuy') {
       const aIdx = parseInt(parts[2], 10);
-      const { agent } = await _getLaunchpadTokens();
-      const at = agent[aIdx];
+      const at = _pinnedLp(chatId, 'agent', aIdx) || ((await _getLaunchpadTokens()).agent||[])[aIdx];
       if (!at) { await bot.sendMessage(chatId, '❌ Token expired from cache. Reopen 🚀 Launchpad.'); return; }
       await _showAgentBuy(chatId, at);
       return;
