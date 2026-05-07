@@ -3183,7 +3183,7 @@ const MAIN_KB = {
     [{text:'💰 Buy'},{text:'💸 Sell'},{text:'📊 Positions'}],
     [{text:'💼 Balance'},{text:'🚀 Launchpad'},{text:'🔍 Scan'}],
     [{text:'⚡ Snipe'},{text:'🔁 Copy Trade'},{text:'⚙️ Settings'}],
-    [{text:'🔗 Referral'},{text:'❓ Help'}],
+    [{text:'📋 Orders'},{text:'🔗 Referral'},{text:'❓ Help'}],
   ],
   resize_keyboard:true, persistent:true,
 };
@@ -3500,6 +3500,62 @@ async function doSettings(chatId) {
   });
 }
 
+// ── Orders panel: list / cancel / edit limit, DCA and snipe orders ──
+async function doOrders(chatId, replaceMid) {
+  const u=getU(chatId); if(!u) return;
+  const limits=u.limitOrders||[], dcas=u.dcaOrders||[], snipes=u.snipeWatches||[];
+  let txt='📋 *Active Orders*\n';
+  const rows=[];
+  if(!limits.length && !dcas.length && !snipes.length){
+    txt+='\n_No active orders._\n\nOpen a token, then tap *Limit*, *DCA* or *⚡ Snipe* to create one.';
+  } else {
+    if(limits.length){
+      txt+=`\n📊 *Limit Orders (${limits.length})*\n`;
+      limits.forEach((o,i)=>{
+        const dir=o.dir==='>='?'≥':'≤';
+        const status=o.triggered?'✅ filled':'⏳ pending';
+        txt+=`\`${i+1}.\` ${o.sui} SUI when ${dir} $${o.targetPriceUsd}  _${status}_\n   \`${trunc(o.ct)}\`\n`;
+        if(!o.triggered) rows.push([
+          {text:`✏️ Edit L#${i+1}`,   callback_data:`ord:edit:l:${i}`},
+          {text:`❌ Cancel L#${i+1}`, callback_data:`ord:cancel:l:${i}`},
+        ]);
+      });
+    }
+    if(dcas.length){
+      txt+=`\n🔄 *DCA Orders (${dcas.length})*\n`;
+      dcas.forEach((d,i)=>{
+        const intMin=Math.round(d.intervalSec/60);
+        txt+=`\`${i+1}.\` ${d.sui} SUI every ${intMin}m  (${d.count}/${d.totalCount} done)\n   \`${trunc(d.ct)}\`\n`;
+        rows.push([
+          {text:`✏️ Edit D#${i+1}`,   callback_data:`ord:edit:d:${i}`},
+          {text:`❌ Cancel D#${i+1}`, callback_data:`ord:cancel:d:${i}`},
+        ]);
+      });
+    }
+    if(snipes.length){
+      txt+=`\n⚡ *Snipe Watches (${snipes.length})*\n`;
+      snipes.forEach((s,i)=>{
+        const mc=s.minMc>0?`MC ≥ $${fNum(s.minMc)}`:'on LP add';
+        const status=s.triggered?'✅ fired':'⏳ waiting';
+        txt+=`\`${i+1}.\` ${s.sui} SUI · ${mc}  _${status}_\n   \`${trunc(s.ct)}\`\n`;
+        if(!s.triggered) rows.push([
+          {text:`✏️ Edit S#${i+1}`,   callback_data:`ord:edit:s:${i}`},
+          {text:`❌ Cancel S#${i+1}`, callback_data:`ord:cancel:s:${i}`},
+        ]);
+      });
+    }
+  }
+  rows.push([{text:'🔄 Refresh',callback_data:'go_orders'},{text:'≡ Menu',callback_data:'go_home'}]);
+  const opts={parse_mode:'Markdown',reply_markup:{inline_keyboard:rows}};
+  if(replaceMid){
+    await bot.editMessageText(txt,{chat_id:chatId,message_id:replaceMid,...opts}).catch(async()=>{
+      await bot.sendMessage(chatId,txt,opts);
+    });
+  } else {
+    await bot.sendMessage(chatId,txt,opts);
+  }
+}
+
 async function doHelp(chatId) {
   await bot.sendMessage(chatId,
     `🤖 *AGENT TRADING BOT v7*\n\n` +
@@ -3511,6 +3567,7 @@ async function doHelp(chatId) {
     `/positions — Open positions & P&L\n` +
     `/pnl — P&L report\n` +
     `/snipe \`CA\` — Snipe on pool creation\n` +
+    `/orders — View / cancel pending limit, DCA & snipe orders\n` +
     `/copytrader \`wallet\` — Mirror trades\n` +
     `/withdraw — Send SUI or tokens\n` +
     `/referral — Referral link & earnings\n` +
@@ -3570,6 +3627,11 @@ function fullBuyKb(u, ct, amtRows){
       {text:(m==='limit'?'✅ Limit':'Limit'),callback_data:'mode_limit'},
       {text:(m==='dca'?'✅ DCA':'DCA'),callback_data:'mode_dca'},
       {text:(m==='migration'?'✅ Migration':'Migration'),callback_data:'mode_migration'},
+    ],
+    [
+      {text:`🎯 TP: ${s.tpDefault?'+'+s.tpDefault+'%':'—'}`,callback_data:'set_tp'},
+      {text:`🛑 SL: ${s.slDefault?'-'+s.slDefault+'%':'—'}`,callback_data:'set_sl'},
+      {text:'📋 My Orders',callback_data:'go_orders'},
     ],
     [{text:'----- Settings -----',callback_data:'noop'}],
     [{text:`✏️ Slippage: ${s.slippage||1}%`,callback_data:'open_slip'},{text:`✏️ Gas Price: ${gp} MIST`,callback_data:'gas_edit'}],
@@ -4117,6 +4179,46 @@ bot.on('callback_query', async(q) => {
 
     if(data==='go_home'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu)await bot.sendMessage(chatId,'≡ *Main Menu*',{parse_mode:'Markdown',reply_markup:MAIN_KB});return;}
     if(data==='go_pos'){await bot.answerCallbackQuery(q.id).catch(()=>{});await doPositions(chatId);return;}
+    if(data==='go_orders'){await bot.answerCallbackQuery(q.id).catch(()=>{});await doOrders(chatId,q.message?.message_id);return;}
+    if(data.startsWith('ord:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const [,act,kind,idxStr]=data.split(':');
+      const uu=getU(chatId); if(!uu) return;
+      const idx=parseInt(idxStr);
+      const arr = kind==='l'?(uu.limitOrders||[]) : kind==='d'?(uu.dcaOrders||[]) : (uu.snipeWatches||[]);
+      if(isNaN(idx)||idx<0||idx>=arr.length){await bot.sendMessage(chatId,'❌ Order not found (list may be stale — refresh).');return;}
+      const order=arr[idx];
+      if(act==='cancel'){
+        arr.splice(idx,1); saveDB();
+        await bot.sendMessage(chatId,`✅ Order cancelled.`);
+        await doOrders(chatId);
+        return;
+      }
+      if(act==='edit'){
+        const ct=order.ct;
+        arr.splice(idx,1); saveDB();
+        updU(chatId,{pd:{...(uu.pd||{}),ct,wiz:{}}});
+        if(kind==='l'){
+          updU(chatId,{state:'wiz_limit_amt'});
+          await bot.sendMessage(chatId,`✏️ *Edit Limit Order — Step 1 of 3*\n\nOld order removed. Pick new SUI amount:`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+            [{text:'0.1 SUI',callback_data:'wiz:lamt:0.1'},{text:'0.5 SUI',callback_data:'wiz:lamt:0.5'},{text:'1 SUI',callback_data:'wiz:lamt:1'}],
+            [{text:'2 SUI',callback_data:'wiz:lamt:2'},{text:'5 SUI',callback_data:'wiz:lamt:5'},{text:'10 SUI',callback_data:'wiz:lamt:10'}],
+            [{text:'✏️ Custom amount',callback_data:'wiz:lamt:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+          ]}});
+        } else if(kind==='d'){
+          updU(chatId,{state:'wiz_dca_amt'});
+          await bot.sendMessage(chatId,`✏️ *Edit DCA — Step 1 of 3*\n\nOld DCA removed. Pick new SUI per buy:`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+            [{text:'0.1 SUI',callback_data:'wiz:damt:0.1'},{text:'0.5 SUI',callback_data:'wiz:damt:0.5'},{text:'1 SUI',callback_data:'wiz:damt:1'}],
+            [{text:'2 SUI',callback_data:'wiz:damt:2'},{text:'5 SUI',callback_data:'wiz:damt:5'},{text:'10 SUI',callback_data:'wiz:damt:10'}],
+            [{text:'✏️ Custom amount',callback_data:'wiz:damt:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+          ]}});
+        } else {
+          updU(chatId,{state:'snipe_amount',pd:{...(getU(chatId).pd||{}),sniToken:ct}});
+          await bot.sendMessage(chatId,`✏️ *Edit Snipe*\n\nOld snipe removed. Send new SUI amount to snipe with (e.g. \`0.5\`):`,{parse_mode:'Markdown'});
+        }
+        return;
+      }
+    }
     if(data==='open_slip'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu){updU(chatId,{state:'edit_slip'});await bot.sendMessage(chatId,'✏️ Enter slippage % (e.g. 1, 2, 5):');}return;}
     if(data==='rbuy'){
       await bot.answerCallbackQuery(q.id,{text:'🔄 Refreshing...'}).catch(()=>{});
@@ -4277,6 +4379,7 @@ bot.on('message', async(msg) => {
     '⚡ Snipe':      ()=>guard(chatId,async()=>{await bot.sendMessage(chatId,'⚡ Send the token CA to snipe:\n\n_Example: 0x1234..._',{parse_mode:'Markdown'});updU(chatId,{state:'snipe_ca'});}),
     '🔁 Copy Trade': ()=>guard(chatId,async(u)=>{if(!u.copyTraders?.length){await bot.sendMessage(chatId,'🔁 *Copy Trader*\n\nNo wallets tracked.\n\nUsage: `/copytrader [wallet]`\n\nToggles per tracker:\n`/copytrader sells [n] on|off`\n`/copytrader auto [n] on|off`\n`/copytrader stop [n]`',{parse_mode:'Markdown'});}else{const lines=u.copyTraders.map((ct,i)=>{const amt=ct.autoAmount?'Auto':'Fixed '+ct.amount+' SUI';const sells=ct.copySells===false?'Sells: OFF':'Sells: ON';return `${i+1}. \`${trunc(ct.wallet)}\`\n   💰 ${amt} | ${sells}`;}).join('\n\n');await bot.sendMessage(chatId,`🔁 *Copy Traders (${u.copyTraders.length}/3)*\n\n${lines}\n\n_/copytrader sells [n] on|off_\n_/copytrader auto [n] on|off_\n_/copytrader stop [n]_`,{parse_mode:'Markdown'});}}),
     '🔗 Referral':   ()=>doReferral(chatId),
+    '📋 Orders':     ()=>doOrders(chatId),
     '⚙️ Settings':   ()=>doSettings(chatId),
     '❓ Help':        ()=>doHelp(chatId),
     '🚀 Launchpad': ()=>doLaunchpadMenu(chatId),
@@ -4734,6 +4837,7 @@ bot.onText(/\/scan(?:\s+(.+))?/, async(msg,m)=>{
 bot.onText(/\/withdraw/, async(msg)=>doWithdrawMenu(msg.chat.id));
 bot.onText(/\/balance/,  async(msg)=>doBalance(msg.chat.id));
 bot.onText(/\/positions/,async(msg)=>doPositions(msg.chat.id));
+bot.onText(/\/orders/,   async(msg)=>doOrders(msg.chat.id));
 bot.onText(/\/print(?:\s+(\d+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   await guard(chatId, async (u) => {
@@ -5952,6 +6056,7 @@ async function main() {
       { command:'balance',     description:'💼 Check wallet balance' },
       { command:'scan',        description:'🔍 Token security audit' },
       { command:'snipe',       description:'⚡ Snipe a token when pool goes live' },
+      { command:'orders',      description:'📋 View / cancel limit, DCA & snipe orders' },
       { command:'copytrader',  description:'🔁 Copy a trader\'s buys automatically' },
       { command:'referral',    description:'🔗 Your referral link & earnings' },
       { command:'withdraw',    description:'📤 Send SUI or tokens to an address' },
