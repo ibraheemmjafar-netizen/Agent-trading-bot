@@ -1,5 +1,5 @@
 {
-  "name": "agent-trading-bot",
+  "name": "bot-runner",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -10,6 +10,7 @@
     "@mysten/sui": "^1.30.0",
     "@napi-rs/canvas": "^1.0.0",
     "node-telegram-bot-api": "^0.66.0",
+    "qrcode": "^1.5.4",
     "redis": "^4.7.0"
   }
 }
