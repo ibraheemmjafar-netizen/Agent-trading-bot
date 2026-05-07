@@ -43,6 +43,7 @@ import { SuiClient }           from '@mysten/sui/client';
 import { Ed25519Keypair }      from '@mysten/sui/keypairs/ed25519';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Transaction }         from '@mysten/sui/transactions';
+import { normalizeStructTag }  from '@mysten/sui/utils';
 import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto';
 import { readFileSync, writeFileSync, existsSync }                   from 'fs';
 import { setTimeout as sleep }                                       from 'timers/promises';
@@ -844,7 +845,17 @@ async function detectState(ct) {
   //    Strategy B is the reliable one — DexScreener always has BVS/PANS when
   //    searched from the PANS side, even if searching BVS directly returns nothing.
   try {
-    // Helper: convert a confirmed DS pool entry into a pans_cetus state result
+    // Helper: convert a confirmed DS pool entry into a pans_cetus state result.
+    // Bug fix: the pool MUST also contain `ct` (the user's token) — otherwise we'd
+    // build swap calls with typeArguments that don't match the wallet's coin type,
+    // causing CommandArgumentError { arg_idx: 3, kind: TypeMismatch } on sell or
+    // delivering the wrong token on buy hop2. Compare via normalizeStructTag to
+    // tolerate leading-zero / case variations.
+    const ctNorm = (() => { try { return normalizeStructTag(ct); } catch { return ct.toLowerCase(); } })();
+    const tagEq = (a, b) => {
+      try { return normalizeStructTag(a) === normalizeStructTag(b); }
+      catch { return (a||'').toLowerCase() === (b||'').toLowerCase(); }
+    };
     const tryPansState = async (dsPool) => {
       if (!dsPool?.address) return null;
       const poolInfo = await getPoolFromRPC(dsPool.address).catch(() => null);
@@ -856,7 +867,11 @@ async function detectState(ct) {
       const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
       const hasSui  = coinAl === SUI_NORM  || coinAl.endsWith('::sui::sui') ||
                       coinBl === SUI_NORM  || coinBl.endsWith('::sui::sui');
-      if (!hasPans || hasSui) return null;
+      // CRITICAL: the OTHER coin (non-PANS) must equal ct, or we'll route through
+      // a sibling PANS-paired pool (e.g. KYLN/PANS instead of BVS/PANS).
+      const otherCoin = (coinAl === PANS_NORM) ? poolInfo.coinB : poolInfo.coinA;
+      const hasCt = tagEq(otherCoin, ct);
+      if (!hasPans || hasSui || !hasCt) return null;
       const suiPansPool = await findSuiPansPool();
       if (!suiPansPool) return null;
       return {
@@ -965,7 +980,20 @@ async function detectState(ct) {
         const AGENT_NORM = AGENT_T.toLowerCase();
         const hasAgent = coinAl === AGENT_NORM || coinBl === AGENT_NORM;
 
-        if (!hasSui && hasPans && poolInfo.dex === 'cetus') {
+        // Defense-in-depth: same hasCt check as section 2's tryPansState — the
+        // non-PANS/non-AGENT side of the pool MUST equal user's ct, or the bot
+        // will pick a sibling pool (e.g. KYLN/PANS instead of BVS/PANS) and the
+        // sell will fail at Move type-check (arg_idx 3 TypeMismatch).
+        const tagEqS5 = (a, b) => {
+          try { return normalizeStructTag(a) === normalizeStructTag(b); }
+          catch { return (a||'').toLowerCase() === (b||'').toLowerCase(); }
+        };
+        const otherVsPans  = (coinAl === PANS_NORM)  ? poolInfo.coinB : poolInfo.coinA;
+        const otherVsAgent = (coinAl === AGENT_NORM) ? poolInfo.coinB : poolInfo.coinA;
+        const hasCtVsPans  = hasPans  && tagEqS5(otherVsPans,  ct);
+        const hasCtVsAgent = hasAgent && tagEqS5(otherVsAgent, ct);
+
+        if (!hasSui && hasPans && hasCtVsPans && poolInfo.dex === 'cetus') {
           // TOKEN/PANS pool on Cetus — look for SUI/PANS hop pool via GeckoTerminal-resilient helper
           try {
             const suiPansPool = await findSuiPansPool();
@@ -983,7 +1011,7 @@ async function detectState(ct) {
         }
 
         // AGENT MemeLand token — TOKEN/AGENT Cetus pool (2-hop sell: MEME→AGENT→SUI)
-        if (!hasSui && hasAgent && poolInfo.dex === 'cetus') {
+        if (!hasSui && hasAgent && hasCtVsAgent && poolInfo.dex === 'cetus') {
           const res = { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...poolInfo, liq, ts: Date.now() };
           stateCache.set(ct, res); return res;
         }
@@ -1858,17 +1886,13 @@ async function executeSell(chatId, ct, pct) {
     const sellA2bHop1 = !pansIsA;
     console.log('[PANS-SELL] hop1 poolId=%s coinA=%s a2b=%s sellAmt=%s',
       tp.poolId.slice(0,20), s1CoinA.slice(0,40), sellA2bHop1, sellAmt.toString());
-    // Bug fix: use pool-derived canonical s1CoinB (not user-supplied ct) so the
-    // Move VM's strict type-tag check on arg 3 passes. ct may differ from the
-    // pool's canonical type string by leading-zero stripping or normalization,
-    // which causes CommandArgumentError { arg_idx: 3, kind: TypeMismatch }.
     const tx1 = await buildCetusSwapTx({
       wallet:       u.walletAddress,
       poolId:       tp.poolId,
       coinA:        s1CoinA,
       coinB:        s1CoinB,
       a2b:          sellA2bHop1,
-      coinInType:   sellA2bHop1 ? s1CoinA : s1CoinB,
+      coinInType:   ct,
       amountIn:     sellAmt.toString(),
       minAmountOut: '0',
     });
@@ -2041,13 +2065,10 @@ async function executeSell(chatId, ct, pct) {
     const a2b1    = memeIsA; // MEME is INPUT; if MEME=coinA → swap_a2b (a2b=true) else swap_b2a (a2b=false)
 
     // Hop 1: MEME → AGENT
-    // Use pool-derived canonical type (a2b1 ? poolCoinA : poolCoinB) instead of
-    // user-supplied ct to avoid Move VM TypeMismatch from string-form mismatch.
     const tx1 = await buildCetusSwapTx({
       wallet: u.walletAddress, poolId: tokenPoolId,
       coinA: poolCoinA, coinB: poolCoinB, a2b: a2b1,
-      coinInType: a2b1 ? poolCoinA : poolCoinB,
-      amountIn: sellAmt.toString(), minAmountOut: '0',
+      coinInType: ct, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
     try{applyTxOpts(tx1, u);}catch{}
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
@@ -2151,7 +2172,7 @@ async function executeSell(chatId, ct, pct) {
   // Last resort: force-find Cetus SUI-paired pool
   const pool = await findCetusPool(ct, SUI_T);
   if (pool) {
-    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType: pool.a2b ? pool.coinA : pool.coinB, amountIn:sellAmt.toString(), minAmountOut:'0' });
+    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType:ct, amountIn:sellAmt.toString(), minAmountOut:'0' });
     try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
