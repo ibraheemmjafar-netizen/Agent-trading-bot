@@ -1,15 +1,16 @@
-{
-  "name": "agent-tg-bot",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "bot_launchpad_v5.mjs",
-  "scripts": {
-    "start": "node bot_launchpad_v5.mjs"
-  },
-  "dependencies": {
-    "@mysten/sui": "1.21.0",
-    "dotenv": "^17.3.1",
-    "node-telegram-bot-api": "^0.66.0",
-    "ioredis": "^5.3.2"
-  }
+﻿{
+    "name":  "agent-tg-bot",
+    "version":  "1.0.0",
+    "type":  "module",
+    "main":  "bot_launchpad_v5.mjs",
+    "scripts":  {
+                    "start":  "node bot_launchpad_v5.mjs"
+                },
+    "dependencies":  {
+                         "@mysten/sui":  "1.21.0",
+                         "dotenv":  "^17.3.1",
+                         "node-telegram-bot-api":  "^0.66.0",
+                         "ioredis":  "^5.3.2",
+                         "@napi-rs/canvas":  "^0.1.80"
+                     }
 }
