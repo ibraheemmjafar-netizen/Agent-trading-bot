@@ -1858,13 +1858,17 @@ async function executeSell(chatId, ct, pct) {
     const sellA2bHop1 = !pansIsA;
     console.log('[PANS-SELL] hop1 poolId=%s coinA=%s a2b=%s sellAmt=%s',
       tp.poolId.slice(0,20), s1CoinA.slice(0,40), sellA2bHop1, sellAmt.toString());
+    // Bug fix: use pool-derived canonical s1CoinB (not user-supplied ct) so the
+    // Move VM's strict type-tag check on arg 3 passes. ct may differ from the
+    // pool's canonical type string by leading-zero stripping or normalization,
+    // which causes CommandArgumentError { arg_idx: 3, kind: TypeMismatch }.
     const tx1 = await buildCetusSwapTx({
       wallet:       u.walletAddress,
       poolId:       tp.poolId,
       coinA:        s1CoinA,
       coinB:        s1CoinB,
       a2b:          sellA2bHop1,
-      coinInType:   ct,
+      coinInType:   sellA2bHop1 ? s1CoinA : s1CoinB,
       amountIn:     sellAmt.toString(),
       minAmountOut: '0',
     });
@@ -2037,10 +2041,13 @@ async function executeSell(chatId, ct, pct) {
     const a2b1    = memeIsA; // MEME is INPUT; if MEME=coinA → swap_a2b (a2b=true) else swap_b2a (a2b=false)
 
     // Hop 1: MEME → AGENT
+    // Use pool-derived canonical type (a2b1 ? poolCoinA : poolCoinB) instead of
+    // user-supplied ct to avoid Move VM TypeMismatch from string-form mismatch.
     const tx1 = await buildCetusSwapTx({
       wallet: u.walletAddress, poolId: tokenPoolId,
       coinA: poolCoinA, coinB: poolCoinB, a2b: a2b1,
-      coinInType: ct, amountIn: sellAmt.toString(), minAmountOut: '0',
+      coinInType: a2b1 ? poolCoinA : poolCoinB,
+      amountIn: sellAmt.toString(), minAmountOut: '0',
     });
     try{applyTxOpts(tx1, u);}catch{}
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
@@ -2144,7 +2151,7 @@ async function executeSell(chatId, ct, pct) {
   // Last resort: force-find Cetus SUI-paired pool
   const pool = await findCetusPool(ct, SUI_T);
   if (pool) {
-    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType:ct, amountIn:sellAmt.toString(), minAmountOut:'0' });
+    const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType: pool.a2b ? pool.coinA : pool.coinB, amountIn:sellAmt.toString(), minAmountOut:'0' });
     try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
