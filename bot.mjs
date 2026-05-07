@@ -2733,8 +2733,10 @@ function pnlCaption(pos, p) {
 
 // ── RaidenX-style PnL card ──────────────────────────────────────────
 // Returns a PNG Buffer. Prefers MC display when entryMc was tracked at buy time.
-async function _renderPosCard(pos) {
+async function _renderPosCard(pos, user) {
   const me = await bot.getMe().catch(() => ({ username: 'bot' }));
+  const refCode = user?.referralCode || '';
+  const referralUrl = refCode ? `https://t.me/${me.username || BOT_USERNAME}?start=${refCode}` : '';
   const p  = await getPnl(pos).catch(() => null);
   const spent = parseFloat(pos.spent || 0);
   const cur   = p ? p.cur : null;
@@ -2770,6 +2772,8 @@ async function _renderPosCard(pos) {
     ts: new Date(),
     botHandle: '@' + (me.username || 'bot'),
     botName: 'AGENT TRADING BOT',
+    referralUrl,
+    referralBlurb: 'Refer others and earn up to 40%',
   });
 }
 
@@ -3984,7 +3988,7 @@ bot.on('callback_query', async(q) => {
       const uu=getU(chatId); const idx=parseInt(data.split(':')[1]);
       const pos=uu?.positions?.[idx]; if(!pos){await bot.sendMessage(chatId,'❌ Position not found.');return;}
       try {
-        const buf = await _renderPosCard(pos);
+        const buf = await _renderPosCard(pos, uu);
         const cap = `${(pos.sym||'?').toUpperCase()} ${pos.entryMc?'· MC P&L':'· SUI P&L'}  ·  shared via @${(await bot.getMe()).username}`;
         await bot.sendPhoto(chatId, buf, { caption: cap });
       } catch(e){
@@ -4628,7 +4632,7 @@ bot.onText(/\/print(?:\s+(\d+))?/, async (msg, match) => {
     const pickIdx = match?.[1] != null ? parseInt(match[1], 10) - 1 : null;
     if (pickIdx != null && positions[pickIdx]) {
       try {
-        const buf = await _renderPosCard(positions[pickIdx]);
+        const buf = await _renderPosCard(positions[pickIdx], u);
         await bot.sendPhoto(chatId, buf, { caption: `${(positions[pickIdx].sym||'?').toUpperCase()} PnL card` });
       } catch (e) { await bot.sendMessage(chatId, `❌ ${(e.message||'').slice(0,120)}`); }
       return;
