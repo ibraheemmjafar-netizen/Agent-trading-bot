@@ -47,6 +47,7 @@ import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypt
 import { readFileSync, writeFileSync, existsSync }                   from 'fs';
 import { setTimeout as sleep }                                       from 'timers/promises';
 import { createClient }                                              from 'redis';
+import { renderPnlCard, fmtMoney }                                   from './pnl-card.mjs';
 
 // ─── Launchpad integration: AGENT (MemeLand) + Odyssey moonbags ──
 import {
@@ -2401,18 +2402,50 @@ async function getTokenData(ct, walletAddr) {
     }));
 
   // Merge: prefer DS entry when same pool id exists in both; add DS-only pools.
-  const gpIds = new Set(gPools.map(p => p.id));
-  const merged = [...gPools, ...dsConverted.filter(p => !gpIds.has(p.id))];
+  // Normalize ids to lowercase so dedup works across DS/Gecko address case differences.
+  const norm   = id => String(id||'').toLowerCase();
+  const gpIds  = new Set(gPools.map(p => norm(p.id)));
+  const merged = [...gPools, ...dsConverted.filter(p => !gpIds.has(norm(p.id)))];
   const pools  = merged.sort((a, b) => b.liq - a.liq);
 
-  const best   = pools[0];
+  // Filter out phantom liquidity (Aftermath vaults, broken DS entries):
+  // a pool with significant liq but ~zero volume isn't a real trading pool.
+  // Guards to avoid false positives:
+  //   - Only filter pools older than 24h (new pools haven't accumulated volume yet).
+  //   - Require liq > $10k AND vol/liq < 0.0002 (i.e. <0.02% turnover/24h — extreme inactivity).
+  // Aftermath vault example: NS had $53.8M liq with $19k vol → ratio 0.00036 → filtered.
+  // Real low-vol pool example: a $10k LP with $5/day vol → ratio 0.0005 → kept.
+  const ageHrs = p => {
+    if (!p.age) return Infinity; // unknown age — assume old
+    const t = typeof p.age === 'string' ? Date.parse(p.age) : p.age;
+    if (!t) return Infinity;
+    return (Date.now() - t) / 3600000;
+  };
+  const isReal = p => {
+    const liq = p.liq||0, vol = p.vol||0;
+    if (liq <= 0) return false;
+    if (ageHrs(p) < 24) return true;          // give new pools the benefit of doubt
+    if (liq > 10000 && vol < liq * 0.0002) return false;
+    return true;
+  };
+  let realPools = pools.filter(isReal);
+  // Safety: if filter wiped everything, fall back to all pools so we never show $0 liq
+  // for a token that genuinely has liquidity.
+  if (realPools.length === 0 && pools.length > 0) realPools = pools;
+
+  const best   = realPools[0];
   const name   = meta?.name   || gTok?.name   || '?';
   const symbol = meta?.symbol || gTok?.symbol || '?';
   const dec    = meta?.decimals || gTok?.decimals || 9;
   const supRaw = supply ? Number(BigInt(supply.value)) : (gTok?.rawSupply||0);
   const supH   = supRaw / Math.pow(10, dec);
   const priceU = gTok?.priceUsd || best?.priceU || 0;
-  const liq    = pools.reduce((t,p) => t+(p.liq||0), 0);
+  const liq    = realPools.reduce((t,p) => t+(p.liq||0), 0);
+  // Volume: prefer the larger of gTok.vol24h (token-aggregate from Gecko) vs sum of real pool vols.
+  // Gecko token endpoint sometimes lags / misses DS-tracked pools; summing real pools covers more venues.
+  // Both sides are dedup'd, so max() avoids double-counting while still picking the more complete number.
+  const volSum  = realPools.reduce((t,p) => t+(p.vol||0), 0);
+  const volBest = Math.max(gTok?.vol24h||0, volSum);
   const top10  = (holders?.top||[]).slice(0,10).reduce((t,h) => t+h.pct, 0);
 
   const deployer = await cap(findDeployer(ct));
@@ -2427,7 +2460,7 @@ async function getTokenData(ct, walletAddr) {
 
   return {
     name, symbol, dec, supH,
-    priceU, mcap:gTok?.mcap||0, vol:gTok?.vol24h||best?.vol||0, liq,
+    priceU, mcap:gTok?.mcap||0, vol:volBest, liq,
     chg5m:best?.chg5m||0, chg1h:best?.chg1h||0, chg6h:best?.chg6h||0, chg24h:best?.chg24h||gTok?.chg24h||0,
     pools, best, dex:best?.dex||'Sui',
     age:best?.age ? fAge(best.age) : null,
@@ -2609,7 +2642,7 @@ function addPos(chatId, p) {
     if (p.tp != null) existing.tp = p.tp;
     if (p.sl != null) existing.sl = p.sl;
   } else {
-    u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, at:Date.now() });
+    u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, entryMc:p.entryMc||null, poolId:p.poolId||null, at:Date.now() });
   }
   saveDB();
 }
@@ -2696,6 +2729,48 @@ function pnlCaption(pos, p) {
     `Total PNL: *${s}${p.pnl.toFixed(4)} SUI (${s}${p.pct.toFixed(2)}%)*\n` +
     `${pnlBar(p.pct)}`
   );
+}
+
+// ── RaidenX-style PnL card ──────────────────────────────────────────
+// Returns a PNG Buffer. Prefers MC display when entryMc was tracked at buy time.
+async function _renderPosCard(pos) {
+  const me = await bot.getMe().catch(() => ({ username: 'bot' }));
+  const p  = await getPnl(pos).catch(() => null);
+  const spent = parseFloat(pos.spent || 0);
+  const cur   = p ? p.cur : null;
+  const pct   = p ? p.pct : 0;
+
+  // Prefer MC display when we recorded entry MC
+  let entryLabel = 'Entry SUI', currentLabel = 'Current SUI';
+  let entryValue = `${spent.toFixed(4)} SUI`;
+  let currentValue = cur != null ? `${cur.toFixed(4)} SUI` : '—';
+
+  if (pos.entryMc && pos.entryMc > 0) {
+    entryLabel = 'Entry MC';
+    entryValue = fmtMoney(pos.entryMc);
+    // try to get current MC from agent backend (only source with live MC)
+    let curMc = null;
+    if (pos.source === 'agent') {
+      const t = await fetchAgentTokenByCoinType(pos.ct).catch(() => null);
+      if (t?.marketCapUsd) curMc = Number(t.marketCapUsd);
+    }
+    if (curMc == null && cur != null && spent > 0) {
+      // Derive current MC from PnL ratio: cur/spent × entryMc
+      curMc = pos.entryMc * (cur / spent);
+    }
+    currentLabel = 'Current MC';
+    currentValue = curMc != null ? fmtMoney(curMc) : '—';
+  }
+
+  return renderPnlCard({
+    sym: pos.sym || '?',
+    pct,
+    entryLabel, entryValue,
+    currentLabel, currentValue,
+    ts: new Date(),
+    botHandle: '@' + (me.username || 'bot'),
+    botName: 'AGENT TRADING BOT',
+  });
 }
 
 function pnlChart(sym, pct, spent, cur) {
@@ -3202,7 +3277,7 @@ async function doPositions(chatId) {
         }
 
         const sellKb = { inline_keyboard: [
-          [{text:'📍 Close track',callback_data:`close_track:${i}`},{text:'✨ Flex',callback_data:`flex:${i}`}],
+          [{text:'🖨 Print PnL',callback_data:`print:${i}`},{text:'📍 Close track',callback_data:`close_track:${i}`}],
           [
             {text:'💸 25%',  callback_data:`qs:${i}:25` },
             {text:'💸 50%',  callback_data:`qs:${i}:50` },
@@ -3904,16 +3979,17 @@ bot.on('callback_query', async(q) => {
       try{await bot.deleteMessage(chatId,q.message.message_id);}catch{}
       return;
     }
-    if(data.startsWith('flex:')){
-      await bot.answerCallbackQuery(q.id).catch(()=>{});
+    if(data.startsWith('flex:') || data.startsWith('print:')){
+      await bot.answerCallbackQuery(q.id, {text:'🖨 Generating card...'}).catch(()=>{});
       const uu=getU(chatId); const idx=parseInt(data.split(':')[1]);
-      const pos=uu?.positions?.[idx]; if(!pos){return;}
+      const pos=uu?.positions?.[idx]; if(!pos){await bot.sendMessage(chatId,'❌ Position not found.');return;}
       try {
-        const p=await getPnl(pos);
-        if(!p){await bot.sendMessage(chatId,'No PnL data available.');return;}
-        const cap=`${p.pnl>=0?'🚀':'💀'} *${pos.sym}/SUI*\n\nEntry → Current\nP&L: *${p.pnl>=0?'+':''}${p.pct.toFixed(2)}%* (${p.pnl>=0?'+':''}${p.pnl.toFixed(4)} SUI)\n\n_Shared via Agent Trading Bot_`;
-        await bot.sendPhoto(chatId,pnlChart(pos.sym,p.pct,parseFloat(pos.spent||0),p.cur),{caption:cap,parse_mode:'Markdown'});
-      } catch(e){await bot.sendMessage(chatId,`Couldn't generate flex card: ${e.message?.slice(0,80)}`);}
+        const buf = await _renderPosCard(pos);
+        const cap = `${(pos.sym||'?').toUpperCase()} ${pos.entryMc?'· MC P&L':'· SUI P&L'}  ·  shared via @${(await bot.getMe()).username}`;
+        await bot.sendPhoto(chatId, buf, { caption: cap });
+      } catch(e){
+        await bot.sendMessage(chatId,`❌ Couldn't generate PnL card: ${(e.message||'').slice(0,120)}`);
+      }
       return;
     }
 
@@ -4544,6 +4620,30 @@ bot.onText(/\/scan(?:\s+(.+))?/, async(msg,m)=>{
 bot.onText(/\/withdraw/, async(msg)=>doWithdrawMenu(msg.chat.id));
 bot.onText(/\/balance/,  async(msg)=>doBalance(msg.chat.id));
 bot.onText(/\/positions/,async(msg)=>doPositions(msg.chat.id));
+bot.onText(/\/print(?:\s+(\d+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  await guard(chatId, async (u) => {
+    const positions = u.positions || [];
+    if (!positions.length) { await bot.sendMessage(chatId, '🖨 No positions to print.\n\nBuy a token first, then /print to share a PnL card.'); return; }
+    const pickIdx = match?.[1] != null ? parseInt(match[1], 10) - 1 : null;
+    if (pickIdx != null && positions[pickIdx]) {
+      try {
+        const buf = await _renderPosCard(positions[pickIdx]);
+        await bot.sendPhoto(chatId, buf, { caption: `${(positions[pickIdx].sym||'?').toUpperCase()} PnL card` });
+      } catch (e) { await bot.sendMessage(chatId, `❌ ${(e.message||'').slice(0,120)}`); }
+      return;
+    }
+    // No index → show picker
+    const rows = positions.slice(0, 30).map((p, i) => ([{
+      text: `${i+1}. ${(p.sym||'?').slice(0,12)}`,
+      callback_data: `print:${i}`,
+    }]));
+    await bot.sendMessage(chatId,
+      `🖨 *Print PnL Card*\n\n_Pick a position to generate a shareable card:_`,
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } }
+    );
+  });
+});
 bot.onText(/\/pnl(?:\s+(.+))?/, async(msg,m)=>{
   const chatId=msg.chat.id, arg=m[1]?san(m[1].trim()):null;
   await guard(chatId,async(u)=>{
@@ -4878,7 +4978,7 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💸 Spent:    \`${amtSui} SUI\`\n` +
@@ -4965,7 +5065,7 @@ async function _odyBuyCA(chatId, msgId, amtSui) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💸 Spent:    \`${amtSui} SUI\`\n` +
@@ -5120,7 +5220,7 @@ async function _agentBuyCA(chatId, msgId, amtSui) {
     const ab2  = await getActualDelta(res2.balanceChanges || res2.digest, t.coinType, u.walletAddress);
     const got  = ab2 && ab2 > 0n ? Number(ab2)/Math.pow(10, dec) : 0;
     const agentGot = Number(ab1)/1e9;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', poolId: t.poolId || null, tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), poolId: t.poolId || null, tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
       `🟢 *Bought ${sym}* via AGENT MemeLand\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
@@ -5336,7 +5436,7 @@ async function _mbBuyCommon(chatId, msgId, t, amtSui, backCb) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'moonbags', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'moonbags', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on Moonbags\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
@@ -5550,7 +5650,7 @@ async function _hfBuyCommon(chatId, msgId, t, amtSui, backCb) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on hop.fun\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
