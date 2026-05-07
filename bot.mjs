@@ -2735,23 +2735,73 @@ function updatePositionAfterSell(chatId, ct, pct) {
   saveDB();
 }
 
+// Cached SUI/USD price — used to convert USD-denominated indexer prices back
+// into SUI for PnL display. 60s TTL keeps it fresh without hammering Gecko.
+let _suiUsdCache = { v:0, ts:0 };
+async function fetchSuiUsd() {
+  const now = Date.now();
+  if (_suiUsdCache.v > 0 && now - _suiUsdCache.ts < 60_000) return _suiUsdCache.v;
+  try {
+    const t = await geckoTok(SUI_T).catch(() => null);
+    const v = t?.priceUsd > 0 ? t.priceUsd : 0;
+    if (v > 0) { _suiUsdCache = { v, ts: now }; return v; }
+  } catch {}
+  // Fallback: keep last known good value if we have one, else null.
+  return _suiUsdCache.v > 0 ? _suiUsdCache.v : null;
+}
+
+// Look up live USD price of a token via GeckoTerminal or DexScreener
+// (whichever has it indexed). This covers tokens trading on any Sui DEX —
+// not just Cetus, which is the only venue getSwapEstimate currently hits.
+async function _tokenPriceUsd(ct) {
+  try {
+    const gt = await geckoTok(ct).catch(() => null);
+    if (gt?.priceUsd > 0) return gt.priceUsd;
+  } catch {}
+  try {
+    const ds = await getDexScreenerPools(ct).catch(() => []);
+    // Pick the deepest-liquidity pool with a positive price.
+    const best = (ds || []).filter(p => p.priceU > 0).sort((a,b) => (b.liq||0) - (a.liq||0))[0];
+    if (best?.priceU > 0) return best.priceU;
+  } catch {}
+  return null;
+}
+
 async function getPnl(pos) {
   if (pos.source==='bonding'||!pos.tokens||pos.tokens<=0) return null;
+  const spent = parseFloat(pos.spent || 0);
+  if (!(spent > 0)) return null;
+  const mkRes = (cur) => ({ cur, pnl: cur - spent, pct: ((cur - spent) / spent) * 100 });
   try {
     // AGENT MemeLand tokens route MEME→AGENT→SUI (2 hops) so direct
-    // getSwapEstimate always returns 0. Use Railway backend priceSui instead.
+    // getSwapEstimate always returns 0. Use Railway backend priceSui first;
+    // fall through to the USD fallback if the backend has no price either.
     if (pos.source === 'agent') {
       const t = await fetchAgentTokenByCoinType(pos.ct).catch(() => null);
-      if (!t || t.priceSui == null) return null;
-      const cur = Number(t.priceSui) * pos.tokens;
-      if (!cur || cur <= 0) return null;
-      return { cur, pnl: cur - parseFloat(pos.spent), pct: (cur - parseFloat(pos.spent)) / parseFloat(pos.spent) * 100 };
+      if (t?.priceSui != null) {
+        const cur = Number(t.priceSui) * pos.tokens;
+        if (cur > 0) return mkRes(cur);
+      }
+    } else {
+      const amt = BigInt(Math.floor(pos.tokens * Math.pow(10, pos.dec||9)));
+      const out = await getSwapEstimate(pos.ct, SUI_T, amt.toString()).catch(() => null);
+      if (out && out !== '0') {
+        const cur = Number(out)/1e9;
+        if (cur > 0) return mkRes(cur);
+      }
     }
-    const amt = BigInt(Math.floor(pos.tokens * Math.pow(10, pos.dec||9)));
-    const out = await getSwapEstimate(pos.ct, SUI_T, amt.toString());
-    if (!out||out==='0') return null;
-    const cur = Number(out)/1e9;
-    return { cur, pnl:cur-parseFloat(pos.spent), pct:(cur-parseFloat(pos.spent))/parseFloat(pos.spent)*100 };
+    // Universal fallback: USD price from Gecko/DexScreener × tokens / SUI-USD.
+    // This is what lets tokens on Turbos / FlowX / Kriya / BlueMove / PANS hop
+    // pools show live PnL — getSwapEstimate above only routes via Cetus.
+    const [pUsd, suiUsd] = await Promise.all([
+      _tokenPriceUsd(pos.ct),
+      fetchSuiUsd(),
+    ]);
+    if (pUsd > 0 && suiUsd > 0) {
+      const cur = (pUsd * pos.tokens) / suiUsd;
+      if (cur > 0) return mkRes(cur);
+    }
+    return null;
   } catch { return null; }
 }
 
@@ -3530,6 +3580,31 @@ function fullBuyKb(u, ct, amtRows){
   ];
 }
 
+// Build the bottom action rows for the trade card.
+// In Buy Mode → rocket SUI-amount buttons (ba:i / ba:c → showBuyConfirm).
+// In Sell Mode → 25 / 50 / 75 / 100 percentage buttons + custom % (sp:25 etc.
+// → showSellConfirm). This is what the screenshot is missing.
+function buildActionRows(u) {
+  const sellOn = (u.settings?.buySellMode === 'sell');
+  if (sellOn) {
+    return [
+      [
+        {text:'💸 25%',  callback_data:'sp:25' },
+        {text:'💸 50%',  callback_data:'sp:50' },
+        {text:'💸 75%',  callback_data:'sp:75' },
+        {text:'💸 100%', callback_data:'sp:100'},
+      ],
+      [{text:'✏️ x %', callback_data:'sp:c'}],
+    ];
+  }
+  const amts = u.settings?.buyAmounts || DEF_AMTS;
+  const btns = amts.map((a,i) => ({text:`🚀 ${a} SUI`, callback_data:`ba:${i}`}));
+  btns.push({text:'✏️ x SUI', callback_data:'ba:c'});
+  const rows = [];
+  for (let i=0; i<btns.length; i+=3) rows.push(btns.slice(i, i+3));
+  return rows;
+}
+
 async function startBuy(chatId, ct, editMsgId) {
   const u=getU(chatId); if(!u) return;
   let mid=editMsgId;
@@ -3537,16 +3612,10 @@ async function startBuy(chatId, ct, editMsgId) {
     const lm=await bot.sendMessage(chatId,'⏳ Fetching token info...');
     mid=lm.message_id;
   }
-  const s=u.settings;
   try {
     const [d,st]=await Promise.all([getTokenData(ct, u.walletAddress), detectState(ct).catch(()=>null)]);
     updU(chatId,{pd:{ct,sym:d.symbol,buyMsgId:mid}});
-    const amts=s.buyAmounts||DEF_AMTS;
-    // 3-column rocket grid — RaidenX style
-    const amtBtns=amts.map((a,i)=>({text:`🚀 ${a} SUI`,callback_data:`ba:${i}`}));
-    amtBtns.push({text:'✏️ x SUI',callback_data:'ba:c'});
-    const amtRows=[];
-    for(let i=0;i<amtBtns.length;i+=3) amtRows.push(amtBtns.slice(i,i+3));
+    const amtRows = buildActionRows(u);
     await bot.editMessageText(buyCard(d,ct,st),{
       chat_id:chatId, message_id:mid, parse_mode:'Markdown',
       reply_markup:{inline_keyboard:fullBuyKb(u,ct,amtRows)},
@@ -3555,11 +3624,7 @@ async function startBuy(chatId, ct, editMsgId) {
     const meta=await getMeta(ct).catch(()=>null);
     const sym=meta?.symbol||trunc(ct);
     updU(chatId,{pd:{ct,sym,buyMsgId:mid}});
-    const amts=s.buyAmounts||DEF_AMTS;
-    const amtBtns=amts.map((a,i)=>({text:`🚀 ${a} SUI`,callback_data:`ba:${i}`}));
-    amtBtns.push({text:'✏️ x SUI',callback_data:'ba:c'});
-    const amtRows=[];
-    for(let i=0;i<amtBtns.length;i+=3) amtRows.push(amtBtns.slice(i,i+3));
+    const amtRows = buildActionRows(u);
     await bot.editMessageText(
       `*${sym}/SUI*\n\`${ct}\`\n\n⚠️ _Token data unavailable — routing to best price_`,
       {chat_id:chatId,message_id:mid,parse_mode:'Markdown',reply_markup:{inline_keyboard:fullBuyKb(u,ct,amtRows)}}
@@ -3842,21 +3907,9 @@ bot.on('callback_query', async(q) => {
     if(data==='mode_buy'||data==='mode_sell'){
       await bot.answerCallbackQuery(q.id).catch(()=>{});
       const uu=getU(chatId); if(uu){uu.settings.buySellMode=(data==='mode_sell')?'sell':'buy';saveDB();}
-      const ct=uu?.pd?.ct;
-      if(ct){
-        if(data==='mode_sell'){
-          // Route to sell-percentage UI (25/50/75/100), not the buy SUI-amount card.
-          const meta=await getMeta(ct).catch(()=>null)||{};
-          const sym=meta.symbol||uu?.pd?.sym||trunc(ct);
-          updU(chatId,{pd:{...uu.pd,ct,sym}});
-          await showSellPct(chatId,ct,sym,q.message.message_id).catch(async()=>{
-            // showSellPct sends a new message; if user has no balance it warns inline.
-            await showSellPct(chatId,ct,sym,null).catch(()=>{});
-          });
-        } else {
-          await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
-        }
-      }
+      // Re-render the same card in place — buildActionRows() picks the
+      // correct bottom row (rocket SUI amounts vs sell %) based on mode.
+      const ct=uu?.pd?.ct; if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
       return;
     }
     if(data==='mode_swap'||data==='mode_limit'||data==='mode_dca'||data==='mode_migration'){
