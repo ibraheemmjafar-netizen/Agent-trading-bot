@@ -401,6 +401,16 @@ async function resolveCoinType(raw) {
  * Tries both coin orderings. Returns pool info with a2b direction.
  */
 async function findCetusPool(coinA, coinB) {
+  // Sanity: a pool can't have the same coin on both sides. Without this guard,
+  // findCetusPool(PANS, PANS) used by section 3 (when user sells PANS itself)
+  // would fall into the pools_info fallback that returns ANY PANS pool, and
+  // section 3 would then set state='pans_cetus' with a wrong tokenPansPool —
+  // causing PANS-sell hop1 to build swap_b2a<PANS,SUI> with mismatched coins.
+  try {
+    if (normalizeStructTag(coinA) === normalizeStructTag(coinB)) return null;
+  } catch {
+    if ((coinA||'').toLowerCase() === (coinB||'').toLowerCase()) return null;
+  }
   // Try direct pool lookup first (more reliable)
   const pairs = [[coinA, coinB, true], [coinB, coinA, false]];
   for (const [ca, cb, isA2b] of pairs) {
@@ -900,18 +910,28 @@ async function detectState(ct) {
   } catch {}
 
   // 3. PANS ecosystem — Cetus API + GeckoTerminal fallback
+  //    Skip when ct === PANS itself: a 2-hop "TOKEN→PANS→SUI" route makes no
+  //    sense, and findCetusPool(PANS,PANS) is now guarded to return null anyway.
   try {
-    const pansPool = await findCetusPool(PANS_T, ct);
-    if (pansPool) {
-      const suiPansPool = await findSuiPansPool();
-      if (suiPansPool) {
-        const res = {
-          state:'pans_cetus', dex:'Cetus (PANS hop)',
-          tokenPansPool: pansPool,
-          suiPansPool:   suiPansPool,
-          ts: Date.now(),
-        };
-        stateCache.set(ct, res); return res;
+    const ctIsPansSec3 = (() => { try { return normalizeStructTag(ct) === normalizeStructTag(PANS_T); } catch { return ct.toLowerCase() === PANS_T.toLowerCase(); } })();
+    if (!ctIsPansSec3) {
+      const pansPool = await findCetusPool(PANS_T, ct);
+      if (pansPool) {
+        // Defense-in-depth: confirm the returned pool's non-PANS side equals ct.
+        const tagEqS3 = (a,b)=>{ try { return normalizeStructTag(a)===normalizeStructTag(b); } catch { return (a||'').toLowerCase()===(b||'').toLowerCase(); } };
+        const otherSide = tagEqS3(pansPool.coinA, PANS_T) ? pansPool.coinB : pansPool.coinA;
+        if (tagEqS3(otherSide, ct)) {
+          const suiPansPool = await findSuiPansPool();
+          if (suiPansPool) {
+            const res = {
+              state:'pans_cetus', dex:'Cetus (PANS hop)',
+              tokenPansPool: pansPool,
+              suiPansPool:   suiPansPool,
+              ts: Date.now(),
+            };
+            stateCache.set(ct, res); return res;
+          }
+        }
       }
     }
   } catch {}
@@ -929,11 +949,19 @@ async function detectState(ct) {
   // Tokens launched on AGENT MemeLand pair against AGENT, not SUI.
   // detectState must recognise them as 'agent_cetus' so executeSell can route
   // them through the existing 2-hop logic (mirrors _agentSellCA).
+  // Skip when ct === AGENT itself (mirror of section 3 PANS guard).
   try {
-    const agentPool = await findCetusPool(AGENT_T, ct);
-    if (agentPool) {
-      const res = { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...agentPool, ts:Date.now() };
-      stateCache.set(ct, res); return res;
+    const ctIsAgentSec4b = (() => { try { return normalizeStructTag(ct) === normalizeStructTag(AGENT_T); } catch { return ct.toLowerCase() === AGENT_T.toLowerCase(); } })();
+    if (!ctIsAgentSec4b) {
+      const agentPool = await findCetusPool(AGENT_T, ct);
+      if (agentPool) {
+        const tagEqS4b = (a,b)=>{ try { return normalizeStructTag(a)===normalizeStructTag(b); } catch { return (a||'').toLowerCase()===(b||'').toLowerCase(); } };
+        const otherSide = tagEqS4b(agentPool.coinA, AGENT_T) ? agentPool.coinB : agentPool.coinA;
+        if (tagEqS4b(otherSide, ct)) {
+          const res = { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...agentPool, ts:Date.now() };
+          stateCache.set(ct, res); return res;
+        }
+      }
     }
   } catch {}
 
