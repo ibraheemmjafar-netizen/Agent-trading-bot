@@ -3830,11 +3830,7 @@ bot.on('callback_query', async(q) => {
         const res = await executeSell(chatId, pos.ct, pct);
         const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
         await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
-        if (res.pnl) {
-          const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
-          const cap = `${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${pct}% Sell  |  P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  (${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI)`;
-          await bot.sendPhoto(chatId, chartUrl, { caption: cap }).catch(() => {});
-        }
+        // PnL is already included in sellMsg via formatSellResult — no pie chart photo.
       } catch(e) {
         await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown' });
       }
@@ -3846,8 +3842,21 @@ bot.on('callback_query', async(q) => {
     if(data==='mode_buy'||data==='mode_sell'){
       await bot.answerCallbackQuery(q.id).catch(()=>{});
       const uu=getU(chatId); if(uu){uu.settings.buySellMode=(data==='mode_sell')?'sell':'buy';saveDB();}
-      // Re-render in place
-      const ct=uu?.pd?.ct; if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+      const ct=uu?.pd?.ct;
+      if(ct){
+        if(data==='mode_sell'){
+          // Route to sell-percentage UI (25/50/75/100), not the buy SUI-amount card.
+          const meta=await getMeta(ct).catch(()=>null)||{};
+          const sym=meta.symbol||uu?.pd?.sym||trunc(ct);
+          updU(chatId,{pd:{...uu.pd,ct,sym}});
+          await showSellPct(chatId,ct,sym,q.message.message_id).catch(async()=>{
+            // showSellPct sends a new message; if user has no balance it warns inline.
+            await showSellPct(chatId,ct,sym,null).catch(()=>{});
+          });
+        } else {
+          await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+        }
+      }
       return;
     }
     if(data==='mode_swap'||data==='mode_limit'||data==='mode_dca'||data==='mode_migration'){
@@ -4144,11 +4153,7 @@ bot.on('callback_query', async(q) => {
         const res = await executeSell(chatId, sc_ct, sc_pct);
         const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
         await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:msgId, parse_mode:'Markdown', disable_web_page_preview:true });
-        if (res.pnl) {
-          const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
-          const cap = `${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${sc_pct}% Sell  |  P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  (${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI)`;
-          await bot.sendPhoto(chatId, chartUrl, { caption: cap }).catch(() => {});
-        }
+        // PnL is already included in sellMsg via formatSellResult — no pie chart photo.
       }catch(e){await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});}
       updU(chatId,{pd:{}}); return;
     }
@@ -4452,11 +4457,7 @@ bot.on('message', async(msg) => {
       const res = await executeSell(chatId, pos.ct, pct);
       const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
       await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
-      if (res.pnl) {
-        const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
-        const cap = `${res.pnl.pnl>=0?'🚀':'💀'} ${res.sym} ${pct}% Sell  |  P&L: ${res.pnl.pnl>=0?'+':''}${res.pnl.pnlPct.toFixed(2)}%  (${res.pnl.pnl>=0?'+':''}${res.pnl.pnl.toFixed(4)} SUI)`;
-        await bot.sendPhoto(chatId, chartUrl, { caption: cap }).catch(() => {});
-      }
+      // PnL is already included in sellMsg via formatSellResult — no pie chart photo.
     } catch(e) {
       await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown' });
     }
