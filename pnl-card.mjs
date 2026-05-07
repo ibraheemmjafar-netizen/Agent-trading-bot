@@ -1,6 +1,17 @@
 // RaidenX-style PnL flex card generator
-// Pure @napi-rs/canvas — no external assets needed
-import { createCanvas } from '@napi-rs/canvas';
+// Uses bundled Inter font so text renders on slim Linux containers (Railway, etc).
+import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import { existsSync } from 'fs';
+
+// Register Inter once. Variable font supplies all weights.
+const _here = dirname(fileURLToPath(import.meta.url));
+const _fontPath = join(_here, 'fonts', 'Inter-Regular.ttf');
+if (existsSync(_fontPath) && !GlobalFonts.has('Inter')) {
+  try { GlobalFonts.registerFromPath(_fontPath, 'Inter'); } catch {}
+}
+const FAM = GlobalFonts.has('Inter') ? 'Inter' : 'sans-serif';
 
 const W = 900, H = 900;
 
@@ -118,19 +129,19 @@ export function renderPnlCard(opts) {
 
   // bot title (top of card)
   ctx.fillStyle = '#cfeee0';
-  ctx.font = '600 28px sans-serif';
+  ctx.font = `600 28px ${FAM}`;
   ctx.textAlign = 'center';
   ctx.fillText(botName, W/2, cy + 52);
 
   // symbol
   ctx.fillStyle = '#ffffff';
-  ctx.font = '700 46px sans-serif';
+  ctx.font = `700 46px ${FAM}`;
   ctx.fillText(`$${sym.toUpperCase()}`, W/2, cy + 130);
 
   // BIG percentage
   const pctStr = `${positive?'+':''}${pct.toFixed(2)}%`;
   ctx.fillStyle = accent;
-  ctx.font = '800 130px sans-serif';
+  ctx.font = `800 130px ${FAM}`;
   ctx.fillText(pctStr, W/2, cy + 280);
 
   // Entry / Current panel
@@ -142,20 +153,20 @@ export function renderPnlCard(opts) {
 
   // row 1
   ctx.textAlign = 'left';
-  ctx.fillStyle = '#9ec0b3'; ctx.font = '500 26px sans-serif';
+  ctx.fillStyle = '#9ec0b3'; ctx.font = `500 26px ${FAM}`;
   ctx.fillText(entryLabel, px + 28, py + 50);
   ctx.textAlign = 'right';
-  ctx.fillStyle = '#ffffff'; ctx.font = '700 28px sans-serif';
+  ctx.fillStyle = '#ffffff'; ctx.font = `700 28px ${FAM}`;
   ctx.fillText(String(entryValue), px + pw - 28, py + 50);
   // divider
   ctx.strokeStyle = 'rgba(92,255,177,0.12)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(px + 24, py + 78); ctx.lineTo(px + pw - 24, py + 78); ctx.stroke();
   // row 2
   ctx.textAlign = 'left';
-  ctx.fillStyle = '#9ec0b3'; ctx.font = '500 26px sans-serif';
+  ctx.fillStyle = '#9ec0b3'; ctx.font = `500 26px ${FAM}`;
   ctx.fillText(currentLabel, px + 28, py + 118);
   ctx.textAlign = 'right';
-  ctx.fillStyle = '#ffffff'; ctx.font = '700 28px sans-serif';
+  ctx.fillStyle = '#ffffff'; ctx.font = `700 28px ${FAM}`;
   ctx.fillText(String(currentValue), px + pw - 28, py + 118);
 
   drawHills(ctx);
@@ -163,7 +174,7 @@ export function renderPnlCard(opts) {
   // footer: bot handle + timestamp
   ctx.textAlign = 'center';
   ctx.fillStyle = '#7d9a8e';
-  ctx.font = '500 22px sans-serif';
+  ctx.font = `500 22px ${FAM}`;
   const tsStr = ts.toISOString().slice(0,19).replace('T',' ') + ' (UTC)';
   ctx.fillText(`${botHandle}  ·  ${tsStr}`, W/2, H - 30);
 
