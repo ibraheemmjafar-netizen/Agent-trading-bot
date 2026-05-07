@@ -47,6 +47,7 @@ import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypt
 import { readFileSync, writeFileSync, existsSync }                   from 'fs';
 import { setTimeout as sleep }                                       from 'timers/promises';
 import { createClient }                                              from 'redis';
+import { renderPnlCard, fmtMoney }                                   from './pnl-card.mjs';
 
 // ─── Launchpad integration: AGENT (MemeLand) + Odyssey moonbags ──
 import {
@@ -69,10 +70,10 @@ import {
 // ═══════════════════════════════════════════════════════════
 // CONFIG — set via environment variables
 // ═══════════════════════════════════════════════════════════
-const TG_TOKEN    = process.env.TG_BOT_TOKEN  || '';
-const ENC_KEY     = process.env.ENCRYPT_KEY   || '';
+const TG_TOKEN    = process.env.TG_BOT_TOKEN  || process.env.BOT_TOKEN || '';
+const ENC_KEY     = process.env.ENCRYPT_KEY   || process.env.SESSION_SECRET || '';
 const RPC_URL     = process.env.RPC_URL       || 'https://fullnode.mainnet.sui.io:443';
-const ADMIN_ID    = process.env.ADMIN_CHAT_ID || '';
+const ADMIN_ID    = process.env.ADMIN_CHAT_ID || process.env.ADMIN_ID || '';
 
 const DEV_WALLET  = '0x47cee6fed8a44224350d0565a45dd97b320a9c3f54a8feb6036fb9b2d3a81a08';
 const FEE_BPS     = 500;           // 5% bot fee (auto-sent to DEV_WALLET on every trade)
@@ -88,8 +89,13 @@ const SUI_AGENT_POOL = '0xe8bf297251264d4474a6f6115ebeeeea4a3e50d534d3b663691e22
 const SUISCAN     = 'https://suiscan.xyz/mainnet/tx/';
 
 // ─── Redis client (persists users.json across Railway deployments) ───
-const redisClient = createClient({ url: process.env.REDIS_URL });
-redisClient.on('error', e => console.error('Redis error:', e.message));
+// Falls back to local file `./bot-db.json` when REDIS_URL is not set.
+const REDIS_ENABLED = !!process.env.REDIS_URL;
+const DB_FILE = process.env.DB_FILE || './bot-db.json';
+const redisClient = REDIS_ENABLED
+  ? createClient({ url: process.env.REDIS_URL, socket:{ reconnectStrategy:r=>r>3?false:Math.min(r*500,3000) } })
+  : { connect:async()=>{}, get:async()=>null, set:async()=>{}, on:()=>{} };
+if (REDIS_ENABLED) redisClient.on('error', e => console.error('Redis error:', e.message));
 const GECKO       = 'https://api.geckoterminal.com/api/v2';
 const GECKO_NET   = 'sui-network';
 const BB_KEY      = '9W0M5OHgX2gF05Si1AG7kPUm6hxg6P';
@@ -176,19 +182,37 @@ function trunc(a)    { return (!a || a.length < 12) ? (a || '') : a.slice(0,6)+'
 // ═══════════════════════════════════════════════════════════
 let DB = {};
 async function loadDB() {
-  try {
-    await redisClient.connect();
-    const raw = await redisClient.get('agent_bot_db');
-    DB = raw ? JSON.parse(raw) : {};
-    console.log(`✅ DB loaded from Redis — ${Object.keys(DB).length} users`);
-  } catch(e) {
-    console.error('Redis loadDB failed, starting empty:', e.message);
-    DB = {};
+  if (REDIS_ENABLED) {
+    try {
+      await redisClient.connect();
+      const raw = await redisClient.get('agent_bot_db');
+      DB = raw ? JSON.parse(raw) : {};
+      console.log(`✅ DB loaded from Redis — ${Object.keys(DB).length} users`);
+      return;
+    } catch(e) {
+      console.error('Redis loadDB failed, falling back to file:', e.message);
+    }
   }
+  try {
+    if (existsSync(DB_FILE)) {
+      DB = JSON.parse(readFileSync(DB_FILE, 'utf8'));
+      console.log(`✅ DB loaded from ${DB_FILE} — ${Object.keys(DB).length} users`);
+    } else { DB = {}; console.log(`✅ DB starting empty (file-mode, will write to ${DB_FILE})`); }
+  } catch(e) { console.error('File loadDB failed, starting empty:', e.message); DB = {}; }
 }
+let _saveTimer = null;
 function saveDB() {
-  redisClient.set('agent_bot_db', JSON.stringify(DB))
-    .catch(e => console.error('Redis saveDB error:', e.message));
+  if (REDIS_ENABLED) {
+    redisClient.set('agent_bot_db', JSON.stringify(DB))
+      .catch(e => console.error('Redis saveDB error:', e.message));
+    return;
+  }
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    try { writeFileSync(DB_FILE, JSON.stringify(DB)); }
+    catch(e) { console.error('File saveDB error:', e.message); }
+  }, 300);
 }
 function getU(id)    { return DB[String(id)] || null; }
 function makeU(id, extra={}) {
@@ -200,7 +224,20 @@ function makeU(id, extra={}) {
     settings:{
       slippage:1, confirmThreshold:0.5, copyAmount:0.1,
       buyAmounts:[...DEF_AMTS], tpDefault:null, slDefault:null,
+      // RaidenX-parity additions:
+      gasPriceMist:750,        // editable gas price in MIST
+      tipSui:0,                // optional tip per trade (SUI, transferred to dev)
+      mode:'swap',             // swap | limit | dca | migration
+      buySellMode:'buy',       // 'buy' or 'sell' — drives Buy Mode/Sell Mode toggle
+      autoSell:false,          // auto-sell engine on/off
+      autoSellTpPct:50,        // default TP % for auto-sell
+      autoSellSlPct:30,        // default SL %
     },
+    wallets:[],                // [{address, encryptedKey, label}] — multi-wallet
+    activeWalletIdx:[0],       // selected wallet indices for trading
+    limitOrders:[],            // [{ct, sui, targetPriceUsd, dir:'<='|'>=', triggered, at}]
+    dcaOrders:[],              // [{ct, sui, intervalSec, lastFire, count, totalCount, at}]
+    migAlerts:[],              // [{ct, lastState, at}] — notify on bonding→graduated
     referralCode:genRef(), referredBy:null, referredByCode:null, referralCount:0, referralEarned:0,
     state:null, pd:{}, ...extra,
   };
@@ -211,6 +248,29 @@ function updU(id, patch) {
   Object.assign(u, patch); u.lastActivity = Date.now(); saveDB();
 }
 function isLocked(u)  { return !!(u?.pinHash && u?.lockedAt); }
+
+// ── Multi-wallet helpers (backward compatible) ────────────────────
+function getAllWallets(u){
+  if(!u) return [];
+  const list = [];
+  if(u.walletAddress&&u.encryptedKey) list.push({address:u.walletAddress,encryptedKey:u.encryptedKey,label:'Main'});
+  if(Array.isArray(u.wallets)) for(const w of u.wallets) if(w&&w.address&&w.encryptedKey) list.push(w);
+  return list;
+}
+function getActiveWallets(u){
+  const all = getAllWallets(u);
+  if(!all.length) return [];
+  const idx = (u.activeWalletIdx&&u.activeWalletIdx.length) ? u.activeWalletIdx : [0];
+  return idx.filter(i=>i>=0&&i<all.length).map(i=>all[i]);
+}
+function applyTxOpts(tx, u){
+  // RaidenX-parity: apply user's gas price (in MIST) — keeps existing gas budget
+  try {
+    const gp = u?.settings?.gasPriceMist;
+    if (gp && gp>0) tx.setGasPrice(BigInt(gp));
+  } catch {}
+  return tx;
+}
 function lockU(id)    { updU(id, { lockedAt: Date.now() }); }
 function unlockU(id)  { updU(id, { lockedAt: null, failAttempts: 0 }); }
 
@@ -1398,8 +1458,12 @@ async function executeBuy(chatId, ct, amtSui) {
   const refMist  = refWallet ? (feeMist * BigInt(Math.floor(REF_SHARE * 100))) / 100n : 0n;
   const devMist  = feeMist - refMist;
 
-  // Helper to append fee transfers to tx
+  // RaidenX-parity: optional tip (transferred to dev wallet)
+  const tipMist = BigInt(Math.floor(Number(u.settings.tipSui||0) * Number(MIST)));
+
+  // Helper to append fee transfers + tip to tx; also applies user gas price
   const addFees = (tx) => {
+    applyTxOpts(tx, u);
     const [fc] = tx.splitCoins(tx.gas, [tx.pure.u64(devMist)]);
     tx.transferObjects([fc], tx.pure.address(DEV_WALLET));
     if (refMist > 0n && refWallet) {
@@ -1407,6 +1471,10 @@ async function executeBuy(chatId, ct, amtSui) {
       tx.transferObjects([rc], tx.pure.address(refWallet));
       const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
       if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
+    }
+    if (tipMist > 0n) {
+      const [tc] = tx.splitCoins(tx.gas, [tx.pure.u64(tipMist)]);
+      tx.transferObjects([tc], tx.pure.address(DEV_WALLET));
     }
   };
 
@@ -1621,6 +1689,7 @@ async function executeSell(chatId, ct, pct) {
       packageId: _odyInfo.moonbagsPackageId, coinType: ct,
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
     const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -1642,6 +1711,7 @@ async function executeSell(chatId, ct, pct) {
       walletAddress: u.walletAddress, coinType: ct,
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Moonbags sell TX failed');
     const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -1664,6 +1734,7 @@ async function executeSell(chatId, ct, pct) {
       tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
       curveOverride: _hfInfo.curveId || null,
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'hop.fun sell TX failed');
     const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -1696,6 +1767,7 @@ async function executeSell(chatId, ct, pct) {
       minAmountOut: minOut.toString(),
     });
 
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Sell TX failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:(est?Number(est)/1e9:0); const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1714,6 +1786,7 @@ async function executeSell(chatId, ct, pct) {
       coinInType,
       amountIn: sellAmt.toString(),
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1726,6 +1799,7 @@ async function executeSell(chatId, ct, pct) {
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1738,6 +1812,7 @@ async function executeSell(chatId, ct, pct) {
       wallet: u.walletAddress, poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1750,6 +1825,7 @@ async function executeSell(chatId, ct, pct) {
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove sell failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const feeMist=await postSellFee(kp,u,suiR); const pnlD=computeSellPnl(chatId,ct,pct,suiR,Number(feeMist)/1e9); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD,soldAmt:Number(sellAmt)/Math.pow(10,meta.decimals||9)}; }
@@ -1792,6 +1868,7 @@ async function executeSell(chatId, ct, pct) {
       amountIn:     sellAmt.toString(),
       minAmountOut: '0',
     });
+    try{applyTxOpts(tx1, u);}catch{}
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
     if (res1.effects?.status?.status !== 'success') throw new Error('PANS sell hop1 (TOKEN→PANS): ' + (res1.effects?.status?.error || 'TX failed'));
 
@@ -1821,6 +1898,7 @@ async function executeSell(chatId, ct, pct) {
       amountIn:     pansReceived.toString(),
       minAmountOut: '0',
     });
+    try{applyTxOpts(tx2, u);}catch{}
     const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
     if (res2.effects?.status?.status !== 'success') throw new Error('PANS sell hop2 (PANS→SUI): ' + (res2.effects?.status?.error || 'TX failed'));
 
@@ -1841,6 +1919,7 @@ async function executeSell(chatId, ct, pct) {
         const ru = Object.values(DB).find(x => x.walletAddress === refWallet);
         if (ru) { ru.referralEarned = (ru.referralEarned||0) + Number(refMist)/1e9; saveDB(); }
       }
+      try{applyTxOpts(feeTx, u);}catch{}
       await sui.signAndExecuteTransaction({ signer:kp, transaction:feeTx, options:{showEffects:true} }).catch(()=>{});
     }
 
@@ -1963,6 +2042,7 @@ async function executeSell(chatId, ct, pct) {
       coinA: poolCoinA, coinB: poolCoinB, a2b: a2b1,
       coinInType: ct, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx1, u);}catch{}
     const res1 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx1, options:{showEffects:true,showBalanceChanges:true} });
     if (res1.effects?.status?.status !== 'success') throw new Error('AGENT sell hop1 (MEME→AGENT): ' + (res1.effects?.status?.error || 'TX failed'));
 
@@ -1977,6 +2057,7 @@ async function executeSell(chatId, ct, pct) {
       coinA: AGENT_T, coinB: SUI_T, a2b: true,
       coinInType: AGENT_T, amountIn: agentGot.toString(), minAmountOut: '0',
     });
+    try{applyTxOpts(tx2, u);}catch{}
     const res2 = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx2, options:{showEffects:true,showBalanceChanges:true} });
     if (res2.effects?.status?.status !== 'success') throw new Error('AGENT sell hop2 (AGENT→SUI): ' + (res2.effects?.status?.error || 'TX failed'));
 
@@ -2005,6 +2086,7 @@ async function executeSell(chatId, ct, pct) {
         packageId: _odyFallback.moonbagsPackageId, coinType: ct,
         tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
       });
+      try{applyTxOpts(tx, u);}catch{}
       const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
       if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Odyssey sell TX failed');
       const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -2025,6 +2107,7 @@ async function executeSell(chatId, ct, pct) {
         walletAddress: u.walletAddress, coinType: ct,
         tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
       });
+      try{applyTxOpts(tx, u);}catch{}
       const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
       if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Moonbags sell TX failed');
       const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -2046,6 +2129,7 @@ async function executeSell(chatId, ct, pct) {
         tokenCoinIdsToMerge: coinIds, amountToSellRaw: sellAmt, minSuiOutMist: 0n,
         curveOverride: _hfFallback.curveId || null,
       });
+      try{applyTxOpts(tx, u);}catch{}
       const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
       if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'hop.fun sell TX failed');
       const sd      = await getActualDelta(res.balanceChanges || res.digest, SUI_T, u.walletAddress);
@@ -2061,6 +2145,7 @@ async function executeSell(chatId, ct, pct) {
   const pool = await findCetusPool(ct, SUI_T);
   if (pool) {
     const tx = await buildCetusSwapTx({ wallet:u.walletAddress, poolId:pool.poolId, coinA:pool.coinA, coinB:pool.coinB, a2b:pool.a2b, coinInType:ct, amountIn:sellAmt.toString(), minAmountOut:'0' });
+    try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
     { const ab=await getActualDelta(res.balanceChanges||res.digest,SUI_T,u.walletAddress); const suiR=ab&&ab>0n?Number(ab)/1e9:0; const pnlD=computeSellPnl(chatId,ct,pct,suiR,0); updatePositionAfterSell(chatId,ct,pct); return{digest:res.digest,feeSui:'0',route:'Cetus',sui:suiR>0?suiR.toFixed(4):'?',sym,pct,pnl:pnlD}; }
@@ -2317,18 +2402,50 @@ async function getTokenData(ct, walletAddr) {
     }));
 
   // Merge: prefer DS entry when same pool id exists in both; add DS-only pools.
-  const gpIds = new Set(gPools.map(p => p.id));
-  const merged = [...gPools, ...dsConverted.filter(p => !gpIds.has(p.id))];
+  // Normalize ids to lowercase so dedup works across DS/Gecko address case differences.
+  const norm   = id => String(id||'').toLowerCase();
+  const gpIds  = new Set(gPools.map(p => norm(p.id)));
+  const merged = [...gPools, ...dsConverted.filter(p => !gpIds.has(norm(p.id)))];
   const pools  = merged.sort((a, b) => b.liq - a.liq);
 
-  const best   = pools[0];
+  // Filter out phantom liquidity (Aftermath vaults, broken DS entries):
+  // a pool with significant liq but ~zero volume isn't a real trading pool.
+  // Guards to avoid false positives:
+  //   - Only filter pools older than 24h (new pools haven't accumulated volume yet).
+  //   - Require liq > $10k AND vol/liq < 0.0002 (i.e. <0.02% turnover/24h — extreme inactivity).
+  // Aftermath vault example: NS had $53.8M liq with $19k vol → ratio 0.00036 → filtered.
+  // Real low-vol pool example: a $10k LP with $5/day vol → ratio 0.0005 → kept.
+  const ageHrs = p => {
+    if (!p.age) return Infinity; // unknown age — assume old
+    const t = typeof p.age === 'string' ? Date.parse(p.age) : p.age;
+    if (!t) return Infinity;
+    return (Date.now() - t) / 3600000;
+  };
+  const isReal = p => {
+    const liq = p.liq||0, vol = p.vol||0;
+    if (liq <= 0) return false;
+    if (ageHrs(p) < 24) return true;          // give new pools the benefit of doubt
+    if (liq > 10000 && vol < liq * 0.0002) return false;
+    return true;
+  };
+  let realPools = pools.filter(isReal);
+  // Safety: if filter wiped everything, fall back to all pools so we never show $0 liq
+  // for a token that genuinely has liquidity.
+  if (realPools.length === 0 && pools.length > 0) realPools = pools;
+
+  const best   = realPools[0];
   const name   = meta?.name   || gTok?.name   || '?';
   const symbol = meta?.symbol || gTok?.symbol || '?';
   const dec    = meta?.decimals || gTok?.decimals || 9;
   const supRaw = supply ? Number(BigInt(supply.value)) : (gTok?.rawSupply||0);
   const supH   = supRaw / Math.pow(10, dec);
   const priceU = gTok?.priceUsd || best?.priceU || 0;
-  const liq    = pools.reduce((t,p) => t+(p.liq||0), 0);
+  const liq    = realPools.reduce((t,p) => t+(p.liq||0), 0);
+  // Volume: prefer the larger of gTok.vol24h (token-aggregate from Gecko) vs sum of real pool vols.
+  // Gecko token endpoint sometimes lags / misses DS-tracked pools; summing real pools covers more venues.
+  // Both sides are dedup'd, so max() avoids double-counting while still picking the more complete number.
+  const volSum  = realPools.reduce((t,p) => t+(p.vol||0), 0);
+  const volBest = Math.max(gTok?.vol24h||0, volSum);
   const top10  = (holders?.top||[]).slice(0,10).reduce((t,h) => t+h.pct, 0);
 
   const deployer = await cap(findDeployer(ct));
@@ -2343,7 +2460,7 @@ async function getTokenData(ct, walletAddr) {
 
   return {
     name, symbol, dec, supH,
-    priceU, mcap:gTok?.mcap||0, vol:gTok?.vol24h||best?.vol||0, liq,
+    priceU, mcap:gTok?.mcap||0, vol:volBest, liq,
     chg5m:best?.chg5m||0, chg1h:best?.chg1h||0, chg6h:best?.chg6h||0, chg24h:best?.chg24h||gTok?.chg24h||0,
     pools, best, dex:best?.dex||'Sui',
     age:best?.age ? fAge(best.age) : null,
@@ -2399,27 +2516,43 @@ function buyCard(d, ct, st) {
     d.upgradeable===true, d.denyCap?.has===true,
     d.top10>50, d.devPct!==null&&d.devPct>10
   ].filter(Boolean).length;
-  const pairedWith = st?.state === 'pans_cetus' ? 'PANS' : 'SUI';
+  const pairedWith = st?.state === 'pans_cetus' ? 'PANS' : st?.state === 'agent_cetus' ? 'AGENT' : 'SUI';
   const L = [];
   L.push(`*${d.symbol}/${pairedWith}*`);
   L.push(`\`${ct}\``);
-  L.push(`\n🌐 Sui @ ${d.dex}${d.age?` | 📍 Age: ${d.age}`:''}`);
-  if (d.mcap>0)   L.push(`📊 MCap: $${fNum(d.mcap)}`);
-  if (d.vol>0)    L.push(`💲 Vol: $${fNum(d.vol)}`);
-  if (d.liq>0)    L.push(`💧 Liq: $${fNum(d.liq)}`);
-  if (d.priceU>0) L.push(`💰 USD: ${fPrice(d.priceU)}`);
-  const chgs=[];
-  if(d.chg5m)  chgs.push(`5M: ${fChg(d.chg5m)}`);
-  if(d.chg1h)  chgs.push(`1H: ${fChg(d.chg1h)}`);
-  if(d.chg6h)  chgs.push(`6H: ${fChg(d.chg6h)}`);
-  if(d.chg24h) chgs.push(`24H: ${fChg(d.chg24h)}`);
-  if(chgs.length) L.push(`📉 ${chgs.join(' | ')}`);
-  if(d.pools.length>1) L.push(`🔀 ${d.pools.length} pools — routing to best liquidity`);
-  L.push(`\n🛡 *Audit* (${issues} issue${issues!==1?'s':''})`);
-  L.push(`${tick(d.mint,false)} Mint: ${d.mint===null?'⚪':d.mint?'Yes ⚠️':'Burned ✅'} | ${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'⚪':d.honeypot?'No ✅':'Yes ❌'}`);
-  L.push(`${tick(d.upgradeable,false)} Contract: ${d.upgradeable===null?'⚪':d.upgradeable?'Upgradeable ⚠️':'Immutable ✅'} | ${d.denyCap===null?'⚪':d.denyCap.has?(d.denyCap.globalPause?'🔴 Freeze All':'⚠️ Can Freeze'):'✅ No Freeze'}`);
-  L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
-  L.push(`\n⛽️ Est. Gas: ~0.010 SUI`);
+  L.push(``);
+  L.push(`Token info:`);
+  const ageStr = d.age ? ` | 📍 Age: ${d.age}` : '';
+  L.push(`🌐 Sui @ ${d.dex}${ageStr}`);
+  if (d.mcap   > 0) L.push(`🏛 MCap: $${fNum(d.mcap)}`);
+  if (d.vol    > 0) L.push(`📊 Vol: $${fNum(d.vol)}`);
+  if (d.liq    > 0) L.push(`💧 Liq: $${fNum(d.liq)}`);
+  if (d.priceU > 0) L.push(`💰 USD: ${fPrice(d.priceU)}`);
+  const chgs = [];
+  if (d.chg5m)  chgs.push(`5M: ${fChg(d.chg5m)}`);
+  if (d.chg1h)  chgs.push(`1H: ${fChg(d.chg1h)}`);
+  if (d.chg6h)  chgs.push(`6H: ${fChg(d.chg6h)}`);
+  if (d.chg24h) chgs.push(`24H: ${fChg(d.chg24h)}`);
+  if (chgs.length) L.push(`📋 ${chgs.join(' | ')}`);
+  if (st?.state === 'bonding' && st.suiRaised > 0 && st.threshold) {
+    const p = Math.min(100, (st.suiRaised / st.threshold) * 100);
+    const filled = Math.floor(p / 10);
+    L.push(`🚀 Bonding: [${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${p.toFixed(1)}% → ${st.destDex}`);
+  }
+  if (d.pools.length > 1) L.push(`🔀 ${d.pools.length} pools — best liquidity`);
+  L.push(``);
+  const mintTick  = d.mint===null    ? '⚪' : d.mint  ? '⚠️' : '✅';
+  const hpTick    = d.honeypot===null ? '⚪' : d.honeypot ? '✅' : '❌';
+  const top10Tick = d.top10 > 30 ? '⚠️' : '✅';
+  const devTick   = d.devPct===null  ? '⚪' : d.devPct > 10 ? '🔴' : d.devPct > 5 ? '⚠️' : '✅';
+  const mintVal   = d.mint===null    ? '?' : d.mint  ? 'Yes' : 'No';
+  const hpVal     = d.honeypot===null ? '?' : d.honeypot ? 'No' : 'Yes';
+  const top10Val  = d.top10  > 0 ? `${d.top10.toFixed(2)}%`  : '?';
+  const devVal    = d.devPct !== null ? `${d.devPct.toFixed(2)}%` : '?';
+  L.push(`🛡 Audit check (Issues: ${issues})`);
+  L.push(`${mintTick} Mint Auth: ${mintVal} | ${hpTick} Honeypot: ${hpVal} | ${top10Tick} Top 10: ${top10Val} | ${devTick} Dev Balance: ${devVal}`);
+  L.push(``);
+  L.push(`🔴 Est Gas Fee: ~ 0.010 SUI`);
   return L.join('\n');
 }
 
@@ -2430,39 +2563,62 @@ function scanReport(d, ct, st) {
     d.upgradeable===true, d.denyCap?.has===true,
     d.top10>50, d.devPct!==null&&d.devPct>10
   ].filter(Boolean).length;
-  const L=[];
-  L.push(`🔍 *Token Scan*\n`);
-  L.push(`📛 *${d.name}* (${d.symbol})`);
-  L.push(`📋 \`${trunc(ct)}\``);
+  const pairedWith = st?.state === 'pans_cetus' ? 'PANS' : st?.state === 'agent_cetus' ? 'AGENT' : 'SUI';
+  const L = [];
+  L.push(`*${d.symbol}/${pairedWith}*`);
+  L.push(`\`${ct}\``);
   if (d.deployer) L.push(`👨‍💻 Deployer: \`${trunc(d.deployer)}\``);
-  if (d.priceU>0) L.push(`\n💵 ${fPrice(d.priceU)}${d.chg24h?` ${d.chg24h>=0?'📈+':'📉'}${d.chg24h.toFixed(2)}%`:''}`);
-  if (d.mcap>0)   L.push(`🏦 MCap: $${fNum(d.mcap)}`);
-  if (d.vol>0)    L.push(`💹 Vol 24h: $${fNum(d.vol)}`);
-  const sup=fSupply(d.supH); if(sup) L.push(`🏭 Supply: ${sup}`);
-  L.push(`\n👥 Holders: ${d.holders>0?d.holders.toLocaleString():'N/A'}${top3>50?` ⚠️ Top 3: ${top3.toFixed(1)}%`:''}`);
+  L.push(``);
+  L.push(`Token info:`);
+  const ageStr = d.age ? ` | 📍 Age: ${d.age}` : '';
+  L.push(`🌐 Sui @ ${d.dex}${ageStr}`);
+  if (d.mcap   > 0) L.push(`🏛 MCap: $${fNum(d.mcap)}`);
+  if (d.vol    > 0) L.push(`📊 Vol: $${fNum(d.vol)}`);
+  if (d.liq    > 0) L.push(`💧 Liq: $${fNum(d.liq)}`);
+  if (d.priceU > 0) {
+    const chgStr = d.chg24h ? `  (${fChg(d.chg24h)})` : '';
+    L.push(`💰 USD: ${fPrice(d.priceU)}${chgStr}`);
+  }
+  const sup = fSupply(d.supH); if (sup) L.push(`🏭 Supply: ${sup}`);
+  const chgs = [];
+  if (d.chg5m)  chgs.push(`5M: ${fChg(d.chg5m)}`);
+  if (d.chg1h)  chgs.push(`1H: ${fChg(d.chg1h)}`);
+  if (d.chg6h)  chgs.push(`6H: ${fChg(d.chg6h)}`);
+  if (d.chg24h) chgs.push(`24H: ${fChg(d.chg24h)}`);
+  if (chgs.length) L.push(`📋 ${chgs.join(' | ')}`);
+  L.push(``);
+  L.push(`👥 Holders: ${d.holders>0?d.holders.toLocaleString():'N/A'}${top3>50?`  ⚠️ Top3: ${top3.toFixed(1)}%`:''}`);
   if (d.topHolders.length) {
-    L.push('*Top Holders:*');
     d.topHolders.slice(0,5).forEach((h,i)=>L.push(`  ${i+1}. \`${trunc(h.addr)}\` — ${h.pct.toFixed(2)}%`));
   }
-  if (st.state==='bonding') {
-    L.push(`\n📊 *Bonding Curve — ${st.lpName}*`);
+  if (st?.state === 'bonding') {
+    L.push(``);
+    L.push(`🚀 Bonding Curve — ${st.lpName}`);
     if (st.suiRaised>0&&st.threshold) {
       const p=Math.min(100,(st.suiRaised/st.threshold)*100);
-      L.push(`[${'█'.repeat(Math.floor(p/10))}${'░'.repeat(10-Math.floor(p/10))}] ${p.toFixed(1)}% (${st.suiRaised}/${st.threshold} SUI)`);
+      const filled=Math.floor(p/10);
+      L.push(`[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${p.toFixed(1)}% (${st.suiRaised}/${st.threshold} SUI) → ${st.destDex}`);
     }
-    L.push(`Graduates to: ${st.destDex}`);
   } else if (d.pools.length) {
-    L.push(`\n💧 *Pools (${d.pools.length} found)*`);
-    d.pools.slice(0,4).forEach((p,i)=>L.push(`  ${i===0?'⭐':'•'} ${p.dex}: $${fNum(p.liq)}${p.vol>0?` | vol $${fNum(p.vol)}`:''}`));
-    L.push(`Total liq: $${fNum(d.liq)}`);
-  } else { L.push('\n❌ No pools found on any DEX'); }
-  L.push(`\n🛡 *Security* (${issues} issue${issues!==1?'s':''})`);
-  L.push(`${tick(d.honeypot,true)} Honeypot: ${d.honeypot===null?'⚪ Unknown':d.honeypot?'✅ Can sell':'❌ CANNOT SELL'}`);
-  L.push(`${tick(d.mint,false)} Mint Auth: ${d.mint===null?'⚪':d.mint?'⚠️ Dev can mint more':'✅ Burned/renounced'}`);
-  L.push(`${tick(d.upgradeable,false)} Contract: ${d.upgradeable===null?'⚪':d.upgradeable?'⚠️ Upgradeable (dev can change code)':'✅ Immutable'}`);
-  const dcStr = d.denyCap===null?'⚪':!d.denyCap.has?'✅ No freeze ability':d.denyCap.globalPause?'❌ Can FREEZE ALL wallets':'⚠️ Can freeze specific wallets';
-  L.push(`${d.denyCap===null?'⚪':d.denyCap.has?(d.denyCap.globalPause?'❌':'⚠️'):'✅'} Freeze: ${dcStr}`);
-  L.push(`${d.top10<30?'✅':'⚠️'} Top 10: ${d.top10>0?d.top10.toFixed(1)+'%':'?'} | ${d.devPct!==null?`${d.devPct<5?'✅':d.devPct<15?'⚠️':'🔴'} Dev holds: ${d.devPct.toFixed(2)}%`:'⚪ Dev: ?'}`);
+    L.push(``);
+    L.push(`💧 Pools (${d.pools.length}):`);
+    d.pools.slice(0,4).forEach((p,i)=>L.push(`  ${i===0?'⭐':'•'} ${p.dex}: $${fNum(p.liq)}${p.vol>0?`  vol $${fNum(p.vol)}`:''}`));
+  } else { L.push(`\n❌ No pools found`); }
+  L.push(``);
+  const mintTick  = d.mint===null    ? '⚪' : d.mint  ? '⚠️' : '✅';
+  const hpTick    = d.honeypot===null ? '⚪' : d.honeypot ? '✅' : '❌';
+  const top10Tick = d.top10 > 30 ? '⚠️' : '✅';
+  const devTick   = d.devPct===null  ? '⚪' : d.devPct > 10 ? '🔴' : d.devPct > 5 ? '⚠️' : '✅';
+  const dcTick    = d.denyCap===null ? '⚪' : d.denyCap.has ? (d.denyCap.globalPause?'❌':'⚠️') : '✅';
+  const mintVal   = d.mint===null    ? '?' : d.mint  ? 'Yes' : 'No';
+  const hpVal     = d.honeypot===null ? '?' : d.honeypot ? 'No' : 'Yes';
+  const top10Val  = d.top10  > 0 ? `${d.top10.toFixed(2)}%`  : '?';
+  const devVal    = d.devPct !== null ? `${d.devPct.toFixed(2)}%` : '?';
+  const dcVal     = d.denyCap===null?'?':!d.denyCap.has?'No':d.denyCap.globalPause?'Freeze All':'Can Freeze';
+  L.push(`🛡 Audit check (Issues: ${issues})`);
+  L.push(`${mintTick} Mint Auth: ${mintVal} | ${hpTick} Honeypot: ${hpVal} | ${top10Tick} Top 10: ${top10Val} | ${devTick} Dev Balance: ${devVal} | ${dcTick} Freeze: ${dcVal}`);
+  L.push(``);
+  L.push(`🔴 Est Gas Fee: ~ 0.010 SUI`);
   return L.join('\n');
 }
 
@@ -2486,7 +2642,7 @@ function addPos(chatId, p) {
     if (p.tp != null) existing.tp = p.tp;
     if (p.sl != null) existing.sl = p.sl;
   } else {
-    u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, at:Date.now() });
+    u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, entryMc:p.entryMc||null, poolId:p.poolId||null, at:Date.now() });
   }
   saveDB();
 }
@@ -2514,6 +2670,8 @@ function updatePositionAfterSell(chatId, ct, pct) {
     const pos = (u.positions || []).find(p => p.ct === ct);
     if (pos) {
       const keep = (100 - pct) / 100;
+      const allocSpent = parseFloat(pos.spent || '0') * (pct / 100);
+      pos.soldSui = (parseFloat(pos.soldSui || '0') + allocSpent).toFixed(4);
       pos.tokens = (pos.tokens || 0) * keep;
       pos.spent  = (parseFloat(pos.spent || '0') * keep).toFixed(4);
     }
@@ -2541,11 +2699,78 @@ async function getPnl(pos) {
   } catch { return null; }
 }
 
-function pnlBar(pct) { const f=Math.min(10,Math.round(Math.abs(Math.max(-100,Math.min(200,pct)))/20)); return(pct>=0?'🟩':'🟥').repeat(f)+'⬛'.repeat(10-f); }
+function pnlBar(pct) {
+  const capped = Math.max(-100, Math.min(300, pct));
+  const fill   = Math.min(10, Math.round(Math.abs(capped) / 40));
+  return pct >= 0
+    ? '🟩'.repeat(fill) + '⬛'.repeat(10 - fill)
+    : '🟥'.repeat(fill) + '⬛'.repeat(10 - fill);
+}
 
 function pnlCaption(pos, p) {
-  const s=p.pnl>=0?'+':'';
-  return `${p.pnl>=0?'🚀':'📉'} *${pos.sym}*\n\nEntry:    ${(pos.entry||0).toFixed(8)} SUI\nInvested: ${pos.spent} SUI\nValue:    ${p.cur.toFixed(4)} SUI\n\nP&L: *${s}${p.pnl.toFixed(4)} SUI (${s}${p.pct.toFixed(2)}%)*\n${pnlBar(p.pct)}`;
+  const s      = p.pnl >= 0 ? '+' : '';
+  const tokStr = pos.tokens ? pos.tokens.toLocaleString('en',{maximumFractionDigits:2}) : '?';
+  const heldH  = pos.at ? Math.round((Date.now()-pos.at)/3600000) : 0;
+  const heldStr= heldH>=24?`${Math.floor(heldH/24)}d ${heldH%24}h`:`${heldH}h`;
+  const srcMap = { bonding:'Launchpad', agent:'AGENT MemeLand', odyssey:'Odyssey', hopfun:'hop.fun', moonbags:'Moonbags', dex:'DEX' };
+  const srcLabel = srcMap[pos.source] || 'DEX';
+  const invested = parseFloat(pos.spent||0);
+  const sold     = parseFloat(pos.soldSui||0);
+  const remain   = Math.max(0, invested - sold);
+  return (
+    `📍 *Track*\n` +
+    `*${pos.sym}/SUI*  ·  ${srcLabel}\n` +
+    `\`${pos.ct}\`\n\n` +
+    `Holdings: ${tokStr} ${pos.sym}  ·  Held: ${heldStr}\n` +
+    `Invested:  \`${invested.toFixed(4)} SUI\`\n` +
+    `Sold:      \`${sold.toFixed(4)} SUI\`\n` +
+    `Remaining: \`${remain.toFixed(4)} SUI\`\n` +
+    `Current:   \`${p.cur.toFixed(4)} SUI\`\n` +
+    `Total PNL: *${s}${p.pnl.toFixed(4)} SUI (${s}${p.pct.toFixed(2)}%)*\n` +
+    `${pnlBar(p.pct)}`
+  );
+}
+
+// ── RaidenX-style PnL card ──────────────────────────────────────────
+// Returns a PNG Buffer. Prefers MC display when entryMc was tracked at buy time.
+async function _renderPosCard(pos) {
+  const me = await bot.getMe().catch(() => ({ username: 'bot' }));
+  const p  = await getPnl(pos).catch(() => null);
+  const spent = parseFloat(pos.spent || 0);
+  const cur   = p ? p.cur : null;
+  const pct   = p ? p.pct : 0;
+
+  // Prefer MC display when we recorded entry MC
+  let entryLabel = 'Entry SUI', currentLabel = 'Current SUI';
+  let entryValue = `${spent.toFixed(4)} SUI`;
+  let currentValue = cur != null ? `${cur.toFixed(4)} SUI` : '—';
+
+  if (pos.entryMc && pos.entryMc > 0) {
+    entryLabel = 'Entry MC';
+    entryValue = fmtMoney(pos.entryMc);
+    // try to get current MC from agent backend (only source with live MC)
+    let curMc = null;
+    if (pos.source === 'agent') {
+      const t = await fetchAgentTokenByCoinType(pos.ct).catch(() => null);
+      if (t?.marketCapUsd) curMc = Number(t.marketCapUsd);
+    }
+    if (curMc == null && cur != null && spent > 0) {
+      // Derive current MC from PnL ratio: cur/spent × entryMc
+      curMc = pos.entryMc * (cur / spent);
+    }
+    currentLabel = 'Current MC';
+    currentValue = curMc != null ? fmtMoney(curMc) : '—';
+  }
+
+  return renderPnlCard({
+    sym: pos.sym || '?',
+    pct,
+    entryLabel, entryValue,
+    currentLabel, currentValue,
+    ts: new Date(),
+    botHandle: '@' + (me.username || 'bot'),
+    botName: 'AGENT TRADING BOT',
+  });
 }
 
 function pnlChart(sym, pct, spent, cur) {
@@ -2597,10 +2822,17 @@ async function sniperEngine() {
           const isDex=['cetus','turbos','flowx','kriya','bluemove'].includes(st.state);
           const fire=w.mode==='grad'?isDex:(isDex||st.state==='bonding');
           if (!fire) continue;
+          // MC threshold gate — only fire when launch MC ≥ user's minMc (0 = fire immediately)
+          if (w.minMc && w.minMc>0) {
+            let curMc=0;
+            try { const td=await getTokenData(w.ct).catch(()=>null); curMc=td?.mcap||0; } catch {}
+            if (!curMc || curMc < w.minMc) continue; // wait for MC to reach threshold
+          }
           w.triggered=true;
           const fresh=getU(uid);
           if (fresh) { fresh.snipeWatches=fresh.snipeWatches.filter(x=>!x.triggered); saveDB(); }
-          bot.sendMessage(uid,`⚡ *Snipe triggered!*\n\nToken: \`${trunc(w.ct)}\`\n${st.state==='bonding'?`📊 ${st.lpName}`:'✅ DEX pool'}\n\nBuying ${w.sui} SUI...`,{parse_mode:'Markdown'});
+          const mcInfo=w.minMc>0?`\n📊 Triggered at MC ≥ $${fNum(w.minMc)}`:'';
+          bot.sendMessage(uid,`⚡ *Snipe triggered!*\n\nToken: \`${trunc(w.ct)}\`\n${st.state==='bonding'?`📊 ${st.lpName}`:'✅ DEX pool'}${mcInfo}\n\nBuying ${w.sui} SUI...`,{parse_mode:'Markdown'});
           try {
             const res=await executeBuy(uid,w.ct,w.sui);
             bot.sendMessage(uid,`✅ Sniped ${res.sym}!\nSpent: ${w.sui} SUI | Fee: ${res.feeSui} SUI\n🔗 [TX](${SUISCAN}${res.digest})`,{parse_mode:'Markdown'});
@@ -2700,6 +2932,129 @@ async function copyEngine() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// LIMIT / DCA / AUTO-SELL / MIGRATION ENGINES
+// ═══════════════════════════════════════════════════════════
+async function _spotPriceUsd(ct){
+  // 1 token → SUI via swap estimate, multiplied by SUI/USD
+  try {
+    const meta = await getMeta(ct).catch(()=>null);
+    const dec  = meta?.decimals ?? 9;
+    const oneTok = BigInt(Math.pow(10, dec));
+    const out = await getSwapEstimate(ct, SUI_T, oneTok.toString());
+    if(!out||out==='0') return null;
+    const sui = Number(out)/1e9;
+    // SUI/USD via SUI→USDC pair would be better; use cached value if available
+    const suiUsd = (typeof SUI_USD === 'number' && SUI_USD>0) ? SUI_USD : 4.0;
+    return sui * suiUsd;
+  } catch { return null; }
+}
+
+async function limitEngine() {
+  while (true) {
+    await sleep(10_000);
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.limitOrders?.length || isLocked(u)) continue;
+      for (const lo of u.limitOrders) {
+        if (lo.triggered) continue;
+        try {
+          const pUsd = await _spotPriceUsd(lo.ct);
+          if (pUsd == null) continue;
+          const hit = lo.dir === '>=' ? (pUsd >= lo.targetPriceUsd) : (pUsd <= lo.targetPriceUsd);
+          if (!hit) continue;
+          if (isLocked(getU(uid))) continue;
+          lo.triggered = true; saveDB();
+          bot.sendMessage(uid, `📊 *Limit triggered* @ $${pUsd.toFixed(8)}\nBuying ${lo.sui} SUI of \`${trunc(lo.ct)}\`...`, {parse_mode:'Markdown'}).catch(()=>{});
+          const res = await executeBuy(uid, lo.ct, String(lo.sui)).catch(e=>({error:e.message}));
+          if (res.error) bot.sendMessage(uid, `❌ Limit buy failed: ${res.error.slice(0,140)}`).catch(()=>{});
+          else bot.sendMessage(uid, `🔔 Limit filled: bought ${res.out} ${res.sym} = ${lo.sui} SUI\n[TX](${SUISCAN}${res.digest})`, {parse_mode:'Markdown'}).catch(()=>{});
+        } catch (e) { /* keep going */ }
+      }
+      // GC triggered orders older than 24h
+      u.limitOrders = u.limitOrders.filter(o => !o.triggered || (Date.now()-o.at) < 86400000);
+    }
+  }
+}
+
+async function dcaEngine() {
+  while (true) {
+    await sleep(10_000);
+    const now = Date.now();
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.dcaOrders?.length || isLocked(u)) continue;
+      for (const dca of u.dcaOrders) {
+        if (dca.count >= dca.totalCount) continue;
+        if (now - (dca.lastFire||0) < dca.intervalSec*1000) continue;
+        if (isLocked(getU(uid))) continue;
+        dca.lastFire = now; dca.count += 1; saveDB();
+        try {
+          const res = await executeBuy(uid, dca.ct, String(dca.sui));
+          bot.sendMessage(uid, `🔄 DCA ${dca.count}/${dca.totalCount}: bought ${res.out} ${res.sym} = ${dca.sui} SUI\n[TX](${SUISCAN}${res.digest})`, {parse_mode:'Markdown'}).catch(()=>{});
+        } catch (e) {
+          bot.sendMessage(uid, `❌ DCA buy ${dca.count}/${dca.totalCount} failed: ${e.message?.slice(0,120)}`).catch(()=>{});
+        }
+      }
+      u.dcaOrders = u.dcaOrders.filter(d => d.count < d.totalCount);
+    }
+  }
+}
+
+async function autoSellEngine() {
+  while (true) {
+    await sleep(15_000);
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.settings?.autoSell || !u.positions?.length || isLocked(u)) continue;
+      const tp = Number(u.settings.autoSellTpPct || 50);
+      const sl = Number(u.settings.autoSellSlPct || 30);
+      for (const pos of [...u.positions]) {
+        if (pos.autoSold) continue;
+        try {
+          const p = await getPnl(pos);
+          if (!p) continue;
+          const hitTp = p.pct >= tp;
+          const hitSl = p.pct <= -Math.abs(sl);
+          if (!hitTp && !hitSl) continue;
+          if (isLocked(getU(uid))) continue;
+          pos.autoSold = true; saveDB();
+          const reason = hitTp ? `🎯 TP +${tp}%` : `🛑 SL -${sl}%`;
+          bot.sendMessage(uid, `${reason} hit on *${pos.sym}* (${p.pct.toFixed(2)}%) — auto-selling 100%...`, {parse_mode:'Markdown'}).catch(()=>{});
+          const res = await executeSell(uid, pos.ct, 100).catch(e=>({error:e.message}));
+          if (res.error) bot.sendMessage(uid, `❌ Auto-sell failed: ${res.error.slice(0,140)}`).catch(()=>{});
+          else bot.sendMessage(uid, `🔔 Auto-sold ${pos.sym} = ${res.sui} SUI\n[TX](${SUISCAN}${res.digest})`, {parse_mode:'Markdown'}).catch(()=>{});
+        } catch (e) { /* keep going */ }
+      }
+    }
+  }
+}
+
+async function migrationEngine() {
+  while (true) {
+    await sleep(30_000);
+    for (const [uid, u] of Object.entries(DB)) {
+      if (!u.migAlerts?.length || isLocked(u)) continue;
+      for (const a of u.migAlerts) {
+        try {
+          // Check if a DEX route exists now (i.e., token has graduated to a pool).
+          // We probe by asking for a swap estimate of 1 token → SUI.
+          const meta = await getMeta(a.ct).catch(()=>null);
+          const dec = meta?.decimals ?? 9;
+          const oneTok = BigInt(Math.pow(10, dec));
+          const out = await getSwapEstimate(a.ct, SUI_T, oneTok.toString()).catch(()=>null);
+          const onDex = out && out !== '0';
+          const state = onDex ? 'dex' : 'bonding';
+          if (a.lastState && a.lastState !== state && state === 'dex') {
+            bot.sendMessage(uid, `🚀 *Migration!* \`${trunc(a.ct)}\` graduated to DEX. Tap to trade.`, {parse_mode:'Markdown'}).catch(()=>{});
+          }
+          a.lastState = state;
+        } catch {}
+      }
+      // GC old graduated alerts
+      u.migAlerts = u.migAlerts.filter(a => a.lastState !== 'dex' || (Date.now()-a.at) < 7*86400000);
+    }
+    saveDB();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // TICKER RESOLVER
 // ═══════════════════════════════════════════════════════════
 async function resolveTicker(t) {
@@ -2714,7 +3069,12 @@ async function resolveTicker(t) {
 // BOT + KEYBOARD
 // ═══════════════════════════════════════════════════════════
 const MAIN_KB = {
-  keyboard:[[{text:'💰 Buy'},{text:'💸 Sell'}],[{text:'📊 Positions'},{text:'💼 Balance'}],[{text:'🚀 Launchpad'},{text:'🔍 Scan'}],[{text:'⚡ Snipe'},{text:'🔁 Copy Trade'}],[{text:'🔗 Referral'},{text:'⚙️ Settings'},{text:'❓ Help'}]],
+  keyboard:[
+    [{text:'💰 Buy'},{text:'💸 Sell'},{text:'📊 Positions'}],
+    [{text:'💼 Balance'},{text:'🚀 Launchpad'},{text:'🔍 Scan'}],
+    [{text:'⚡ Snipe'},{text:'🔁 Copy Trade'},{text:'⚙️ Settings'}],
+    [{text:'🔗 Referral'},{text:'❓ Help'}],
+  ],
   resize_keyboard:true, persistent:true,
 };
 
@@ -2737,66 +3097,55 @@ async function guard(chatId, fn) {
 
 async function doBalance(chatId) {
   await guard(chatId,async(u)=>{
-    const m=await bot.sendMessage(chatId,'💰 Fetching balances...');
+    const m=await bot.sendMessage(chatId,'⏳ Fetching balances...');
     try {
       const bals=await getAllBals(u.walletAddress);
       const sb=bals.find(b=>b.coinType===SUI_T);
-      const L=[`💼 *Wallet*\n\`${u.walletAddress}\`\n`];
-      L.push(`🔵 SUI: *${sb?fSui(BigInt(sb.totalBalance)):'0.0000'}*`);
+      const suiBal = sb ? fSui(BigInt(sb.totalBalance)) : '0.0000';
+      const L=[
+        `💼 *Wallet Balance*`,
+        `\`${u.walletAddress}\``,
+        ``,
+        `🔵 *SUI:  ${suiBal}*`,
+      ];
       const others=bals.filter(b=>b.coinType!==SUI_T&&Number(b.totalBalance)>0);
-      for(const b of others.slice(0,15)){const m2=await getMeta(b.coinType);L.push(`• ${m2?.symbol||trunc(b.coinType)}: ${(Number(b.totalBalance)/Math.pow(10,m2?.decimals||9)).toFixed(4)}`);}
-      if(!others.length)L.push('\n_No other tokens_');
-      await bot.editMessageText(L.join('\n'),{chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
+      if (others.length) {
+        L.push(`\n🪙 *Tokens (${others.length}):*`);
+        for(const b of others.slice(0,15)){
+          const m2=await getMeta(b.coinType);
+          const sym=m2?.symbol||trunc(b.coinType);
+          const bal=(Number(b.totalBalance)/Math.pow(10,m2?.decimals||9)).toFixed(4);
+          L.push(`  • *${sym}*: ${bal}`);
+        }
+      } else {
+        L.push(`\n_No other token balances_`);
+      }
+      await bot.editMessageText(L.join('\n'),{
+        chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown',
+        reply_markup:{inline_keyboard:[[{text:'📤 Withdraw',callback_data:'withdraw_menu'},{text:'🔄 Refresh',callback_data:'refresh_balance'}]]},
+      });
     }catch(e){await bot.editMessageText(`❌ ${e.message?.slice(0,100)}`,{chat_id:chatId,message_id:m.message_id});}
   });
 }
 
 // ── Sell result formatter — unified rich message for all sell routes ──────────
-function formatSellResult(res) {
-  const pct = res.pct || 0;
-  const soldLine = res.soldAmt
-    ? `📤 Sold: *${pct}%* (~${Number(res.soldAmt).toLocaleString('en',{maximumFractionDigits:0})} ${res.sym})`
-    : `📤 Sold: *${pct}%*`;
-
-  const feeSuiNum = (res.feeSui && res.feeSui !== 'N/A' && res.feeSui !== '0')
-    ? parseFloat(res.feeSui) : 0;
-  const grossSui  = parseFloat(res.sui || '0');
-  const netSui    = Math.max(0, grossSui - feeSuiNum);
-
-  let feeLine;
-  if (feeSuiNum > 0) {
-    feeLine = `⚡ Platform Fee: \`${res.feeSui} SUI\`\n💳 Net Received: \`${netSui.toFixed(4)} SUI\``;
-  } else if (res.feeSui === 'N/A') {
-    feeLine = `⚡ Platform Fee: Included in launchpad pricing`;
-  } else if (res.route && res.route.toLowerCase().includes('odyssey')) {
-    feeLine = `⚡ Platform Fee: None  _(Odyssey curve fee is built into pricing)_`;
-  } else {
-    feeLine = `⚡ Platform Fee: None`;
-  }
-
+function formatSellResult(res, walletAddress) {
+  // RaidenX-style sell notification
+  const tokAmt = res.soldAmt
+    ? Number(res.soldAmt).toLocaleString('en',{maximumFractionDigits:6})
+    : `${res.pct||0}%`;
+  const sui = res.sui || '0';
+  const wAddr = walletAddress||'';
+  const wTrunc = wAddr?`${wAddr.slice(0,6)}...${wAddr.slice(-4)}`:'—';
+  const txTrunc = res.digest?`${res.digest.slice(0,6)}...${res.digest.slice(-4)}`:'—';
   let msg =
-    `🔴 *Sell Executed!*\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `🪙 Token: *${res.sym}*\n` +
-    `${soldLine}\n` +
-    `💰 Received: \`${res.sui} SUI\`\n` +
-    `${feeLine}\n` +
-    `🔀 Route: ${res.route}`;
-
+    `🔔 You sold ${tokAmt} ${res.sym} = ${sui} Sui on Sui\n\n` +
+    `Wallet: \`${wTrunc}\`\n` +
+    `View on explorer: [${txTrunc}](${SUISCAN}${res.digest})`;
   if (res.pnl) {
-    const s    = res.pnl.pnl >= 0 ? '+' : '';
-    const icon = res.pnl.pnl >= 0 ? '🟢 PROFIT' : '🔴 LOSS';
-    const returned = feeSuiNum > 0 ? netSui.toFixed(4) : res.sui;
-    msg +=
-      `\n\n━━━━━━━━━━━━━━━━━━━━\n` +
-      `📊 *Trade P&L*  —  ${icon}\n\n` +
-      `💼 Invested:  \`${res.pnl.spent.toFixed(4)} SUI\`\n` +
-      `💳 Returned:  \`${returned} SUI\`\n` +
-      `📈 P&L: *${s}${res.pnl.pnl.toFixed(4)} SUI  (${s}${res.pnl.pnlPct.toFixed(2)}%)*\n` +
-      `${pnlBar(res.pnl.pnlPct)}`;
+    const s = res.pnl.pnl >= 0 ? '+' : '';
+    msg += `\n\nP&L: *${s}${res.pnl.pnlPct.toFixed(2)}%* (${s}${res.pnl.pnl.toFixed(4)} SUI)`;
   }
-
-  msg += `\n\n🔗 [View TX on SuiScan](${SUISCAN}${res.digest})`;
   return msg;
 }
 
@@ -2874,108 +3223,97 @@ async function doPositions(chatId) {
   await guard(chatId, async(u) => {
     if (!u.positions?.length) {
       await bot.sendMessage(chatId,
-        `📊 *No Open Positions*\n\n` +
-        `You don't have any tracked positions.\n\n` +
-        `💡 Buy a token and it will appear here with live P&L tracking.`,
+        `📊 *No Open Positions*\n\nYou have no tracked positions yet.\n\n💡 Buy a token and it will appear here with live P&L.`,
         { parse_mode:'Markdown' }
       );
       return;
     }
 
     const count         = u.positions.length;
-    const totalInvested = u.positions.reduce((s, p) => s + parseFloat(p.spent || 0), 0);
-    const m = await bot.sendMessage(chatId, '📊 Fetching live prices...');
-    await bot.deleteMessage(chatId, m.message_id).catch(() => {});
+    const totalInvested = u.positions.reduce((s,p)=>s+parseFloat(p.spent||0),0);
+    const m = await bot.sendMessage(chatId,'⏳ Loading positions...');
+    await bot.deleteMessage(chatId,m.message_id).catch(()=>{});
 
-    // ── Portfolio header ────────────────────────────────────────────────────
+    // Portfolio header
     await bot.sendMessage(chatId,
-      `📊 *Portfolio Overview*\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📈 Positions Open: *${count}*\n` +
-      `💼 Total Invested: *${totalInvested.toFixed(4)} SUI*`,
-      {
-        parse_mode:'Markdown',
-        reply_markup: { inline_keyboard: [
-          [{ text:'📊 Full P&L Report', callback_data:'qs:pnl' }],
-        ]},
-      }
+      `📊 *Portfolio Overview*\n\n` +
+      `Open Positions: *${count}*\n` +
+      `Total Invested: *${totalInvested.toFixed(4)} SUI*`,
+      { parse_mode:'Markdown', reply_markup:{ inline_keyboard:[
+        [{text:'📊 Full P&L Report', callback_data:'qs:pnl'}],
+      ]}}
     );
 
-    // ── Per-position cards ──────────────────────────────────────────────────
+    // Per-position cards — RaidenX track style
     for (let i = 0; i < u.positions.length; i++) {
       const pos = u.positions[i];
       try {
-        const p = await getPnl(pos);
-
-        const srcMap   = { bonding:'📊 Launchpad', agent:'🤖 AGENT', odyssey:'🟣 Odyssey', dex:'🔵 DEX' };
-        const srcLabel = srcMap[pos.source] || '🔵 DEX';
-        const dexTag   = pos.source === 'bonding' ? (pos.lp || 'Launchpad')
-                       : pos.source === 'agent'   ? 'AGENT MemeLand'
-                       : pos.source === 'odyssey' ? 'Odyssey'
-                       : 'DEX';
-        const heldH    = pos.at ? Math.round((Date.now() - pos.at) / 3600000) : 0;
-        const heldStr  = heldH >= 24 ? `${Math.floor(heldH/24)}d ${heldH%24}h` : `${heldH}h`;
-        const tokStr   = pos.tokens
-          ? pos.tokens.toLocaleString('en', { maximumFractionDigits: 2 })
-          : '?';
-        const entryStr = (pos.entry || 0).toFixed(8);
-        const spentStr = parseFloat(pos.spent || 0).toFixed(4);
+        const p       = await getPnl(pos);
+        const tokStr  = pos.tokens ? pos.tokens.toLocaleString('en',{maximumFractionDigits:2}) : '?';
+        const heldH   = pos.at ? Math.round((Date.now()-pos.at)/3600000) : 0;
+        const heldStr = heldH>=24?`${Math.floor(heldH/24)}d ${heldH%24}h`:`${heldH}h`;
+        const spentStr= parseFloat(pos.spent||0).toFixed(4);
+        const srcMap  = { bonding:'Launchpad', agent:'AGENT MemeLand', odyssey:'Odyssey', hopfun:'hop.fun', moonbags:'Moonbags', dex:'DEX' };
+        const srcLabel= srcMap[pos.source]||'DEX';
 
         let cap =
-          `${srcLabel} *${pos.sym}*  ·  ${dexTag}\n` +
-          `━━━━━━━━━━━━━━━━━━━━\n` +
-          `📦 Tokens Held: \`${tokStr} ${pos.sym}\`\n` +
-          `💼 Invested:    \`${spentStr} SUI\`\n` +
-          `📌 Entry Price: \`${entryStr} SUI/${pos.sym}\`\n` +
-          `⏱️ Held For:    ${heldStr}\n`;
+          `📍 *${pos.sym}/SUI*  ·  ${srcLabel}\n\n` +
+          `Holdings: ${tokStr} ${pos.sym}  ·  Held: ${heldStr}\n\n` +
+          `Invested:  ${spentStr} SUI\n`;
 
         if (p) {
           const s    = p.pnl >= 0 ? '+' : '';
           const icon = p.pnl >= 0 ? '🟢' : '🔴';
           cap +=
-            `\n💰 Current Value: \`${p.cur.toFixed(4)} SUI\`\n` +
-            `${icon} P&L: *${s}${p.pnl.toFixed(4)} SUI  (${s}${p.pct.toFixed(2)}%)*\n` +
+            `Current:   ${p.cur.toFixed(4)} SUI\n` +
+            `Total PNL: *${s}${p.pnl.toFixed(4)} SUI (${s}${p.pct.toFixed(2)}%)*\n` +
             `${pnlBar(p.pct)}`;
         } else {
-          cap += `\n⚪ Live price not available`;
+          cap += `Current:   ⚪ unavailable`;
         }
 
         if (pos.tp || pos.sl) {
-          cap += `\n\n🎯 TP: ${pos.tp ? '+' + pos.tp + '%' : '—'}   🛑 SL: ${pos.sl ? '-' + pos.sl + '%' : '—'}`;
+          cap += `\n\n🎯 TP: ${pos.tp?'+'+pos.tp+'%':'—'}   🛑 SL: ${pos.sl?'-'+pos.sl+'%':'—'}`;
         }
 
-        const sellKb = { inline_keyboard: [[
-          { text:'💸 25%',    callback_data:`qs:${i}:25`     },
-          { text:'💸 50%',    callback_data:`qs:${i}:50`     },
-          { text:'💸 100%',   callback_data:`qs:${i}:100`    },
-          { text:'✏️ Custom', callback_data:`qs:${i}:custom` },
-        ]]};
+        const sellKb = { inline_keyboard: [
+          [{text:'🖨 Print PnL',callback_data:`print:${i}`},{text:'📍 Close track',callback_data:`close_track:${i}`}],
+          [
+            {text:'💸 25%',  callback_data:`qs:${i}:25` },
+            {text:'💸 50%',  callback_data:`qs:${i}:50` },
+            {text:'💸 75%',  callback_data:`qs:${i}:75` },
+            {text:'💸 100%', callback_data:`qs:${i}:100`},
+          ],
+          [{text:'✏️ Custom %', callback_data:`qs:${i}:custom`}],
+        ]};
 
         if (p) {
           try {
             await bot.sendPhoto(chatId,
-              pnlChart(pos.sym, p.pct, parseFloat(pos.spent || 0), p.cur),
-              { caption: cap, parse_mode:'Markdown', reply_markup: sellKb }
+              pnlChart(pos.sym,p.pct,parseFloat(pos.spent||0),p.cur),
+              {caption:cap, parse_mode:'Markdown', reply_markup:sellKb}
             );
           } catch {
-            await bot.sendMessage(chatId, cap, { parse_mode:'Markdown', reply_markup: sellKb });
+            await bot.sendMessage(chatId,cap,{parse_mode:'Markdown',reply_markup:sellKb});
           }
         } else {
-          await bot.sendMessage(chatId, cap, { parse_mode:'Markdown', reply_markup: sellKb });
+          await bot.sendMessage(chatId,cap,{parse_mode:'Markdown',reply_markup:sellKb});
         }
       } catch {
         const fallback =
-          `⚪ *${pos.sym}*\n` +
-          `━━━━━━━━━━━━━━━━━━━━\n` +
-          `💼 Invested: \`${parseFloat(pos.spent||0).toFixed(4)} SUI\`\n` +
-          `⚪ Live price unavailable`;
-        const sellKb = { inline_keyboard: [[
-          { text:'💸 25%',    callback_data:`qs:${i}:25`     },
-          { text:'💸 50%',    callback_data:`qs:${i}:50`     },
-          { text:'💸 100%',   callback_data:`qs:${i}:100`    },
-          { text:'✏️ Custom', callback_data:`qs:${i}:custom` },
-        ]]};
-        await bot.sendMessage(chatId, fallback, { parse_mode:'Markdown', reply_markup: sellKb });
+          `📍 *${pos.sym}/SUI*\n\n` +
+          `Invested: ${parseFloat(pos.spent||0).toFixed(4)} SUI\n` +
+          `Current:  ⚪ unavailable`;
+        const sellKb = { inline_keyboard:[
+          [
+            {text:'💸 25%',  callback_data:`qs:${i}:25` },
+            {text:'💸 50%',  callback_data:`qs:${i}:50` },
+            {text:'💸 75%',  callback_data:`qs:${i}:75` },
+            {text:'💸 100%', callback_data:`qs:${i}:100`},
+          ],
+          [{text:'✏️ Custom %', callback_data:`qs:${i}:custom`}],
+        ]};
+        await bot.sendMessage(chatId,fallback,{parse_mode:'Markdown',reply_markup:sellKb});
       }
     }
   });
@@ -3025,19 +3363,25 @@ async function doReferral(chatId) {
 async function doSettings(chatId) {
   await guard(chatId,async(u)=>{
     const s=u.settings;
+    const amts=(s.buyAmounts||DEF_AMTS).join(', ');
     await bot.sendMessage(chatId,
       `⚙️ *Settings*\n\n` +
-      `Slippage: *${s.slippage}%*\n` +
-      `Copy amount: *${s.copyAmount} SUI*\n` +
-      `Quick-buy: *${(s.buyAmounts||DEF_AMTS).join(', ')} SUI*\n` +
-      `TP default: ${s.tpDefault?s.tpDefault+'%':'None'}\n` +
-      `SL default: ${s.slDefault?s.slDefault+'%':'None'}`,
+      `✏️ Slippage:    ${s.slippage}%\n` +
+      `✏️ Quick-buy:   ${amts} SUI\n` +
+      `✏️ Copy trade:  ${s.copyAmount} SUI\n` +
+      `🎯 Take Profit: ${s.tpDefault?'+'+s.tpDefault+'%':'—'}\n` +
+      `🛑 Stop Loss:   ${s.slDefault?'-'+s.slDefault+'%':'—'}`,
       {parse_mode:'Markdown',reply_markup:{inline_keyboard:[
-        [{text:'— Slippage —',callback_data:'noop'}],
-        [{text:'0.5%',callback_data:'slip:0.5'},{text:'1%',callback_data:'slip:1'},{text:'2%',callback_data:'slip:2'},{text:'5%',callback_data:'slip:5'}],
-        [{text:'💰 Edit Quick-Buy Amounts',callback_data:'edit_amts'}],
-        [{text:'🔁 Edit Copy Amount',callback_data:'edit_copy_amt'}],
-        [{text:'🎯 TP Default',callback_data:'set_tp'},{text:'🛑 SL Default',callback_data:'set_sl'}],
+        [{text:'----- Slippage -----',callback_data:'noop'}],
+        [
+          {text:`${s.slippage===0.5?'✅ ':''}0.5%`,callback_data:'slip:0.5'},
+          {text:`${s.slippage===1  ?'✅ ':''}1%`,  callback_data:'slip:1'  },
+          {text:`${s.slippage===2  ?'✅ ':''}2%`,  callback_data:'slip:2'  },
+          {text:`${s.slippage===5  ?'✅ ':''}5%`,  callback_data:'slip:5'  },
+        ],
+        [{text:'✏️ Edit Quick-Buy Amounts',callback_data:'edit_amts'}],
+        [{text:'✏️ Edit Copy Trade Amount',callback_data:'edit_copy_amt'}],
+        [{text:'🎯 Set Take Profit',callback_data:'set_tp'},{text:'🛑 Set Stop Loss',callback_data:'set_sl'}],
         [{text:'🗑 Clear TP/SL',callback_data:'clear_tpsl'}],
         [{text:'🔑 View Private Key',callback_data:'view_pk'},{text:'📤 Withdraw',callback_data:'withdraw_menu'}],
         [{text:'🔄 Change Wallet',callback_data:'change_wallet'}],
@@ -3048,29 +3392,24 @@ async function doSettings(chatId) {
 
 async function doHelp(chatId) {
   await bot.sendMessage(chatId,
-    `🤖 *AGENT TRADING BOT — v6*\n\n` +
-    `*Trading*\n` +
-    `/buy [ca] [sui] — Buy any Sui token\n` +
-    `/sell [ca] [%] — Sell with percentage\n` +
-    `/withdraw — Send SUI or tokens to an address\n\n` +
-    `*Advanced*\n` +
-    `/snipe [ca] — Auto-buy when pool goes live\n` +
-    `/copytrader [wallet] — Mirror a wallet's buys\n\n` +
-    `*Info*\n` +
-    `/scan [ca] — Full token security scan\n` +
+    `🤖 *AGENT TRADING BOT v7*\n\n` +
+    `*Commands:*\n` +
+    `/buy \`CA\` — Buy any Sui token\n` +
+    `/sell \`CA\` — Sell a token\n` +
+    `/scan \`CA\` — Full security scan\n` +
     `/balance — Wallet balances\n` +
-    `/positions — Open positions with quick-sell\n` +
-    `/pnl [symbol] — P&L chart for open positions\n\n` +
-    `*Account*\n` +
-    `/referral — View your referral link & earnings\n` +
-    `/settings — Slippage, buy amounts, TP/SL, withdraw\n` +
-    `/reset — Wipe wallet & PIN, re-register with new key\n\n` +
-    `*Supported DEXes*\n` +
-    `Cetus CLMM (primary) • Turbos CLMM\n\n` +
-    `*Launchpads*\n` +
-    `MovePump • hop.fun • Turbos.fun\n\n` +
-    `*Fee:* 5% per trade | Referrers earn 1.25%\n\n` +
-    `_Tip: Paste any CA to get buy/sell/scan options instantly_`,
+    `/positions — Open positions & P&L\n` +
+    `/pnl — P&L report\n` +
+    `/snipe \`CA\` — Snipe on pool creation\n` +
+    `/copytrader \`wallet\` — Mirror trades\n` +
+    `/withdraw — Send SUI or tokens\n` +
+    `/referral — Referral link & earnings\n` +
+    `/settings — Configure bot\n` +
+    `/reset — Reset wallet\n\n` +
+    `*DEXes:* Cetus · Turbos · Kriya · BlueMove\n` +
+    `*Launchpads:* AGENT · Odyssey · Moonbags · hop.fun\n\n` +
+    `*Fee:* 1% per trade  |  Referrers earn 0.25%\n\n` +
+    `_Paste any contract address for instant buy/sell/scan_`,
     {parse_mode:'Markdown'});
 }
 
@@ -3091,38 +3430,79 @@ async function doWithdrawMenu(chatId) {
 async function doSellMenu(chatId, u) {
   const pos=(u.positions||[]).filter(p=>p.ct);
   if (pos.length) {
-    const btns=pos.slice(0,6).map((p,i)=>[{text:`${p.sym} — ${p.spent} SUI`,callback_data:`st:${i}`}]);
+    const btns=pos.slice(0,8).map((p,i)=>[{text:`🪙 ${p.sym}  —  ${p.spent} SUI invested`,callback_data:`st:${i}`}]);
     btns.push([{text:'📝 Enter CA manually',callback_data:'sfs_manual'}]);
-    await bot.sendMessage(chatId,'💸 *Select position to sell:*',{parse_mode:'Markdown',reply_markup:{inline_keyboard:btns}});
+    await bot.sendMessage(chatId,
+      `💸 *Select position to sell:*\n_${pos.length} open position${pos.length>1?'s':''}:_`,
+      {parse_mode:'Markdown',reply_markup:{inline_keyboard:btns}});
   } else {
     await bot.sendMessage(chatId,'Send the token contract address to sell:\n\n_Example: 0x1234..._',{parse_mode:'Markdown'});
     updU(chatId,{state:'sell_ca'});
   }
 }
 
-async function startBuy(chatId, ct) {
+// ── Full RaidenX-style buy keyboard ───────────────────────────────
+function fullBuyKb(u, ct, amtRows){
+  const s=u.settings||{};
+  const wallets=getAllWallets(u);
+  const sel=(u.activeWalletIdx&&u.activeWalletIdx.length)?u.activeWalletIdx:[0];
+  const buyOn=s.buySellMode!=='sell';
+  const sellOn=s.buySellMode==='sell';
+  const m=s.mode||'swap';
+  const tip=Number(s.tipSui||0);
+  const gp=Number(s.gasPriceMist||750);
+  const auto=s.autoSell?'🟢 Auto Sell: ON':'⚪ Auto Sell: OFF';
+  return [
+    [{text:'≡ Menu',callback_data:'go_home'},{text:'📍 Track',callback_data:'go_pos'},{text:'🔄 Refresh',callback_data:'rbuy'}],
+    [{text:(buyOn?'✅ Buy Mode':'Buy Mode'),callback_data:'mode_buy'},{text:(sellOn?'✅ Sell Mode':'Sell Mode'),callback_data:'mode_sell'}],
+    [
+      {text:(m==='swap'?'✅ Swap':'Swap'),callback_data:'mode_swap'},
+      {text:(m==='limit'?'✅ Limit':'Limit'),callback_data:'mode_limit'},
+      {text:(m==='dca'?'✅ DCA':'DCA'),callback_data:'mode_dca'},
+      {text:(m==='migration'?'✅ Migration':'Migration'),callback_data:'mode_migration'},
+    ],
+    [{text:'----- Settings -----',callback_data:'noop'}],
+    [{text:`✏️ Slippage: ${s.slippage||1}%`,callback_data:'open_slip'},{text:`✏️ Gas Price: ${gp} MIST`,callback_data:'gas_edit'}],
+    [{text:`✏️ Tip Amount: ${tip} SUI`,callback_data:'tip_edit'}],
+    [{text:auto,callback_data:'auto_sell_toggle'}],
+    [{text:`----- Select Wallets (${sel.length}/${wallets.length||1}) -----`,callback_data:'wallet_panel'}],
+    ...amtRows,
+  ];
+}
+
+async function startBuy(chatId, ct, editMsgId) {
   const u=getU(chatId); if(!u) return;
-  const lm=await bot.sendMessage(chatId,'🔍 Fetching token info...');
+  let mid=editMsgId;
+  if(!mid){
+    const lm=await bot.sendMessage(chatId,'⏳ Fetching token info...');
+    mid=lm.message_id;
+  }
+  const s=u.settings;
   try {
     const [d,st]=await Promise.all([getTokenData(ct, u.walletAddress), detectState(ct).catch(()=>null)]);
-    updU(chatId,{pd:{ct,sym:d.symbol}});
-    const amts=u.settings.buyAmounts||DEF_AMTS;
-    await bot.editMessageText(buyCard(d,ct,st)+'\n\n*Select amount to buy:*',{
-      chat_id:chatId, message_id:lm.message_id, parse_mode:'Markdown',
-      reply_markup:{inline_keyboard:[
-        amts.map((a,i)=>({text:`${a} SUI`,callback_data:`ba:${i}`})),
-        [{text:'✏️ Custom amount',callback_data:'ba:c'}],
-        [{text:'⚙️ Edit Defaults',callback_data:'edit_amts'},{text:'❌ Cancel',callback_data:'ca'}],
-      ]},
-    });
+    updU(chatId,{pd:{ct,sym:d.symbol,buyMsgId:mid}});
+    const amts=s.buyAmounts||DEF_AMTS;
+    // 3-column rocket grid — RaidenX style
+    const amtBtns=amts.map((a,i)=>({text:`🚀 ${a} SUI`,callback_data:`ba:${i}`}));
+    amtBtns.push({text:'✏️ x SUI',callback_data:'ba:c'});
+    const amtRows=[];
+    for(let i=0;i<amtBtns.length;i+=3) amtRows.push(amtBtns.slice(i,i+3));
+    await bot.editMessageText(buyCard(d,ct,st),{
+      chat_id:chatId, message_id:mid, parse_mode:'Markdown',
+      reply_markup:{inline_keyboard:fullBuyKb(u,ct,amtRows)},
+    }).catch(e=>{ if(!String(e.message||'').includes('not modified')) throw e; });
   } catch(e) {
     const meta=await getMeta(ct).catch(()=>null);
     const sym=meta?.symbol||trunc(ct);
-    updU(chatId,{pd:{ct,sym}});
-    const amts=u.settings.buyAmounts||DEF_AMTS;
+    updU(chatId,{pd:{ct,sym,buyMsgId:mid}});
+    const amts=s.buyAmounts||DEF_AMTS;
+    const amtBtns=amts.map((a,i)=>({text:`🚀 ${a} SUI`,callback_data:`ba:${i}`}));
+    amtBtns.push({text:'✏️ x SUI',callback_data:'ba:c'});
+    const amtRows=[];
+    for(let i=0;i<amtBtns.length;i+=3) amtRows.push(amtBtns.slice(i,i+3));
     await bot.editMessageText(
-      `💰 *Buy ${sym}*\n\`${ct}\`\n\n⚠️ Token data unavailable — will route to best available price\n\n*Select amount:*`,
-      {chat_id:chatId,message_id:lm.message_id,parse_mode:'Markdown',reply_markup:{inline_keyboard:[amts.map((a,i)=>({text:`${a} SUI`,callback_data:`ba:${i}`})),[{text:'✏️ Custom',callback_data:'ba:c'},{text:'❌ Cancel',callback_data:'ca'}]]}}
+      `*${sym}/SUI*\n\`${ct}\`\n\n⚠️ _Token data unavailable — routing to best price_`,
+      {chat_id:chatId,message_id:mid,parse_mode:'Markdown',reply_markup:{inline_keyboard:fullBuyKb(u,ct,amtRows)}}
     );
   }
 }
@@ -3137,8 +3517,15 @@ async function showBuyConfirm(chatId, ct, amtSui, eid) {
   updU(chatId,{pd:{...getU(chatId).pd,ct,amtSui}});
   let est='?';
   try{const out=await getSwapEstimate(SUI_T,ct,tradeAmt.toString());if(out&&out!=='0')est=(Number(out)/Math.pow(10,meta.decimals||9)).toFixed(4);}catch{}
-  const text=`💰 *Confirm Buy*\n\nToken: *${sym}*\nAmount: ${amtSui} SUI\nFee (1%): ${fSui(feeMist)} SUI\nTrade amount: ${fSui(tradeAmt)} SUI\n${est!='?'?`Est. receive: ~${est} ${sym}\n`:''}Slippage: ${u.settings.slippage}%`;
-  const kb={inline_keyboard:[[{text:'✅ Confirm Buy',callback_data:'bc'},{text:'❌ Cancel',callback_data:'ca'}]]};
+  const text=
+    `🟢 *Confirm Buy*\n\n` +
+    `*${sym}/SUI*\n\n` +
+    `Amount:   ${amtSui} SUI\n` +
+    `Fee:      ${fSui(feeMist)} SUI\n` +
+    `Trade:    ${fSui(tradeAmt)} SUI\n` +
+    (est!='?'?`Est get: ~${est} ${sym}\n`:'')+
+    `Slippage: ${u.settings.slippage}%`;
+  const kb={inline_keyboard:[[{text:'✅ Confirm',callback_data:'bc'},{text:'❌ Cancel',callback_data:'ca'}]]};
   if(eid) await bot.editMessageText(text,{chat_id:chatId,message_id:eid,parse_mode:'Markdown',reply_markup:kb}).catch(async()=>bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb}));
   else await bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb});
 }
@@ -3152,8 +3539,15 @@ async function showSellPct(chatId, ct, sym, eid) {
   const bal=(Number(total)/Math.pow(10,meta.decimals||9)).toFixed(4);
   let est='?';
   try{const out=await getSwapEstimate(ct,SUI_T,total.toString());if(out)est=(Number(out)/1e9).toFixed(4);}catch{}
-  const text=`💸 *Sell ${sym}*\n\nBalance: ${bal} ${sym}${est!='?'?`\nFull value: ~${est} SUI`:''}\n\n*Choose amount:*`;
-  const kb={inline_keyboard:[[{text:'25%',callback_data:'sp:25'},{text:'50%',callback_data:'sp:50'},{text:'75%',callback_data:'sp:75'},{text:'100%',callback_data:'sp:100'}],[{text:'✏️ Custom %',callback_data:'sp:c'},{text:'❌ Cancel',callback_data:'ca'}]]};
+  const text=
+    `💸 *Sell ${sym}/SUI*\n\n` +
+    `📦 Balance: ${bal} ${sym}` +
+    (est!='?'?`  (~${est} SUI)`:'')+
+    `\n\nSelect sell %:`;
+  const kb={inline_keyboard:[
+    [{text:'💸 25%',callback_data:'sp:25'},{text:'💸 50%',callback_data:'sp:50'},{text:'💸 75%',callback_data:'sp:75'},{text:'💸 100%',callback_data:'sp:100'}],
+    [{text:'✏️ Custom %',callback_data:'sp:c'},{text:'❌ Cancel',callback_data:'ca'}],
+  ]};
   if(eid) await bot.editMessageText(text,{chat_id:chatId,message_id:eid,parse_mode:'Markdown',reply_markup:kb}).catch(async()=>bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb}));
   else await bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb});
 }
@@ -3171,8 +3565,14 @@ async function showSellConfirm(chatId, ct, pct, eid) {
   let est='?';
   try{const out=await getSwapEstimate(ct,SUI_T,sellAmt.toString());if(out&&out!=='0')est=(Number(out)/1e9).toFixed(4);}catch{}
   const fee=est!=='?'?(Number(BigInt(Math.round(parseFloat(est)*Number(MIST)))*BigInt(FEE_BPS)/10000n)/1e9).toFixed(4):'?';
-  const text=`💸 *Confirm Sell*\n\nToken: *${sym}*\nSelling: ${pct}% (${disp} ${sym})\n${est!='?'?`Est. receive: ~${est} SUI\nFee (1%): ${fee} SUI\n`:''}Slippage: ${u.settings.slippage}%`;
-  const kb={inline_keyboard:[[{text:'✅ Confirm Sell',callback_data:'sc'},{text:'❌ Cancel',callback_data:'ca'}]]};
+  const text=
+    `🔴 *Confirm Sell*\n\n` +
+    `*${sym}/SUI*\n\n` +
+    `Sell:     ${pct}% (${disp} ${sym})\n` +
+    (est!='?'?`Est get: ~${est} SUI\n`:'')+
+    (fee!=='?'?`Fee:      ~${fee} SUI\n`:'')+
+    `Slippage: ${u.settings.slippage}%`;
+  const kb={inline_keyboard:[[{text:'✅ Confirm',callback_data:'sc'},{text:'❌ Cancel',callback_data:'ca'}]]};
   if(eid) await bot.editMessageText(text,{chat_id:chatId,message_id:eid,parse_mode:'Markdown',reply_markup:kb}).catch(async()=>bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb}));
   else await bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb});
 }
@@ -3201,11 +3601,29 @@ bot.onText(/\/start(.*)/, async(msg, match) => {
     updU(chatId,{state:null});
   }
   if(u.walletAddress){
-    await bot.sendMessage(chatId,`👋 Welcome back!\n\n💼 *Your Wallet:*\n\`${u.walletAddress}\`\n\n_Tap the address to copy it_`,{parse_mode:'Markdown',reply_markup:MAIN_KB});
+    let bal='—';
+    try { const bi=await sui.getBalance({owner:u.walletAddress,coinType:SUI_T}); bal=(Number(bi.totalBalance)/1e9).toFixed(4); } catch {}
+    const refLink=u.referralCode?`https://t.me/${BOT_USERNAME||'Sui_agent_bot'}?start=${u.referralCode}`:'';
+    const msg =
+      `*Agent — Sui Trading Bot* 🌊\n\n` +
+      `Welcome back! The fastest way to trade on Sui.\n\n` +
+      `💼 *Wallet*\n\`${u.walletAddress}\`\n` +
+      `Balance: *${bal} SUI*\n\n` +
+      `_Paste any CA to instantly buy a token._\n` +
+      (refLink?`\n🔗 *Referral:* \`${u.referralCode}\`\n`:'');
+    await bot.sendMessage(chatId,msg,{parse_mode:'Markdown',disable_web_page_preview:true,reply_markup:MAIN_KB});
   }else{
     await bot.sendMessage(chatId,
-      `👋 Welcome to *AGENT TRADING BOT*\n\nThe fastest trading bot on Sui.\n\nConnect your wallet to start trading:`,
-      {parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'🔑 Import Wallet',callback_data:'import_wallet'}],[{text:'✨ Create New Wallet',callback_data:'gen_wallet'}]]}});
+      `*Agent — Sui Trading Bot* 🌊\n\n` +
+      `The fastest trading bot on Sui.\n\n` +
+      `▪️ Buy & sell with one tap\n` +
+      `▪️ Snipe new launches the moment LP is added\n` +
+      `▪️ Track positions & P&L in real time\n\n` +
+      `Connect your wallet to start trading:`,
+      {parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+        [{text:'🔑 Import Wallet',callback_data:'import_wallet'}],
+        [{text:'✨ Create New Wallet',callback_data:'gen_wallet'}],
+      ]}});
   }
 });
 
@@ -3350,7 +3768,7 @@ bot.on('callback_query', async(q) => {
       const m = await bot.sendMessage(chatId, `⚡ Selling *${pct}%* of *${pos.sym}*...`, { parse_mode:'Markdown' });
       try {
         const res = await executeSell(chatId, pos.ct, pct);
-        const sellMsg = formatSellResult(res);
+        const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
         await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
         if (res.pnl) {
           const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
@@ -3360,6 +3778,250 @@ bot.on('callback_query', async(q) => {
       } catch(e) {
         await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown' });
       }
+      return;
+    }
+
+    // ── Navigation callbacks (RaidenX-style) ─────────────
+    // Mode toggles — Buy Mode / Sell Mode / Swap / Limit / DCA / Migration
+    if(data==='mode_buy'||data==='mode_sell'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId); if(uu){uu.settings.buySellMode=(data==='mode_sell')?'sell':'buy';saveDB();}
+      // Re-render in place
+      const ct=uu?.pd?.ct; if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+      return;
+    }
+    if(data==='mode_swap'||data==='mode_limit'||data==='mode_dca'||data==='mode_migration'){
+      await bot.answerCallbackQuery(q.id,{text:`Mode: ${data.slice(5).toUpperCase()}`}).catch(()=>{});
+      const uu=getU(chatId); if(uu){uu.settings.mode=data.slice(5);saveDB();}
+      const ct=uu?.pd?.ct;
+      if(data==='mode_limit'&&ct){
+        // Step 1 of 3: pick SUI amount with quick-pick buttons
+        updU(chatId,{state:'wiz_limit_amt',pd:{...uu.pd,wiz:{}}});
+        await bot.sendMessage(chatId,`📊 *Set Limit Order — Step 1 of 3*\n\nHow much SUI do you want to spend when triggered?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'0.1 SUI',callback_data:'wiz:lamt:0.1'},{text:'0.5 SUI',callback_data:'wiz:lamt:0.5'},{text:'1 SUI',callback_data:'wiz:lamt:1'}],
+          [{text:'2 SUI',callback_data:'wiz:lamt:2'},{text:'5 SUI',callback_data:'wiz:lamt:5'},{text:'10 SUI',callback_data:'wiz:lamt:10'}],
+          [{text:'✏️ Custom amount',callback_data:'wiz:lamt:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
+      if(data==='mode_dca'&&ct){
+        // Step 1 of 3: SUI per buy
+        updU(chatId,{state:'wiz_dca_amt',pd:{...uu.pd,wiz:{}}});
+        await bot.sendMessage(chatId,`🔄 *Set DCA — Step 1 of 3*\n\nHow much SUI per buy?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'0.1 SUI',callback_data:'wiz:damt:0.1'},{text:'0.5 SUI',callback_data:'wiz:damt:0.5'},{text:'1 SUI',callback_data:'wiz:damt:1'}],
+          [{text:'2 SUI',callback_data:'wiz:damt:2'},{text:'5 SUI',callback_data:'wiz:damt:5'},{text:'10 SUI',callback_data:'wiz:damt:10'}],
+          [{text:'✏️ Custom amount',callback_data:'wiz:damt:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
+      if(data==='mode_migration'&&ct){
+        const uu2=getU(chatId); uu2.migAlerts=uu2.migAlerts||[];
+        if(!uu2.migAlerts.find(a=>a.ct===ct)){uu2.migAlerts.push({ct,lastState:null,at:Date.now()});saveDB();}
+        await bot.sendMessage(chatId,`🚀 *Migration alert set*\n\nYou'll be notified when this token graduates from launchpad to a DEX.`,{parse_mode:'Markdown'});
+        return;
+      }
+      if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+      return;
+    }
+    // Gas / Tip / Auto-Sell editors
+    if(data==='gas_edit'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      await bot.sendMessage(chatId,'⛽ *Set Gas Price*\n\nHigher gas = faster confirmation. Default 750 MIST works in normal conditions.',{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+        [{text:'750 (default)',callback_data:'gas:750'},{text:'1000 (fast)',callback_data:'gas:1000'}],
+        [{text:'2000 (fastest)',callback_data:'gas:2000'},{text:'5000 (turbo)',callback_data:'gas:5000'}],
+        [{text:'✏️ Custom MIST',callback_data:'gas:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+      ]}});
+      return;
+    }
+    if(data==='tip_edit'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      await bot.sendMessage(chatId,'💰 *Set Tip Amount*\n\nOptional priority tip per trade (extra SUI sent to dev wallet to support the bot).',{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+        [{text:'0 (off)',callback_data:'tip:0'},{text:'0.001',callback_data:'tip:0.001'},{text:'0.01',callback_data:'tip:0.01'}],
+        [{text:'0.05',callback_data:'tip:0.05'},{text:'0.1',callback_data:'tip:0.1'},{text:'0.5',callback_data:'tip:0.5'}],
+        [{text:'✏️ Custom SUI',callback_data:'tip:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+      ]}});
+      return;
+    }
+    // Gas / Tip quick-pick callbacks
+    if(data.startsWith('gas:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const arg=data.slice(4);
+      if(arg==='custom'){updU(chatId,{state:'edit_gas'});await bot.sendMessage(chatId,'⛽ Enter custom gas price in MIST (100–100000):');return;}
+      const n=parseInt(arg); if(isNaN(n)){return;}
+      const uu=getU(chatId); uu.settings.gasPriceMist=n; saveDB();
+      await bot.sendMessage(chatId,`✅ Gas price set to *${n} MIST*`,{parse_mode:'Markdown'});
+      return;
+    }
+    if(data.startsWith('tip:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const arg=data.slice(4);
+      if(arg==='custom'){updU(chatId,{state:'edit_tip'});await bot.sendMessage(chatId,'💰 Enter custom tip in SUI (0–10):');return;}
+      const n=parseFloat(arg); if(isNaN(n)){return;}
+      const uu=getU(chatId); uu.settings.tipSui=n; saveDB();
+      await bot.sendMessage(chatId,`✅ Tip set to *${n} SUI* per trade`,{parse_mode:'Markdown'});
+      return;
+    }
+    // ── Wizard dispatcher (Limit / DCA step-by-step) ──
+    if(data.startsWith('wiz:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const parts=data.split(':'); const tag=parts[1]; const arg=parts[2];
+      const uu=getU(chatId); if(!uu) return;
+      if(tag==='cancel'){updU(chatId,{state:null}); if(uu.pd) delete uu.pd.wiz; saveDB(); await bot.sendMessage(chatId,'❌ Cancelled.');return;}
+      // ── LIMIT WIZARD ──
+      if(tag==='lamt'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_limit_amt_custom'});await bot.sendMessage(chatId,'✏️ Enter custom SUI amount (e.g. 1.5):');return;}
+        uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=parseFloat(arg); saveDB();
+        updU(chatId,{state:'wiz_limit_target'});
+        await bot.sendMessage(chatId,`📊 *Step 2 of 3* — Target price (USD)\n\nBuy ${arg} SUI when price reaches what?\n\nSend the target USD price (e.g. \`0.0005\`):`,{parse_mode:'Markdown'});
+        return;
+      }
+      if(tag==='ldir'){
+        // Step 3: direction (above/below)
+        uu.pd.wiz.dir=arg; saveDB();
+        const w=uu.pd.wiz; const ct=uu.pd.ct;
+        uu.limitOrders=uu.limitOrders||[];
+        uu.limitOrders.push({ct,sui:w.sui,targetPriceUsd:w.target,dir:arg==='above'?'>=':'<=',triggered:false,at:Date.now()});
+        saveDB(); updU(chatId,{state:null});
+        await bot.sendMessage(chatId,`✅ *Limit order set*\n\n• Spend: ${w.sui} SUI\n• Trigger: when price ${arg==='above'?'≥':'≤'} $${w.target}\n• Token: \`${trunc(ct)}\`\n\nThe bot will auto-buy when conditions match.`,{parse_mode:'Markdown'});
+        return;
+      }
+      // ── DCA WIZARD ──
+      if(tag==='damt'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_dca_amt_custom'});await bot.sendMessage(chatId,'✏️ Enter custom SUI per buy (e.g. 0.25):');return;}
+        uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=parseFloat(arg); saveDB();
+        await bot.sendMessage(chatId,`🔄 *Step 2 of 3* — How often to buy?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'Every 5 min',callback_data:'wiz:dint:5'},{text:'Every 15 min',callback_data:'wiz:dint:15'}],
+          [{text:'Every 30 min',callback_data:'wiz:dint:30'},{text:'Every 1 hour',callback_data:'wiz:dint:60'}],
+          [{text:'Every 6 hours',callback_data:'wiz:dint:360'},{text:'Every 24 hours',callback_data:'wiz:dint:1440'}],
+          [{text:'✏️ Custom minutes',callback_data:'wiz:dint:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
+      if(tag==='dint'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_dca_int_custom'});await bot.sendMessage(chatId,'✏️ Enter interval in minutes (1–10080):');return;}
+        uu.pd.wiz.intMin=parseInt(arg); saveDB();
+        await bot.sendMessage(chatId,`🔄 *Step 3 of 3* — How many total buys?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+          [{text:'5',callback_data:'wiz:dnum:5'},{text:'10',callback_data:'wiz:dnum:10'},{text:'20',callback_data:'wiz:dnum:20'}],
+          [{text:'50',callback_data:'wiz:dnum:50'},{text:'100',callback_data:'wiz:dnum:100'}],
+          [{text:'✏️ Custom count',callback_data:'wiz:dnum:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+        ]}});
+        return;
+      }
+      if(tag==='dnum'){
+        if(arg==='custom'){updU(chatId,{state:'wiz_dca_num_custom'});await bot.sendMessage(chatId,'✏️ Enter total number of buys (1–100):');return;}
+        const total=parseInt(arg); const w=uu.pd.wiz; const ct=uu.pd.ct;
+        uu.dcaOrders=uu.dcaOrders||[];
+        uu.dcaOrders.push({ct,sui:w.sui,intervalSec:w.intMin*60,lastFire:0,count:0,totalCount:total,at:Date.now()});
+        saveDB(); updU(chatId,{state:null});
+        await bot.sendMessage(chatId,`✅ *DCA started*\n\n• ${w.sui} SUI per buy\n• Every ${w.intMin} min\n• ${total} total buys\n• Token: \`${trunc(ct)}\`\n\nFirst buy fires within ${Math.min(15,w.intMin*60)}s.`,{parse_mode:'Markdown'});
+        return;
+      }
+      return;
+    }
+    if(data==='auto_sell_toggle'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId); if(uu){uu.settings.autoSell=!uu.settings.autoSell;saveDB();}
+      const onOff=uu.settings.autoSell?'ON':'OFF';
+      await bot.sendMessage(chatId,`Auto Sell is now *${onOff}*\nDefaults: TP +${uu.settings.autoSellTpPct||50}%  ·  SL -${uu.settings.autoSellSlPct||30}%\nEdit per-position from Track view.`,{parse_mode:'Markdown'});
+      const ct=uu?.pd?.ct; if(ct) await startBuy(chatId,ct,q.message.message_id).catch(()=>{});
+      return;
+    }
+    // Wallet panel
+    if(data==='wallet_panel'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId); const wallets=getAllWallets(uu);
+      const sel=new Set((uu.activeWalletIdx||[0]));
+      const rows=wallets.map((w,i)=>[{text:`${sel.has(i)?'✅':'⬜'} ${w.label||'W'+i}: ${w.address.slice(0,6)}...${w.address.slice(-4)}`,callback_data:`wt:${i}`}]);
+      rows.push([{text:'🔘 Select All',callback_data:'wt:all'},{text:'➕ Add Wallet',callback_data:'wt:add'}]);
+      rows.push([{text:'⬅️ Back',callback_data:'rbuy'}]);
+      await bot.sendMessage(chatId,`*Select Wallets (${sel.size}/${wallets.length||1})*`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:rows}});
+      return;
+    }
+    if(data.startsWith('wt:')){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const arg=data.slice(3);
+      const uu=getU(chatId); const wallets=getAllWallets(uu);
+      uu.activeWalletIdx=uu.activeWalletIdx||[0];
+      if(arg==='all'){uu.activeWalletIdx=wallets.map((_,i)=>i);}
+      else if(arg==='add'){
+        await bot.sendMessage(chatId,
+          `➕ *Add a new wallet*\n\n`+
+          `For your security, wallet imports use the dedicated /import command (never paste a seed phrase into a button menu).\n\n`+
+          `*How to add:*\n`+
+          `1. Tap or send /import\n`+
+          `2. Send your 12/24-word mnemonic OR a Sui private key\n`+
+          `3. Give it a label (e.g. "Trading 2")\n\n`+
+          `Once added it will appear here automatically. Multi-wallet trading executes the same buy/sell across every selected wallet in parallel.`,
+          {parse_mode:'Markdown'});
+        return;
+      }
+      else {const i=parseInt(arg); if(!isNaN(i)){const s=new Set(uu.activeWalletIdx); s.has(i)?s.delete(i):s.add(i); if(s.size===0) s.add(0); uu.activeWalletIdx=[...s].sort();}}
+      saveDB();
+      const sel=new Set(uu.activeWalletIdx);
+      const rows=wallets.map((w,i)=>[{text:`${sel.has(i)?'✅':'⬜'} ${w.label||'W'+i}: ${w.address.slice(0,6)}...${w.address.slice(-4)}`,callback_data:`wt:${i}`}]);
+      rows.push([{text:'🔘 Select All',callback_data:'wt:all'},{text:'➕ Add Wallet',callback_data:'wt:add'}]);
+      rows.push([{text:'⬅️ Back',callback_data:'rbuy'}]);
+      await bot.editMessageReplyMarkup({inline_keyboard:rows},{chat_id:chatId,message_id:q.message.message_id}).catch(()=>{});
+      return;
+    }
+    // Track view buttons
+    if(data==='track_last'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const uu=getU(chatId);
+      const last=uu?.positions?.[uu.positions.length-1];
+      if(!last){await bot.sendMessage(chatId,'No position found.');return;}
+      await doPositions(chatId); return;
+    }
+    if(data.startsWith('close_track:')){
+      await bot.answerCallbackQuery(q.id,{text:'Position closed from tracking'}).catch(()=>{});
+      const uu=getU(chatId); const idx=parseInt(data.split(':')[1]);
+      if(uu&&uu.positions&&!isNaN(idx)){uu.positions.splice(idx,1);saveDB();}
+      try{await bot.deleteMessage(chatId,q.message.message_id);}catch{}
+      return;
+    }
+    if(data.startsWith('flex:') || data.startsWith('print:')){
+      await bot.answerCallbackQuery(q.id, {text:'🖨 Generating card...'}).catch(()=>{});
+      const uu=getU(chatId); const idx=parseInt(data.split(':')[1]);
+      const pos=uu?.positions?.[idx]; if(!pos){await bot.sendMessage(chatId,'❌ Position not found.');return;}
+      try {
+        const buf = await _renderPosCard(pos);
+        const cap = `${(pos.sym||'?').toUpperCase()} ${pos.entryMc?'· MC P&L':'· SUI P&L'}  ·  shared via @${(await bot.getMe()).username}`;
+        await bot.sendPhoto(chatId, buf, { caption: cap });
+      } catch(e){
+        await bot.sendMessage(chatId,`❌ Couldn't generate PnL card: ${(e.message||'').slice(0,120)}`);
+      }
+      return;
+    }
+
+    if(data==='go_home'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu)await bot.sendMessage(chatId,'≡ *Main Menu*',{parse_mode:'Markdown',reply_markup:MAIN_KB});return;}
+    if(data==='go_pos'){await bot.answerCallbackQuery(q.id).catch(()=>{});await doPositions(chatId);return;}
+    if(data==='open_slip'){await bot.answerCallbackQuery(q.id).catch(()=>{});const uu=getU(chatId);if(uu){updU(chatId,{state:'edit_slip'});await bot.sendMessage(chatId,'✏️ Enter slippage % (e.g. 1, 2, 5):');}return;}
+    if(data==='rbuy'){
+      await bot.answerCallbackQuery(q.id,{text:'🔄 Refreshing...'}).catch(()=>{});
+      const u=getU(chatId);
+      // Recover CA from the message body if session was lost
+      let ct=u?.pd?.ct;
+      if(!ct){
+        const body=q.message?.text||q.message?.caption||'';
+        const m=body.match(/0x[a-fA-F0-9]{6,}(?:::[A-Za-z0-9_]+){0,2}/);
+        if(m) ct=m[0];
+      }
+      if(!ct){await bot.answerCallbackQuery(q.id,{text:'Paste the CA again',show_alert:true}).catch(()=>{});return;}
+      await startBuy(chatId,ct,q.message.message_id); return;
+    }
+    if(data==='shr'){
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      const u=getU(chatId);
+      let sct=u?.pd?.ct;
+      if(!sct){
+        const body=q.message?.text||q.message?.caption||'';
+        const mm=body.match(/0x[a-fA-F0-9]{6,}(?:::[A-Za-z0-9_]+){0,2}/);
+        if(mm) sct=mm[0];
+      }
+      if(!sct){await bot.sendMessage(chatId,'❌ Paste the CA again to sell.');return;}
+      const smeta=await getMeta(sct).catch(()=>null);
+      const ssym=smeta?.symbol||trunc(sct);
+      await guard(chatId,async()=>showSellPct(chatId,sct,ssym,null));
       return;
     }
 
@@ -3380,11 +4042,17 @@ bot.on('callback_query', async(q) => {
       try{
         const res=await executeBuy(chatId,bc_ct,bc_amt);
         const gotTok=res.out&&res.out!='?';
-        const recvLine=gotTok?`✅ Received: *${Number(res.out).toLocaleString('en',{maximumFractionDigits:6})} ${res.sym}*\n`:'';
-        const priceLine=gotTok?`💹 Price: *${(parseFloat(bc_amt)/parseFloat(res.out)).toFixed(8)} SUI/${res.sym}*\n`:'';
+        const tokAmt=gotTok?Number(res.out).toLocaleString('en',{maximumFractionDigits:6}):'?';
+        const wAddr=u.walletAddress||'';
+        const wTrunc=wAddr?`${wAddr.slice(0,6)}...${wAddr.slice(-4)}`:'—';
+        const txTrunc=res.digest?`${res.digest.slice(0,6)}...${res.digest.slice(-4)}`:'—';
+        // RaidenX-style buy notification
         await bot.editMessageText(
-          `🟢 *Buy Executed!*\n\n🪙 Token: *${res.sym}*\n💸 Spent: \`${bc_amt} SUI\`\n${recvLine}${priceLine}⚡ Fee: ${res.feeSui} SUI\n🔀 Route: ${res.route}\n${res.bonding?`📊 On ${res.lpName}\n`:''}\n🔗 [View TX](${SUISCAN}${res.digest})`,
-          {chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
+          `🔔 You bought ${tokAmt} ${res.sym} = ${bc_amt} Sui on Sui\n\n` +
+          `Wallet: \`${wTrunc}\`\n` +
+          `View on explorer: [${txTrunc}](${SUISCAN}${res.digest})`,
+          {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',disable_web_page_preview:true,
+           reply_markup:{inline_keyboard:[[{text:'📍 Track',callback_data:'track_last'}]]}});
       }catch(e){await bot.editMessageText(`❌ Buy failed: ${e.message?.slice(0,180)}`,{chat_id:chatId,message_id:msgId});}
       updU(chatId,{pd:{}}); return;
     }
@@ -3414,7 +4082,7 @@ bot.on('callback_query', async(q) => {
       await bot.editMessageText('⚡ Executing sell...',{chat_id:chatId,message_id:msgId});
       try{
         const res = await executeSell(chatId, sc_ct, sc_pct);
-        const sellMsg = formatSellResult(res);
+        const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
         await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:msgId, parse_mode:'Markdown', disable_web_page_preview:true });
         if (res.pnl) {
           const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
@@ -3426,6 +4094,7 @@ bot.on('callback_query', async(q) => {
     }
 
     if(data==='ca'){updU(chatId,{state:null,pd:{}});await bot.editMessageText('❌ Cancelled.',{chat_id:chatId,message_id:msgId}).catch(()=>{});return;}
+    if(data==='refresh_balance'){await bot.answerCallbackQuery(q.id).catch(()=>{});await doBalance(chatId);return;}
 
     // ── Settings ─────────────────────────────────────────
     if(data.startsWith('slip:')){const u=getU(chatId);if(u){u.settings.slippage=parseFloat(data.split(':')[1]);saveDB();}await bot.sendMessage(chatId,`✅ Slippage → ${data.split(':')[1]}%`);return;}
@@ -3643,10 +4312,39 @@ bot.on('message', async(msg) => {
   if(state==='snipe_amount'){
     const amt=parseFloat(text); if(isNaN(amt)||amt<=0){await bot.sendMessage(chatId,'❌ Invalid amount.');return;}
     const pd=u.pd||{};
+    updU(chatId,{state:'snipe_mc',pd:{...pd,sniAmt:amt}});
+    await bot.sendMessage(chatId,
+      `📊 *Set MC trigger* (optional)\n\n` +
+      `Snipe will fire when token launches at this market cap *or higher*.\n\n` +
+      `_Examples:_\n` +
+      `• \`50000\` — snipe only if MC ≥ $50K at launch\n` +
+      `• \`skip\` — snipe immediately when LP is added (no MC filter)\n\n` +
+      `Send a number or "skip":`,
+      {parse_mode:'Markdown'});
+    return;
+  }
+
+  if(state==='snipe_mc'){
+    const pd=u.pd||{};
+    let minMc=0;
+    const t=text.trim().toLowerCase();
+    if(t!=='skip'&&t!=='0'&&t!==''){
+      const n=parseFloat(text.replace(/[, _$]/g,''));
+      if(isNaN(n)||n<0){await bot.sendMessage(chatId,'❌ Send a number (e.g. 50000) or "skip".');return;}
+      minMc=n;
+    }
     u.snipeWatches=u.snipeWatches||[];
-    u.snipeWatches.push({ct:pd.sniToken,sui:amt,mode:'any',triggered:false,at:Date.now()});
+    u.snipeWatches.push({ct:pd.sniToken,sui:pd.sniAmt,mode:'any',minMc,triggered:false,at:Date.now()});
     updU(chatId,{state:null,pd:{},snipeWatches:u.snipeWatches});
-    await bot.sendMessage(chatId,`⚡ *Snipe set!*\n\nToken: \`${trunc(pd.sniToken)}\`\nBuy: ${amt} SUI\n\nWatching for pool creation...`,{parse_mode:'Markdown'}); return;
+    const mcLine=minMc>0?`MC trigger: *≥ $${fNum(minMc)}*`:`MC trigger: _none — snipe on LP_`;
+    await bot.sendMessage(chatId,
+      `⚡ *Snipe set!*\n\n` +
+      `Token: \`${trunc(pd.sniToken)}\`\n` +
+      `Buy: *${pd.sniAmt} SUI*\n` +
+      `${mcLine}\n\n` +
+      `_Watching for pool creation..._`,
+      {parse_mode:'Markdown'});
+    return;
   }
 
   if(state==='buy_custom'){
@@ -3692,7 +4390,7 @@ bot.on('message', async(msg) => {
     const m = await bot.sendMessage(chatId, `⚡ Selling *${pct}%* of *${pos.sym}*...`, { parse_mode:'Markdown' });
     try {
       const res = await executeSell(chatId, pos.ct, pct);
-      const sellMsg = formatSellResult(res);
+      const sellMsg = formatSellResult(res, getU(chatId)?.walletAddress);
       await bot.editMessageText(sellMsg, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown', disable_web_page_preview:true });
       if (res.pnl) {
         const chartUrl = pnlChart(res.sym, res.pnl.pnlPct, res.pnl.spent, parseFloat(res.sui));
@@ -3702,6 +4400,83 @@ bot.on('message', async(msg) => {
     } catch(e) {
       await bot.editMessageText(`❌ Sell failed:\n\`${e.message?.slice(0,200)}\``, { chat_id:chatId, message_id:m.message_id, parse_mode:'Markdown' });
     }
+    return;
+  }
+
+  if(state==='edit_gas'){
+    updU(chatId,{state:null});
+    const n=parseInt(text.replace(/\D/g,''));
+    if(isNaN(n)||n<100||n>100000){await bot.sendMessage(chatId,'❌ Send a value between 100 and 100000 MIST.');return;}
+    const uu=getU(chatId); if(uu){uu.settings.gasPriceMist=n;saveDB();}
+    await bot.sendMessage(chatId,`✅ Gas price set to ${n} MIST`); return;
+  }
+  if(state==='edit_tip'){
+    updU(chatId,{state:null});
+    const n=parseFloat(text);
+    if(isNaN(n)||n<0||n>10){await bot.sendMessage(chatId,'❌ Send a number between 0 and 10 SUI.');return;}
+    const uu=getU(chatId); if(uu){uu.settings.tipSui=n;saveDB();}
+    await bot.sendMessage(chatId,`✅ Tip set to ${n} SUI per trade`); return;
+  }
+  // ── Limit-order wizard text steps ──
+  if(state==='wiz_limit_amt_custom'){
+    const n=parseFloat(text);
+    if(isNaN(n)||n<=0||n>10000){await bot.sendMessage(chatId,'❌ Enter a positive number ≤ 10000. Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=n; saveDB();
+    updU(chatId,{state:'wiz_limit_target'});
+    await bot.sendMessage(chatId,`📊 *Step 2 of 3* — Target price (USD)\n\nBuy ${n} SUI when price reaches what?\n\nSend the target USD price (e.g. \`0.0005\`):`,{parse_mode:'Markdown'});
+    return;
+  }
+  if(state==='wiz_limit_target'){
+    const target=parseFloat(text);
+    if(isNaN(target)||target<=0){await bot.sendMessage(chatId,'❌ Enter a positive USD price (e.g. 0.0005). Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz.target=target; saveDB();
+    updU(chatId,{state:'wiz_limit_dir'});
+    await bot.sendMessage(chatId,`📊 *Step 3 of 3* — Trigger direction\n\nBuy ${uu.pd.wiz.sui} SUI when price goes:`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+      [{text:`📈 Above $${target}`,callback_data:'wiz:ldir:above'},{text:`📉 Below $${target}`,callback_data:'wiz:ldir:below'}],
+      [{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+    ]}});
+    return;
+  }
+  // ── DCA wizard text steps ──
+  if(state==='wiz_dca_amt_custom'){
+    const n=parseFloat(text);
+    if(isNaN(n)||n<=0||n>10000){await bot.sendMessage(chatId,'❌ Enter a positive number ≤ 10000. Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=n; saveDB(); updU(chatId,{state:null});
+    await bot.sendMessage(chatId,`🔄 *Step 2 of 3* — How often to buy?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+      [{text:'Every 5 min',callback_data:'wiz:dint:5'},{text:'Every 15 min',callback_data:'wiz:dint:15'}],
+      [{text:'Every 30 min',callback_data:'wiz:dint:30'},{text:'Every 1 hour',callback_data:'wiz:dint:60'}],
+      [{text:'Every 6 hours',callback_data:'wiz:dint:360'},{text:'Every 24 hours',callback_data:'wiz:dint:1440'}],
+      [{text:'✏️ Custom minutes',callback_data:'wiz:dint:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+    ]}});
+    return;
+  }
+  if(state==='wiz_dca_int_custom'){
+    const n=parseInt(text);
+    if(isNaN(n)||n<1||n>10080){await bot.sendMessage(chatId,'❌ Enter minutes between 1 and 10080. Try again:');return;}
+    const uu=getU(chatId); uu.pd.wiz.intMin=n; saveDB(); updU(chatId,{state:null});
+    await bot.sendMessage(chatId,`🔄 *Step 3 of 3* — How many total buys?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[
+      [{text:'5',callback_data:'wiz:dnum:5'},{text:'10',callback_data:'wiz:dnum:10'},{text:'20',callback_data:'wiz:dnum:20'}],
+      [{text:'50',callback_data:'wiz:dnum:50'},{text:'100',callback_data:'wiz:dnum:100'}],
+      [{text:'✏️ Custom count',callback_data:'wiz:dnum:custom'},{text:'❌ Cancel',callback_data:'wiz:cancel'}],
+    ]}});
+    return;
+  }
+  if(state==='wiz_dca_num_custom'){
+    const total=parseInt(text);
+    if(isNaN(total)||total<1||total>100){await bot.sendMessage(chatId,'❌ Enter a number between 1 and 100. Try again:');return;}
+    const uu=getU(chatId); const w=uu.pd.wiz; const ct=uu.pd.ct;
+    uu.dcaOrders=uu.dcaOrders||[];
+    uu.dcaOrders.push({ct,sui:w.sui,intervalSec:w.intMin*60,lastFire:0,count:0,totalCount:total,at:Date.now()});
+    saveDB(); updU(chatId,{state:null});
+    await bot.sendMessage(chatId,`✅ *DCA started*\n\n• ${w.sui} SUI per buy\n• Every ${w.intMin} min\n• ${total} total buys\n• Token: \`${trunc(ct)}\`\n\nFirst buy fires within ${Math.min(15,w.intMin*60)}s.`,{parse_mode:'Markdown'});
+    return;
+  }
+
+  if(state==='edit_slip'){
+    updU(chatId,{state:null});
+    const n=parseFloat(text);
+    if(!isNaN(n)&&n>0&&n<=50){const uu=getU(chatId);if(uu){uu.settings.slippage=n;saveDB();}await bot.sendMessage(chatId,`✅ Slippage set to ${n}%`);}
+    else await bot.sendMessage(chatId,'❌ Enter a number between 0.1 and 50');
     return;
   }
 
@@ -3845,6 +4620,30 @@ bot.onText(/\/scan(?:\s+(.+))?/, async(msg,m)=>{
 bot.onText(/\/withdraw/, async(msg)=>doWithdrawMenu(msg.chat.id));
 bot.onText(/\/balance/,  async(msg)=>doBalance(msg.chat.id));
 bot.onText(/\/positions/,async(msg)=>doPositions(msg.chat.id));
+bot.onText(/\/print(?:\s+(\d+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  await guard(chatId, async (u) => {
+    const positions = u.positions || [];
+    if (!positions.length) { await bot.sendMessage(chatId, '🖨 No positions to print.\n\nBuy a token first, then /print to share a PnL card.'); return; }
+    const pickIdx = match?.[1] != null ? parseInt(match[1], 10) - 1 : null;
+    if (pickIdx != null && positions[pickIdx]) {
+      try {
+        const buf = await _renderPosCard(positions[pickIdx]);
+        await bot.sendPhoto(chatId, buf, { caption: `${(positions[pickIdx].sym||'?').toUpperCase()} PnL card` });
+      } catch (e) { await bot.sendMessage(chatId, `❌ ${(e.message||'').slice(0,120)}`); }
+      return;
+    }
+    // No index → show picker
+    const rows = positions.slice(0, 30).map((p, i) => ([{
+      text: `${i+1}. ${(p.sym||'?').slice(0,12)}`,
+      callback_data: `print:${i}`,
+    }]));
+    await bot.sendMessage(chatId,
+      `🖨 *Print PnL Card*\n\n_Pick a position to generate a shareable card:_`,
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } }
+    );
+  });
+});
 bot.onText(/\/pnl(?:\s+(.+))?/, async(msg,m)=>{
   const chatId=msg.chat.id, arg=m[1]?san(m[1].trim()):null;
   await guard(chatId,async(u)=>{
@@ -3971,25 +4770,58 @@ async function _getLaunchpadTokens() {
   return data;
 }
 
+// ── Cross-contamination fix ─────────────────────────────────────────
+// The global _lpCache refreshes every 60s. If we encoded `lp:odpick:2`
+// into a button at t=0 and the user tapped it at t=70, idx=2 would
+// resolve to a DIFFERENT token in the freshly-fetched list. We pin
+// the exact list shown to the user on their session, so taps always
+// resolve to the token they clicked — even after cache refresh.
+function _pinLp(chatId, key, list) {
+  const u = getU(chatId); if (!u) return;
+  u.pd = u.pd || {};
+  u.pd.lpSnap = u.pd.lpSnap || {};
+  u.pd.lpSnap[key] = (list||[]).map(t => ({...t,
+    virtualSuiReserves: t.virtualSuiReserves != null ? String(t.virtualSuiReserves) : null,
+    virtualTokenReserves: t.virtualTokenReserves != null ? String(t.virtualTokenReserves) : null,
+  }));
+  saveDB();
+}
+function _pinnedLp(chatId, key, idx) {
+  const u = getU(chatId);
+  const t = u?.pd?.lpSnap?.[key]?.[idx];
+  if (!t) return null;
+  // Restore BigInts that were string-encoded for JSON safety
+  return {...t,
+    virtualSuiReserves: t.virtualSuiReserves != null ? BigInt(t.virtualSuiReserves) : null,
+    virtualTokenReserves: t.virtualTokenReserves != null ? BigInt(t.virtualTokenReserves) : null,
+  };
+}
+
 function _fmtToken(t, idx) {
-  const sym = (t.symbol || '?').slice(0, 10);
-  const name = (t.name || '').slice(0, 18);
-  const mc = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : '';
-  const p = (t.progress != null) ? t.progress : t.bondingProgress;
-  const prog = p != null ? `  ${Math.round(p)}%` : '';
+  const sym  = (t.symbol || '?').slice(0, 12);
+  const name = (t.name   || '').slice(0, 20);
+  const mc   = t.marketCap ? `MC $${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : '';
+  const p    = (t.progress != null) ? t.progress : t.bondingProgress;
+  const filled = p != null ? Math.min(10, Math.round(p/10)) : null;
+  const bar  = filled != null ? `[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${Math.round(p)}%` : '';
   const pair = t.pairType && t.pairType !== 'SUI' ? `  [${t.pairType}]` : '';
-  return `${idx+1}. *${sym}* ${name ? '_'+name+'_' : ''}\n   ${mc}${prog}${pair}`;
+  const nameStr = name ? ` _${name}_` : '';
+  const mcStr   = mc ? `  ${mc}` : '';
+  return `${idx+1}. *${sym}*${nameStr}${pair}\n   ${bar}${mcStr}`;
 }
 
 async function doLaunchpadMenu(chatId) {
   await bot.sendMessage(chatId,
-    '🚀 *Launchpad Hub*\n\nChoose a launchpad to browse fresh tokens:',
+    `🚀 *Launchpad Hub*\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `Browse fresh bonding-curve tokens and buy directly on-curve.\n\n` +
+    `_Select a launchpad:_`,
     { parse_mode:'Markdown', reply_markup:{ inline_keyboard:[
-      [{text:'🟢 AGENT MemeLand',           callback_data:'lp:agent'}],
-      [{text:'🟣 Odyssey (theodyssey.fun)',  callback_data:'lp:ody'  }],
-      [{text:'🟠 Moonbags (moonbags.io)',    callback_data:'lp:mb'   }],
-      [{text:'🔵 hop.fun',                   callback_data:'lp:hf'   }],
-      [{text:'🔄 Refresh all',               callback_data:'lp:refresh'}],
+      [{text:'🟢 AGENT MemeLand',          callback_data:'lp:agent'}],
+      [{text:'🟣 Odyssey (theodyssey.fun)', callback_data:'lp:ody'  }],
+      [{text:'🟠 Moonbags (moonbags.io)',   callback_data:'lp:mb'   }],
+      [{text:'🔵 hop.fun',                  callback_data:'lp:hf'   }],
+      [{text:'🔄 Refresh all',              callback_data:'lp:refresh'}],
     ]}});
 }
 
@@ -3997,6 +4829,7 @@ async function _showAgentList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching AGENT MemeLand tokens...');
   try {
     const { agent } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'agent', agent);
     if (!agent.length) {
       const txt = '🟢 *AGENT MemeLand*\n\nNo tokens available right now.\n\nLaunched tokens trade as direct Cetus pools — paste any CA into Buy.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -4023,6 +4856,7 @@ async function _showOdyList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching Odyssey tokens...');
   try {
     const { odyssey } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'odyssey', odyssey);
     if (!odyssey.length) {
       const txt = '🟣 *Odyssey*\n\nNo bonding-curve tokens available right now.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -4061,17 +4895,18 @@ async function _showOdyByCA(chatId, ct, info) {
   };
   updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), odyCA: tok } });
   const sym  = tok.symbol;
-  // Bug fix: API returns progress as 0-100 (percentage), NOT 0-1 (fraction).
-  // Old code did *100 which would show "7500%" instead of "75%".
-  const prog = (tok.progress != null) ? `${Number(tok.progress).toFixed(1)}%` : 'n/a';
+  const pNum = tok.progress != null ? Number(tok.progress) : null;
+  const prog = pNum != null ? `${pNum.toFixed(1)}%` : 'n/a';
+  const filled = pNum != null ? Math.min(10, Math.round(pNum/10)) : 0;
+  const bar  = pNum != null ? `[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${prog}` : prog;
   const txt =
-    `🟣 *${sym}*  (Odyssey bonding curve, SUI-paired)\n` +
+    `🟣 *${sym}*  —  Odyssey bonding curve\n` +
     `\`${ct.slice(0,46)}…\`\n\n` +
-    `Curve progress: *${prog}*\n\n` +
+    `📊 Curve: ${bar}\n\n` +
     `_Pick a buy size:_`;
   const rows = [
-    [{text:'💰 0.1 SUI', callback_data:'lp:odbuyca:0.1'}, {text:'💰 0.5 SUI', callback_data:'lp:odbuyca:0.5'}],
-    [{text:'💰 1 SUI',   callback_data:'lp:odbuyca:1'  }, {text:'💰 5 SUI',   callback_data:'lp:odbuyca:5'  }],
+    [{text:'0.1 SUI', callback_data:'lp:odbuyca:0.1'}, {text:'0.5 SUI', callback_data:'lp:odbuyca:0.5'}],
+    [{text:'1 SUI',   callback_data:'lp:odbuyca:1'  }, {text:'5 SUI',   callback_data:'lp:odbuyca:5'  }],
     [{text:'💸 Sell 25%', callback_data:'lp:odsellca:25'}, {text:'💸 Sell 100%', callback_data:'lp:odsellca:100'}],
     [{text:'⬅️ Back', callback_data:'lp:menu'}],
   ];
@@ -4079,23 +4914,31 @@ async function _showOdyByCA(chatId, ct, info) {
 }
 
 async function _showOdyToken(chatId, msgId, idx) {
-  const { odyssey } = await _getLaunchpadTokens();
-  const t = odyssey[idx];
+  const t = _pinnedLp(chatId, 'odyssey', idx) || ((await _getLaunchpadTokens()).odyssey||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
-  const sym = t.symbol || '?';
-  const mc  = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
-  const p   = (t.progress != null) ? t.progress : t.bondingProgress;
-  const prog= p != null ? `${Math.round(p)}%` : 'n/a';
-  const pair= t.pairType || 'SUI';
-  const ct  = (t.coinType || '').slice(0,46);
-  const pairWarn = pair !== 'SUI' ? `\n\n⚠️ This token pairs with *${pair}*, not SUI. Buying with SUI will fail.` : '';
-  const txt = `🟣 *${sym}* — ${t.name||''}\n\n` +
-    `MCAP: ${mc}\nBonding: ${prog}\nPair: ${pair}\nCA: \`${ct}...\`${pairWarn}\n\nChoose buy amount (SUI):`;
+  const sym  = t.symbol || '?';
+  const mc   = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
+  const p    = (t.progress != null) ? t.progress : t.bondingProgress;
+  const pNum = p != null ? Number(p) : null;
+  const prog = pNum != null ? `${Math.round(pNum)}%` : 'n/a';
+  const filled = pNum != null ? Math.min(10, Math.round(pNum/10)) : 0;
+  const bar  = pNum != null ? `[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${prog}` : prog;
+  const pair = t.pairType || 'SUI';
+  const ct   = (t.coinType || '').slice(0,46);
+  const pairWarn = pair !== 'SUI' ? `\n\n⚠️ This token pairs with *${pair}*, not SUI.` : '';
+  const txt =
+    `🟣 *${sym}*  —  Odyssey\n` +
+    `\`${ct}...\`\n\n` +
+    `┌─────────────────────────\n` +
+    `│ 🏦 MCap:  *${mc}*\n` +
+    `│ 📊 Curve: ${bar}\n` +
+    `│ 🔀 Pair:  ${pair}\n` +
+    `└─────────────────────────${pairWarn}\n\n` +
+    `_Choose buy amount (SUI):_`;
   const kb = { inline_keyboard:[
-    [{text:'0.1', callback_data:`lp:odbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:odbuy:${idx}:0.5`}],
-    [{text:'1',   callback_data:`lp:odbuy:${idx}:1`  },{text:'2',   callback_data:`lp:odbuy:${idx}:2`  }],
-    [{text:'5',   callback_data:`lp:odbuy:${idx}:5`  },{text:'10',  callback_data:`lp:odbuy:${idx}:10` }],
-    [{text:'📤 Sell 25%', callback_data:`lp:odsell:${idx}:25`},{text:'Sell 50%', callback_data:`lp:odsell:${idx}:50`},{text:'Sell 100%', callback_data:`lp:odsell:${idx}:100`}],
+    [{text:'0.1', callback_data:`lp:odbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:odbuy:${idx}:0.5`},{text:'1', callback_data:`lp:odbuy:${idx}:1`}],
+    [{text:'2',   callback_data:`lp:odbuy:${idx}:2`  },{text:'5',   callback_data:`lp:odbuy:${idx}:5`  },{text:'10',callback_data:`lp:odbuy:${idx}:10`}],
+    [{text:'💸 Sell 25%', callback_data:`lp:odsell:${idx}:25`},{text:'💸 Sell 50%', callback_data:`lp:odsell:${idx}:50`},{text:'💸 Sell 100%', callback_data:`lp:odsell:${idx}:100`}],
     [{text:'⬅️ Back', callback_data:'lp:ody'}],
   ]};
   await bot.editMessageText(txt,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:kb});
@@ -4104,8 +4947,7 @@ async function _showOdyToken(chatId, msgId, idx) {
 async function _odyBuy(chatId, msgId, idx, amtSui) {
   const u = getU(chatId);
   if (!u || !u.encryptedKey) { await bot.editMessageText('❌ No wallet. Use /start first.', {chat_id:chatId,message_id:msgId}); return; }
-  const { odyssey } = await _getLaunchpadTokens();
-  const t = odyssey[idx];
+  const t = _pinnedLp(chatId, 'odyssey', idx) || ((await _getLaunchpadTokens()).odyssey||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   // Guard: this entry only supports SUI-paired curves
   const pair = t.pairType || 'SUI';
@@ -4136,11 +4978,11 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
-      `✅ *Bought ${t.symbol}* on Odyssey\n\n` +
-      `💰 Spent:    ${amtSui} SUI\n` +
-      `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\n\n` +
+      `🟢 *Bought ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `💸 Spent:    \`${amtSui} SUI\`\n` +
+      `📦 Received: \`${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\`\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'⬅️ Back', callback_data:`lp:odpick:${idx}`}]]}});
   } catch(e) {
@@ -4152,8 +4994,7 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
 async function _odySell(chatId, msgId, idx, pct) {
   const u = getU(chatId);
   if (!u || !u.encryptedKey) { await bot.editMessageText('❌ No wallet.', {chat_id:chatId,message_id:msgId}); return; }
-  const { odyssey } = await _getLaunchpadTokens();
-  const t = odyssey[idx];
+  const t = _pinnedLp(chatId, 'odyssey', idx) || ((await _getLaunchpadTokens()).odyssey||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   await bot.editMessageText(`⏳ Selling ${pct}% of *${t.symbol}*...`,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown'});
   try {
@@ -4184,7 +5025,7 @@ async function _odySell(chatId, msgId, idx, pct) {
       if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
     }
     await bot.editMessageText(
-      `✅ *Sold ${pct}% of ${t.symbol}* on Odyssey\n\n` +
+      `🔴 *Sold ${pct}% of ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
       `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${t.symbol}\n` +
       `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
@@ -4224,11 +5065,11 @@ async function _odyBuyCA(chatId, msgId, amtSui) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
-      `✅ *Bought ${t.symbol}* on Odyssey\n\n` +
-      `💰 Spent:    ${amtSui} SUI\n` +
-      `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\n\n` +
+      `🟢 *Bought ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `💸 Spent:    \`${amtSui} SUI\`\n` +
+      `📦 Received: \`${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\`\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
       {chat_id:chatId,message_id:m.message_id,parse_mode:'Markdown'});
   } catch(e) {
@@ -4268,7 +5109,7 @@ async function _odySellCA(chatId, msgId, pct) {
       if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
     }
     await bot.editMessageText(
-      `✅ *Sold ${pct}% of ${t.symbol}* on Odyssey\n\n` +
+      `🔴 *Sold ${pct}% of ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
       `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${t.symbol}\n` +
       `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
@@ -4298,13 +5139,17 @@ async function _showAgentBuy(chatId, at) {
   const mc = at.marketCapUsd ? `$${Number(at.marketCapUsd).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
   const px = at.priceSui ? `${Number(at.priceSui).toExponential(3)} SUI` : 'n/a';
   const txt =
-    `🟢 *${tok.symbol}*  (AGENT MemeLand)\n` +
+    `🟢 *${tok.symbol}*  —  AGENT MemeLand\n` +
     `\`${ct.slice(0,46)}…\`\n\n` +
-    `MCAP:  ${mc}\nPrice: ${px}\nRoute: SUI → AGENT → ${tok.symbol}\n\n` +
+    `┌─────────────────────────\n` +
+    `│ 🏦 MCap:  *${mc}*\n` +
+    `│ 💲 Price: *${px}*\n` +
+    `│ 🔀 Route: SUI → AGENT → ${tok.symbol}\n` +
+    `└─────────────────────────\n\n` +
     `_Pick a buy size:_`;
   const rows = [
-    [{text:'💰 0.1 SUI', callback_data:'lp:agbuyca:0.1'}, {text:'💰 0.5 SUI', callback_data:'lp:agbuyca:0.5'}],
-    [{text:'💰 1 SUI',   callback_data:'lp:agbuyca:1'  }, {text:'💰 5 SUI',   callback_data:'lp:agbuyca:5'  }],
+    [{text:'0.1 SUI', callback_data:'lp:agbuyca:0.1'}, {text:'0.5 SUI', callback_data:'lp:agbuyca:0.5'}],
+    [{text:'1 SUI',   callback_data:'lp:agbuyca:1'  }, {text:'5 SUI',   callback_data:'lp:agbuyca:5'  }],
     [{text:'💸 Sell 25%', callback_data:'lp:agsellca:25'}, {text:'💸 Sell 100%', callback_data:'lp:agsellca:100'}],
     [{text:'⬅️ Back', callback_data:'lp:agent'}],
   ];
@@ -4375,9 +5220,9 @@ async function _agentBuyCA(chatId, msgId, amtSui) {
     const ab2  = await getActualDelta(res2.balanceChanges || res2.digest, t.coinType, u.walletAddress);
     const got  = ab2 && ab2 > 0n ? Number(ab2)/Math.pow(10, dec) : 0;
     const agentGot = Number(ab1)/1e9;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', poolId: t.poolId || null, tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), poolId: t.poolId || null, tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
-      `✅ *Bought ${sym}* via AGENT MemeLand\n\n` +
+      `🟢 *Bought ${sym}* via AGENT MemeLand\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
       `🟢 Hop 1:    ${agentGot.toFixed(4)} AGENT\n` +
       `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${sym}\n\n` +
@@ -4468,6 +5313,7 @@ async function _showMbList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching Moonbags tokens...');
   try {
     const { moonbags } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'moonbags', moonbags);
     if (!moonbags.length) {
       const txt = '🟠 *Moonbags*\n\nNo bonding-curve tokens available right now.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -4500,15 +5346,18 @@ async function _showMbByCA(chatId, ct, info) {
   };
   updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), mbCA: tok } });
   const sym  = tok.symbol;
-  const prog = (tok.progress != null) ? `${Number(tok.progress).toFixed(1)}%` : 'n/a';
+  const pNum = tok.progress != null ? Number(tok.progress) : null;
+  const prog = pNum != null ? `${pNum.toFixed(1)}%` : 'n/a';
+  const filled = pNum != null ? Math.min(10, Math.round(pNum/10)) : 0;
+  const bar  = pNum != null ? `[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${prog}` : prog;
   const txt =
-    `🟠 *${sym}*  (Moonbags bonding curve, SUI-paired)\n` +
+    `🟠 *${sym}*  —  Moonbags bonding curve\n` +
     `\`${ct.slice(0,46)}…\`\n\n` +
-    `Curve progress: *${prog}*\n\n` +
+    `📊 Curve: ${bar}\n\n` +
     `_Pick a buy size:_`;
   const rows = [
-    [{text:'💰 0.1 SUI', callback_data:'lp:mbbuyca:0.1'}, {text:'💰 0.5 SUI', callback_data:'lp:mbbuyca:0.5'}],
-    [{text:'💰 1 SUI',   callback_data:'lp:mbbuyca:1'  }, {text:'💰 5 SUI',   callback_data:'lp:mbbuyca:5'  }],
+    [{text:'0.1 SUI', callback_data:'lp:mbbuyca:0.1'}, {text:'0.5 SUI', callback_data:'lp:mbbuyca:0.5'}],
+    [{text:'1 SUI',   callback_data:'lp:mbbuyca:1'  }, {text:'5 SUI',   callback_data:'lp:mbbuyca:5'  }],
     [{text:'💸 Sell 25%', callback_data:'lp:mbsellca:25'}, {text:'💸 Sell 100%', callback_data:'lp:mbsellca:100'}],
     [{text:'⬅️ Back', callback_data:'lp:menu'}],
   ];
@@ -4516,19 +5365,27 @@ async function _showMbByCA(chatId, ct, info) {
 }
 
 async function _showMbToken(chatId, msgId, idx) {
-  const { moonbags } = await _getLaunchpadTokens();
-  const t = moonbags[idx];
+  const t = _pinnedLp(chatId, 'moonbags', idx) || ((await _getLaunchpadTokens()).moonbags||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
-  const sym = t.symbol || '?';
-  const mc  = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
-  const prog= t.progress != null ? `${Math.round(t.progress)}%` : 'n/a';
-  const ct  = (t.coinType || '').slice(0,46);
-  const txt = `🟠 *${sym}* — ${t.name||''}\n\nMCAP: ${mc}\nBonding: ${prog}\nCA: \`${ct}...\`\n\nChoose buy amount (SUI):`;
+  const sym  = t.symbol || '?';
+  const mc   = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
+  const p    = t.progress != null ? Number(t.progress) : null;
+  const prog = p != null ? `${Math.round(p)}%` : 'n/a';
+  const filled = p != null ? Math.min(10, Math.round(p/10)) : 0;
+  const bar  = p != null ? `[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${prog}` : prog;
+  const ct   = (t.coinType || '').slice(0,46);
+  const txt =
+    `🟠 *${sym}*  —  Moonbags\n` +
+    `\`${ct}...\`\n\n` +
+    `┌─────────────────────────\n` +
+    `│ 🏦 MCap:  *${mc}*\n` +
+    `│ 📊 Curve: ${bar}\n` +
+    `└─────────────────────────\n\n` +
+    `_Choose buy amount (SUI):_`;
   const kb = { inline_keyboard:[
-    [{text:'0.1', callback_data:`lp:mbbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:mbbuy:${idx}:0.5`}],
-    [{text:'1',   callback_data:`lp:mbbuy:${idx}:1`  },{text:'2',   callback_data:`lp:mbbuy:${idx}:2`  }],
-    [{text:'5',   callback_data:`lp:mbbuy:${idx}:5`  },{text:'10',  callback_data:`lp:mbbuy:${idx}:10` }],
-    [{text:'📤 Sell 25%', callback_data:`lp:mbsell:${idx}:25`},{text:'Sell 50%', callback_data:`lp:mbsell:${idx}:50`},{text:'Sell 100%', callback_data:`lp:mbsell:${idx}:100`}],
+    [{text:'0.1', callback_data:`lp:mbbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:mbbuy:${idx}:0.5`},{text:'1', callback_data:`lp:mbbuy:${idx}:1`}],
+    [{text:'2',   callback_data:`lp:mbbuy:${idx}:2`  },{text:'5',   callback_data:`lp:mbbuy:${idx}:5`  },{text:'10',callback_data:`lp:mbbuy:${idx}:10`}],
+    [{text:'💸 Sell 25%', callback_data:`lp:mbsell:${idx}:25`},{text:'💸 Sell 50%', callback_data:`lp:mbsell:${idx}:50`},{text:'💸 Sell 100%', callback_data:`lp:mbsell:${idx}:100`}],
     [{text:'⬅️ Back', callback_data:'lp:mb'}],
   ]};
   await bot.editMessageText(txt,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:kb});
@@ -4579,9 +5436,9 @@ async function _mbBuyCommon(chatId, msgId, t, amtSui, backCb) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'moonbags', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'moonbags', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
-      `✅ *Bought ${t.symbol}* on Moonbags\n\n` +
+      `🟢 *Bought ${t.symbol}* on Moonbags\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
       `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
@@ -4625,7 +5482,7 @@ async function _mbSellCommon(chatId, msgId, t, pct, backCb) {
       if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
     }
     await bot.editMessageText(
-      `✅ *Sold ${pct}% of ${t.symbol}* on Moonbags\n\n` +
+      `🔴 *Sold ${pct}% of ${t.symbol}* on Moonbags\n━━━━━━━━━━━━━━━━━━━━\n` +
       `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${t.symbol}\n` +
       `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
@@ -4637,14 +5494,12 @@ async function _mbSellCommon(chatId, msgId, t, pct, backCb) {
 }
 
 async function _mbBuy(chatId, msgId, idx, amtSui) {
-  const { moonbags } = await _getLaunchpadTokens();
-  const t = moonbags[idx];
+  const t = _pinnedLp(chatId, 'moonbags', idx) || ((await _getLaunchpadTokens()).moonbags||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   return _mbBuyCommon(chatId, msgId, t, amtSui, `lp:mbpick:${idx}`);
 }
 async function _mbSell(chatId, msgId, idx, pct) {
-  const { moonbags } = await _getLaunchpadTokens();
-  const t = moonbags[idx];
+  const t = _pinnedLp(chatId, 'moonbags', idx) || ((await _getLaunchpadTokens()).moonbags||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
   return _mbSellCommon(chatId, msgId, t, pct, `lp:mbpick:${idx}`);
 }
@@ -4668,6 +5523,7 @@ async function _showHfList(chatId, msgId) {
   const m = msgId ? null : await bot.sendMessage(chatId, '⏳ Fetching hop.fun tokens...');
   try {
     const { hopfun } = await _getLaunchpadTokens();
+    _pinLp(chatId, 'hopfun', hopfun);
     if (!hopfun.length) {
       const txt = '🔵 *hop.fun*\n\nNo bonding-curve tokens available right now.';
       const kb = { inline_keyboard:[[{text:'⬅️ Back', callback_data:'lp:menu'}]] };
@@ -4690,6 +5546,7 @@ async function _showHfList(chatId, msgId) {
 }
 
 async function _showHfByCA(chatId, ct, info) {
+  // BigInts can't survive JSON.stringify in saveDB() — string-encode for storage.
   const tok = {
     coinType: ct,
     symbol: info.symbol || (ct.split('::').pop() || '?'),
@@ -4697,21 +5554,24 @@ async function _showHfByCA(chatId, ct, info) {
     progress: info.progress ?? null,
     isCompleted: !!info.isCompleted,
     curveId: info.curveId || null,
-    virtualSuiReserves:   info.virtualSuiReserves   || null,
-    virtualTokenReserves: info.virtualTokenReserves || null,
+    virtualSuiReserves:   info.virtualSuiReserves   != null ? String(info.virtualSuiReserves)   : null,
+    virtualTokenReserves: info.virtualTokenReserves != null ? String(info.virtualTokenReserves) : null,
     source: 'hop.fun',
   };
   updU(chatId, { pd: { ...(getU(chatId)?.pd||{}), hfCA: tok } });
   const sym  = tok.symbol;
-  const prog = (tok.progress != null) ? `${Number(tok.progress).toFixed(1)}%` : 'n/a';
+  const pNum = tok.progress != null ? Number(tok.progress) : null;
+  const prog = pNum != null ? `${pNum.toFixed(1)}%` : 'n/a';
+  const filled = pNum != null ? Math.min(10, Math.round(pNum/10)) : 0;
+  const bar  = pNum != null ? `[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${prog}` : prog;
   const txt =
-    `🔵 *${sym}*  (hop.fun bonding curve, SUI-paired)\n` +
+    `🔵 *${sym}*  —  hop.fun bonding curve\n` +
     `\`${ct.slice(0,46)}…\`\n\n` +
-    `Curve progress: *${prog}*\n\n` +
+    `📊 Curve: ${bar}\n\n` +
     `_Pick a buy size:_`;
   const rows = [
-    [{text:'💰 0.1 SUI', callback_data:'lp:hfbuyca:0.1'}, {text:'💰 0.5 SUI', callback_data:'lp:hfbuyca:0.5'}],
-    [{text:'💰 1 SUI',   callback_data:'lp:hfbuyca:1'  }, {text:'💰 5 SUI',   callback_data:'lp:hfbuyca:5'  }],
+    [{text:'0.1 SUI', callback_data:'lp:hfbuyca:0.1'}, {text:'0.5 SUI', callback_data:'lp:hfbuyca:0.5'}],
+    [{text:'1 SUI',   callback_data:'lp:hfbuyca:1'  }, {text:'5 SUI',   callback_data:'lp:hfbuyca:5'  }],
     [{text:'💸 Sell 25%', callback_data:'lp:hfsellca:25'}, {text:'💸 Sell 100%', callback_data:'lp:hfsellca:100'}],
     [{text:'⬅️ Back', callback_data:'lp:menu'}],
   ];
@@ -4719,19 +5579,27 @@ async function _showHfByCA(chatId, ct, info) {
 }
 
 async function _showHfToken(chatId, msgId, idx) {
-  const { hopfun } = await _getLaunchpadTokens();
-  const t = hopfun[idx];
+  const t = _pinnedLp(chatId, 'hopfun', idx) || ((await _getLaunchpadTokens()).hopfun||[])[idx];
   if (!t) { await bot.editMessageText('❌ Token not in cache. Refresh.', {chat_id:chatId, message_id:msgId}); return; }
-  const sym = t.symbol || '?';
-  const mc  = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
-  const prog= t.progress != null ? `${Math.round(t.progress)}%` : 'n/a';
-  const ct  = (t.coinType || '').slice(0,46);
-  const txt = `🔵 *${sym}* — ${t.name||''}\n\nMCAP: ${mc}\nBonding: ${prog}\nCA: \`${ct}...\`\n\nChoose buy amount (SUI):`;
+  const sym  = t.symbol || '?';
+  const mc   = t.marketCap ? `$${Number(t.marketCap).toLocaleString(undefined,{maximumFractionDigits:0})}` : 'n/a';
+  const p    = t.progress != null ? Number(t.progress) : null;
+  const prog = p != null ? `${Math.round(p)}%` : 'n/a';
+  const filled = p != null ? Math.min(10, Math.round(p/10)) : 0;
+  const bar  = p != null ? `[${'█'.repeat(filled)}${'░'.repeat(10-filled)}] ${prog}` : prog;
+  const ct   = (t.coinType || '').slice(0,46);
+  const txt =
+    `🔵 *${sym}*  —  hop.fun\n` +
+    `\`${ct}...\`\n\n` +
+    `┌─────────────────────────\n` +
+    `│ 🏦 MCap:  *${mc}*\n` +
+    `│ 📊 Curve: ${bar}\n` +
+    `└─────────────────────────\n\n` +
+    `_Choose buy amount (SUI):_`;
   const kb = { inline_keyboard:[
-    [{text:'0.1', callback_data:`lp:hfbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:hfbuy:${idx}:0.5`}],
-    [{text:'1',   callback_data:`lp:hfbuy:${idx}:1`  },{text:'2',   callback_data:`lp:hfbuy:${idx}:2`  }],
-    [{text:'5',   callback_data:`lp:hfbuy:${idx}:5`  },{text:'10',  callback_data:`lp:hfbuy:${idx}:10` }],
-    [{text:'📤 Sell 25%', callback_data:`lp:hfsell:${idx}:25`},{text:'Sell 50%', callback_data:`lp:hfsell:${idx}:50`},{text:'Sell 100%', callback_data:`lp:hfsell:${idx}:100`}],
+    [{text:'0.1', callback_data:`lp:hfbuy:${idx}:0.1`},{text:'0.5', callback_data:`lp:hfbuy:${idx}:0.5`},{text:'1', callback_data:`lp:hfbuy:${idx}:1`}],
+    [{text:'2',   callback_data:`lp:hfbuy:${idx}:2`  },{text:'5',   callback_data:`lp:hfbuy:${idx}:5`  },{text:'10',callback_data:`lp:hfbuy:${idx}:10`}],
+    [{text:'💸 Sell 25%', callback_data:`lp:hfsell:${idx}:25`},{text:'💸 Sell 50%', callback_data:`lp:hfsell:${idx}:50`},{text:'💸 Sell 100%', callback_data:`lp:hfsell:${idx}:100`}],
     [{text:'⬅️ Back', callback_data:'lp:hf'}],
   ]};
   await bot.editMessageText(txt,{chat_id:chatId,message_id:msgId,parse_mode:'Markdown',reply_markup:kb});
@@ -4782,9 +5650,9 @@ async function _hfBuyCommon(chatId, msgId, t, amtSui, backCb) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
     await bot.editMessageText(
-      `✅ *Bought ${t.symbol}* on hop.fun\n\n` +
+      `🟢 *Bought ${t.symbol}* on hop.fun\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
       `📦 Received: ${got > 0 ? got.toLocaleString(undefined,{maximumFractionDigits:4}) : '?'} ${t.symbol}\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
@@ -4828,7 +5696,7 @@ async function _hfSellCommon(chatId, msgId, t, pct, backCb) {
       if (pos) { pos.tokens = Math.max(0, (pos.tokens||0) - sold); if (pos.tokens === 0) u.positions = u.positions.filter(p => p !== pos); saveDB(); }
     }
     await bot.editMessageText(
-      `✅ *Sold ${pct}% of ${t.symbol}* on hop.fun\n\n` +
+      `🔴 *Sold ${pct}% of ${t.symbol}* on hop.fun\n━━━━━━━━━━━━━━━━━━━━\n` +
       `📤 Sold:     ${sold.toLocaleString(undefined,{maximumFractionDigits:4})} ${t.symbol}\n` +
       `💰 Received: ${suiR > 0 ? suiR.toFixed(4) : '?'} SUI\n\n` +
       `🔗 [View TX](${SUISCAN}${res.digest})`,
@@ -4839,29 +5707,51 @@ async function _hfSellCommon(chatId, msgId, t, pct, backCb) {
   }
 }
 
+// Pinned snapshots can hold stale reserves (curves move fast). Refetch fresh
+// reserves before quoting so min-out math stays current. Token IDENTITY still
+// comes from the snapshot (the whole point of the cross-contamination fix).
+async function _hfFreshen(t) {
+  try {
+    const fresh = await fetchHopFunCoin(sui, t.coinType);
+    if (fresh && fresh.coinType?.toLowerCase() === t.coinType?.toLowerCase()) {
+      return { ...t, virtualSuiReserves: fresh.virtualSuiReserves, virtualTokenReserves: fresh.virtualTokenReserves, curveId: fresh.curveId || t.curveId, progress: fresh.progress ?? t.progress, isCompleted: !!fresh.isCompleted };
+    }
+  } catch {}
+  return t;
+}
+// Restore string-encoded BigInts from session persistence
+function _hfHydrate(t) {
+  if (!t) return t;
+  return { ...t,
+    virtualSuiReserves:   t.virtualSuiReserves   != null && typeof t.virtualSuiReserves   === 'string' ? BigInt(t.virtualSuiReserves)   : t.virtualSuiReserves,
+    virtualTokenReserves: t.virtualTokenReserves != null && typeof t.virtualTokenReserves === 'string' ? BigInt(t.virtualTokenReserves) : t.virtualTokenReserves,
+  };
+}
 async function _hfBuy(chatId, msgId, idx, amtSui) {
-  const { hopfun } = await _getLaunchpadTokens();
-  const t = hopfun[idx];
-  if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const pinned = _pinnedLp(chatId, 'hopfun', idx) || ((await _getLaunchpadTokens()).hopfun||[])[idx];
+  if (!pinned) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const t = await _hfFreshen(_hfHydrate(pinned));
   return _hfBuyCommon(chatId, msgId, t, amtSui, `lp:hfpick:${idx}`);
 }
 async function _hfSell(chatId, msgId, idx, pct) {
-  const { hopfun } = await _getLaunchpadTokens();
-  const t = hopfun[idx];
-  if (!t) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const pinned = _pinnedLp(chatId, 'hopfun', idx) || ((await _getLaunchpadTokens()).hopfun||[])[idx];
+  if (!pinned) { await bot.editMessageText('❌ Token expired from cache.', {chat_id:chatId,message_id:msgId}); return; }
+  const t = await _hfFreshen(_hfHydrate(pinned));
   return _hfSellCommon(chatId, msgId, t, pct, `lp:hfpick:${idx}`);
 }
 async function _hfBuyCA(chatId, msgId, amtSui) {
   const u = getU(chatId);
-  const t = u?.pd?.hfCA;
-  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const raw = u?.pd?.hfCA;
+  if (!raw) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const t = await _hfFreshen(_hfHydrate(raw));
   const m = await bot.sendMessage(chatId, `⏳ Buying ${amtSui} SUI of *${t.symbol}* on hop.fun...`, {parse_mode:'Markdown'});
   return _hfBuyCommon(chatId, m.message_id, t, amtSui, 'lp:menu');
 }
 async function _hfSellCA(chatId, msgId, pct) {
   const u = getU(chatId);
-  const t = u?.pd?.hfCA;
-  if (!t) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const raw = u?.pd?.hfCA;
+  if (!raw) { await bot.sendMessage(chatId, '❌ Lost the token reference. Paste the CA again.'); return; }
+  const t = await _hfFreshen(_hfHydrate(raw));
   const m = await bot.sendMessage(chatId, `⏳ Selling ${pct}% of *${t.symbol}*...`, {parse_mode:'Markdown'});
   return _hfSellCommon(chatId, m.message_id, t, pct, 'lp:menu');
 }
@@ -4885,8 +5775,7 @@ bot.on('callback_query', async(q)=>{
     if (parts[1] === 'odsellca') return _odySellCA(chatId, msgId, parseInt(parts[2],10));
     if (parts[1] === 'agbuy') {
       const aIdx = parseInt(parts[2], 10);
-      const { agent } = await _getLaunchpadTokens();
-      const at = agent[aIdx];
+      const at = _pinnedLp(chatId, 'agent', aIdx) || ((await _getLaunchpadTokens()).agent||[])[aIdx];
       if (!at) { await bot.sendMessage(chatId, '❌ Token expired from cache. Reopen 🚀 Launchpad.'); return; }
       await _showAgentBuy(chatId, at);
       return;
@@ -4969,6 +5858,10 @@ async function main() {
   positionMonitor().catch(e=>console.error('Monitor:', e));
   sniperEngine().catch(e=>console.error('Sniper:', e));
   copyEngine().catch(e=>console.error('Copy:', e));
+  limitEngine().catch(e=>console.error('Limit:', e));
+  dcaEngine().catch(e=>console.error('DCA:', e));
+  autoSellEngine().catch(e=>console.error('AutoSell:', e));
+  migrationEngine().catch(e=>console.error('Migration:', e));
 
   console.log('  Bot is live! 🚀');
   if(ADMIN_ID) bot.sendMessage(ADMIN_ID,'🟢 AGENT TRADING BOT v6 online.').catch(()=>{});

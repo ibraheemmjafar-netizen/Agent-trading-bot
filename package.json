@@ -1,12 +1,15 @@
 {
-  "name": "agent-trading-bot",
-  "version": "6.0.0",
+  "name": "agent-tg-bot",
+  "version": "1.0.0",
   "type": "module",
-  "main": "bot.mjs",
-  "scripts": { "start": "node bot.mjs" },
+  "main": "bot_launchpad_v5.mjs",
+  "scripts": {
+    "start": "node bot_launchpad_v5.mjs"
+  },
   "dependencies": {
-    "@mysten/sui": "^1.0.0",
+    "@mysten/sui": "1.21.0",
+    "dotenv": "^17.3.1",
     "node-telegram-bot-api": "^0.66.0",
-    "redis": "^4.7.0"
+    "ioredis": "^5.3.2"
   }
 }
