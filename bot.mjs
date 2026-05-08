@@ -1506,6 +1506,10 @@ async function executeBuy(chatId, ct, amtSui) {
     throw new Error(`Amount too high. Max safe buy: ${maxSui} SUI (0.07 SUI reserved for gas). Your balance: ${(Number(totalMist)/1e9).toFixed(4)} SUI`);
   }
 
+  // Snapshot live price + market cap BEFORE the swap so positions
+  // remember their entry MC / USD price for proper PnL display.
+  const _bm = await _liveTokenStats(ct).catch(() => null);
+
   // Collect fee from buy amount
   const feeMist  = (amt * BigInt(FEE_BPS)) / 10000n;
   const tradeAmt = amt - feeMist;
@@ -1551,7 +1555,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):Number(est||0)/Math.pow(10,dec); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):Number(est||0)/Math.pow(10,dec); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'turbos') {
@@ -1568,7 +1572,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'flowx') {
@@ -1580,7 +1584,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'kriya') {
@@ -1592,7 +1596,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'bluemove') {
@@ -1604,7 +1608,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault}); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'unsupported_dex') {
@@ -1684,7 +1688,7 @@ async function executeBuy(chatId, ct, amtSui) {
     const dec = meta.decimals || 9;
     const ab2 = await getActualDelta(res2.balanceChanges || res2.digest, ct, u.walletAddress);
     const tok  = ab2 && ab2 > 0n ? Number(ab2) / Math.pow(10, dec) : 0;
-    addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault });
+    addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault, entryPriceUsd:_bm?.priceUsd||null, entryMc:_bm?.mc||null, entrySupplyH:_bm?.supplyH||null });
     return { digest:res2.digest, feeSui:fSui(feeMist), route:'Cetus CLMM (SUI→PANS→TOKEN)', out:tok>0?tok.toFixed(6):'?', sym, bonding:false };
   }
 
@@ -2698,7 +2702,7 @@ function addPos(chatId, p) {
     if (p.tp != null) existing.tp = p.tp;
     if (p.sl != null) existing.sl = p.sl;
   } else {
-    u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, entryMc:p.entryMc||null, poolId:p.poolId||null, at:Date.now() });
+    u.positions.push({ id:randomBytes(4).toString('hex'), ct:p.ct, sym:p.sym, entry:p.entry||0, tokens:p.tokens||0, dec:p.dec||9, spent:p.spent, source:p.source||'dex', lp:p.lp||null, tp:p.tp||null, sl:p.sl||null, entryMc:p.entryMc||null, entryPriceUsd:p.entryPriceUsd||null, entrySupplyH:p.entrySupplyH||null, poolId:p.poolId||null, at:Date.now() });
   }
   saveDB();
 }
@@ -2753,6 +2757,22 @@ async function fetchSuiUsd() {
 // Look up live USD price of a token via GeckoTerminal or DexScreener
 // (whichever has it indexed). This covers tokens trading on any Sui DEX —
 // not just Cetus, which is the only venue getSwapEstimate currently hits.
+// Cheap one-shot lookup of live USD price + market cap for a token.
+// Used at buy-time (snapshot entry stats) and at display-time (live PnL).
+async function _liveTokenStats(ct) {
+  try {
+    const [pUsd, supply, meta] = await Promise.all([
+      _tokenPriceUsd(ct),
+      sui.getTotalSupply({ coinType: ct }).catch(() => null),
+      getMeta(ct).catch(() => null),
+    ]);
+    const dec  = meta?.decimals || 9;
+    const supH = supply ? Number(BigInt(supply.value)) / Math.pow(10, dec) : 0;
+    const mc   = (pUsd > 0 && supH > 0) ? pUsd * supH : null;
+    return { priceUsd: pUsd > 0 ? pUsd : null, mc, supplyH: supH || null };
+  } catch { return { priceUsd: null, mc: null, supplyH: null }; }
+}
+
 async function _tokenPriceUsd(ct) {
   try {
     const gt = await geckoTok(ct).catch(() => null);
@@ -2771,11 +2791,37 @@ async function getPnl(pos) {
   if (pos.source==='bonding'||!pos.tokens||pos.tokens<=0) return null;
   const spent = parseFloat(pos.spent || 0);
   if (!(spent > 0)) return null;
-  const mkRes = (cur) => ({ cur, pnl: cur - spent, pct: ((cur - spent) / spent) * 100 });
+  // Always fetch live USD price + SUI/USD up-front so we can show
+  // bought / current price + market cap regardless of which DEX has the pool.
+  const [pUsd, suiUsd, supplyInfo] = await Promise.all([
+    _tokenPriceUsd(pos.ct).catch(() => null),
+    fetchSuiUsd().catch(() => null),
+    pos.entrySupplyH ? Promise.resolve(null) : sui.getTotalSupply({ coinType: pos.ct }).catch(() => null),
+  ]);
+  const supplyH = pos.entrySupplyH || (supplyInfo ? Number(BigInt(supplyInfo.value)) / Math.pow(10, pos.dec || 9) : null);
+  const curMc   = (pUsd > 0 && supplyH > 0) ? pUsd * supplyH : null;
+  // Lazy backfill for old positions that were created before entry stats
+  // were captured (so the UI shows real bought/now MC instead of "—").
+  if (!pos.entryPriceUsd && suiUsd > 0 && pos.entry > 0) {
+    pos.entryPriceUsd = pos.entry * suiUsd; // approx — uses *current* SUI/USD
+  }
+  if (!pos.entryMc && pos.entryPriceUsd && supplyH > 0) {
+    pos.entryMc = pos.entryPriceUsd * supplyH;
+  }
+  if (!pos.entrySupplyH && supplyH > 0) pos.entrySupplyH = supplyH;
+  saveDB();
+
+  const mkRes = (cur) => ({
+    cur, pnl: cur - spent, pct: ((cur - spent) / spent) * 100,
+    priceUsd: pUsd || null,
+    suiUsd: suiUsd || null,
+    mc: curMc,
+    entryPriceUsd: pos.entryPriceUsd || null,
+    entryMc: pos.entryMc || null,
+  });
   try {
     // AGENT MemeLand tokens route MEME→AGENT→SUI (2 hops) so direct
-    // getSwapEstimate always returns 0. Use Railway backend priceSui first;
-    // fall through to the USD fallback if the backend has no price either.
+    // getSwapEstimate always returns 0. Use Railway backend priceSui first.
     if (pos.source === 'agent') {
       const t = await fetchAgentTokenByCoinType(pos.ct).catch(() => null);
       if (t?.priceSui != null) {
@@ -2790,13 +2836,7 @@ async function getPnl(pos) {
         if (cur > 0) return mkRes(cur);
       }
     }
-    // Universal fallback: USD price from Gecko/DexScreener × tokens / SUI-USD.
-    // This is what lets tokens on Turbos / FlowX / Kriya / BlueMove / PANS hop
-    // pools show live PnL — getSwapEstimate above only routes via Cetus.
-    const [pUsd, suiUsd] = await Promise.all([
-      _tokenPriceUsd(pos.ct),
-      fetchSuiUsd(),
-    ]);
+    // Universal fallback: USD price × tokens / SUI-USD.
     if (pUsd > 0 && suiUsd > 0) {
       const cur = (pUsd * pos.tokens) / suiUsd;
       if (cur > 0) return mkRes(cur);
@@ -3366,20 +3406,37 @@ async function doPositions(chatId) {
         const srcMap  = { bonding:'Launchpad', agent:'AGENT MemeLand', odyssey:'Odyssey', hopfun:'hop.fun', moonbags:'Moonbags', dex:'DEX' };
         const srcLabel= srcMap[pos.source]||'DEX';
 
+        // Pretty USD price formatter — handles tiny token prices ($0.0000123)
+        const fPrice = (n) => {
+          if (!n || n <= 0) return '—';
+          if (n >= 1)     return '$' + n.toLocaleString('en',{maximumFractionDigits:4});
+          if (n >= 0.01)  return '$' + n.toFixed(4);
+          if (n >= 1e-6)  return '$' + n.toFixed(8).replace(/0+$/,'');
+          return '$' + n.toExponential(2);
+        };
+
         let cap =
-          `📍 *${pos.sym}/SUI*  ·  ${srcLabel}\n\n` +
-          `Holdings: ${tokStr} ${pos.sym}  ·  Held: ${heldStr}\n\n` +
-          `Invested:  ${spentStr} SUI\n`;
+          `🪙 *${pos.sym}/SUI*  ·  ${srcLabel}\n` +
+          `\`${pos.ct}\`\n\n` +
+          `📦 Holdings: *${tokStr} ${pos.sym}*\n` +
+          `⏱ Held: ${heldStr}\n\n` +
+          `📈 *Bought*\n` +
+          `   Spent: \`${spentStr} SUI\`\n` +
+          `   Price: ${fPrice(pos.entryPriceUsd)}\n` +
+          `   MC:    ${pos.entryMc?fmtMoney(pos.entryMc):'—'}\n\n`;
 
         if (p) {
           const s    = p.pnl >= 0 ? '+' : '';
-          const icon = p.pnl >= 0 ? '🟢' : '🔴';
+          const arrow= p.pnl >= 0 ? '🟢' : '🔴';
           cap +=
-            `Current:   ${p.cur.toFixed(4)} SUI\n` +
-            `Total PNL: *${s}${p.pnl.toFixed(4)} SUI (${s}${p.pct.toFixed(2)}%)*\n` +
+            `📊 *Now*\n` +
+            `   Worth: \`${p.cur.toFixed(4)} SUI\`\n` +
+            `   Price: ${fPrice(p.priceUsd)}\n` +
+            `   MC:    ${p.mc?fmtMoney(p.mc):'—'}\n\n` +
+            `${arrow} *PnL: ${s}${p.pnl.toFixed(4)} SUI (${s}${p.pct.toFixed(2)}%)*\n` +
             `${pnlBar(p.pct)}`;
         } else {
-          cap += `Current:   ⚪ unavailable`;
+          cap += `📊 *Now*\n   ⚪ Live price unavailable — pool may be inactive.`;
         }
 
         if (pos.tp || pos.sl) {
