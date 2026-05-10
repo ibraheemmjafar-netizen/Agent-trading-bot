@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v204)
+ * AGENT TRADING BOT — v7 Production (v206)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -189,12 +189,34 @@ function trunc(a)    { return (!a || a.length < 12) ? (a || '') : a.slice(0,6)+'
 // DATABASE — Redis-backed, persists across Railway deployments
 // ═══════════════════════════════════════════════════════════
 let DB = {};
+// v206: one-time migration that clears legacy MC stamps from all open
+// positions. v205-and-earlier stamped entryMc using sui.getTotalSupply()
+// which over-counts locked/vesting/treasury supply, so the saved MC was
+// systematically high. Wiping forces /positions cards to show "Entry SUI"
+// for old buys (honest) and lets new buys stamp correct circulating MC.
+function _v206WipeLegacyMc() {
+  if (DB._v206_mc_wiped) return 0;
+  let n = 0;
+  for (const uid of Object.keys(DB)) {
+    const u = DB[uid];
+    if (!u || !Array.isArray(u.positions)) continue;
+    for (const p of u.positions) {
+      if (p && (p.entryMc != null || p.entryPriceUsd != null || p.entrySupplyH != null)) {
+        p.entryMc = null; p.entryPriceUsd = null; p.entrySupplyH = null; n++;
+      }
+    }
+  }
+  DB._v206_mc_wiped = true;
+  return n;
+}
 async function loadDB() {
   if (REDIS_ENABLED) {
     try {
       await redisClient.connect();
       const raw = await redisClient.get('agent_bot_db');
       DB = raw ? JSON.parse(raw) : {};
+      const wiped = _v206WipeLegacyMc();
+      if (wiped > 0) { saveDB(); console.log(`🧹 v206: wiped legacy MC on ${wiped} position(s)`); }
       console.log(`✅ DB loaded from Redis — ${Object.keys(DB).length} users`);
       return;
     } catch(e) {
@@ -204,6 +226,8 @@ async function loadDB() {
   try {
     if (existsSync(DB_FILE)) {
       DB = JSON.parse(readFileSync(DB_FILE, 'utf8'));
+      const wiped = _v206WipeLegacyMc();
+      if (wiped > 0) { saveDB(); console.log(`🧹 v206: wiped legacy MC on ${wiped} position(s)`); }
       console.log(`✅ DB loaded from ${DB_FILE} — ${Object.keys(DB).length} users`);
     } else { DB = {}; console.log(`✅ DB starting empty (file-mode, will write to ${DB_FILE})`); }
   } catch(e) { console.error('File loadDB failed, starting empty:', e.message); DB = {}; }
@@ -711,6 +735,52 @@ async function getSwapEstimate(tokenIn, tokenOut, amountIn) {
   return null;
 }
 
+/**
+ * v205: Indexer-based fair-price quote.
+ *
+ * Used as the slippage benchmark on non-Cetus DEXes (Turbos/FlowX/Kriya/BlueMove)
+ * where the bot has no on-chain quote API. Falls back to the broader-market USD
+ * price from GeckoTerminal/DexScreener, which represents fair value across all
+ * pools — so a thin/dust pool that quotes badly will fail the slippage check.
+ *
+ * Returns the fair output amount as a raw u64 string, or null on failure.
+ * Direction inferred from which side is SUI_T:
+ *   tokenIn = SUI_T  → buy:  raw SUI_in (mist) → raw token_out (with token decimals)
+ *   tokenOut = SUI_T → sell: raw token_in       → raw SUI_out (mist)
+ */
+async function estimateFairOut(tokenIn, tokenOut, amountInRaw) {
+  try {
+    const suiUsd = await fetchSuiUsd().catch(() => null);
+    if (!(suiUsd > 0)) return null;
+    if (tokenIn === SUI_T && tokenOut !== SUI_T) {
+      const [pUsd, meta] = await Promise.all([
+        _tokenPriceUsd(tokenOut).catch(() => null),
+        getMeta(tokenOut).catch(() => null),
+      ]);
+      if (!(pUsd > 0) || !meta) return null;
+      const dec   = meta.decimals || 9;
+      const usdIn = (Number(amountInRaw) / 1e9) * suiUsd;
+      const tok   = usdIn / pUsd;
+      const raw   = BigInt(Math.floor(tok * Math.pow(10, dec)));
+      return raw > 0n ? raw.toString() : null;
+    }
+    if (tokenOut === SUI_T && tokenIn !== SUI_T) {
+      const [pUsd, meta] = await Promise.all([
+        _tokenPriceUsd(tokenIn).catch(() => null),
+        getMeta(tokenIn).catch(() => null),
+      ]);
+      if (!(pUsd > 0) || !meta) return null;
+      const dec    = meta.decimals || 9;
+      const tokIn  = Number(amountInRaw) / Math.pow(10, dec);
+      const usdOut = tokIn * pUsd;
+      const suiOut = usdOut / suiUsd;
+      const raw    = BigInt(Math.floor(suiOut * 1e9));
+      return raw > 0n ? raw.toString() : null;
+    }
+  } catch {}
+  return null;
+}
+
 // Read actual token delta for walletAddr from a confirmed TX (balance changes)
 // Returns the BigInt amount change (positive = received, negative = spent) or null
 // Extract balance delta from a balanceChanges array (from TX response or getTransactionBlock)
@@ -814,6 +884,8 @@ async function getDexScreenerPools(addr) {
       quoteSymbol: p.quoteToken?.symbol || '',
       baseAddr:    p.baseToken?.address  || '',
       quoteAddr:   p.quoteToken?.address || '',
+      marketCap:   parseFloat(p.marketCap || 0),
+      fdv:         parseFloat(p.fdv || 0),
     }));
     dsCache.set(addr, { pools, ts: Date.now() });
     return pools;
@@ -1092,8 +1164,27 @@ async function detectState(ct) {
     candidates.push({ priority: isUnsupported ? 99 : (i + 1), result: r });
   }
   candidates.sort((a, b) => a.priority - b.priority);
+  // v205: liquidity-aware selection. Dust pools (e.g. Cetus $0.71-liq pool that
+  // burned the CHAD trader at 36x worse than market) are skipped in favour of
+  // the next-priority candidate that has real liquidity. PANS/AGENT hops and
+  // unsupported_dex are exempt (they have multiple pool IDs or no poolId).
+  for (const c of candidates) {
+    const r = c.result;
+    const exempt = !r.poolId || ['pans_cetus','agent_cetus','unsupported_dex'].includes(r.state);
+    if (exempt) { stateCache.set(ct, r); return r; }
+    const liq = await getBluemovePoolLiqUsd(r.poolId).catch(() => null);
+    // null = indexer unknown (allow), >= $1000 = OK, < $1000 = dust → skip
+    if (liq == null || liq >= 1000) {
+      if (liq != null) r.liqUsd = liq;
+      stateCache.set(ct, r);
+      return r;
+    }
+  }
+  // All candidates were dust — surface the deepest one with a flag so callers
+  // can warn the user instead of silently routing through a broken pool.
   if (candidates.length) {
     const best = candidates[0].result;
+    best.lowLiq = true;
     stateCache.set(ct, best);
     return best;
   }
@@ -1236,7 +1327,7 @@ async function buildCetusSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
  * a2b=true  → swap_a_b: coinA goes in, coinB comes out
  * a2b=false → swap_b_a: coinB goes in, coinA comes out
  */
-async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, coinInType, amountIn }) {
+async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
   const tx = new Transaction();
   tx.setGasBudget(50_000_000);
   tx.setSender(wallet);
@@ -1273,7 +1364,7 @@ async function buildTurbosSwapTx({ wallet, poolId, feeType, coinA, coinB, a2b, c
       tx.object(poolId),                  // &mut Pool<CoinA,CoinB,FeeType>
       coinVec,                            // vector<Coin<CoinX>>
       tx.pure.u64(BigInt(amountIn)),      // amount (exact in)
-      tx.pure.u64(0n),                    // amount_limit (min out — 0 = no limit, slippage applied separately)
+      tx.pure.u64(BigInt(minAmountOut || '0')), // amount_limit (min out) — v205 slippage
       tx.pure.u128(0n),                   // sqrt_price_limit (0 = no restriction)
       tx.pure.bool(true),                 // is_exact_in
       tx.pure.address(wallet),            // recipient
@@ -1638,6 +1729,9 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'turbos') {
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildTurbosSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId,
@@ -1647,6 +1741,7 @@ async function executeBuy(chatId, ct, amtSui) {
       a2b:    st.a2b,
       coinInType: SUI_T,
       amountIn:   tradeAmt.toString(),
+      minAmountOut: minOut.toString(),
     });
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -1655,10 +1750,13 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'flowx') {
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildFlowXSwapTx({
       wallet: u.walletAddress,
       coinA:  st.coinA, coinB: st.coinB, a2b: st.a2b,
-      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
+      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: minOut.toString(),
     });
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -1667,10 +1765,13 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'kriya') {
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildKriyaSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: st.a2b,
-      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
+      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: minOut.toString(),
     });
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -1679,11 +1780,14 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'bluemove') {
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildBlueMoveSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId,
       coinA: st.coinA, coinB: st.coinB, a2b: st.a2b,
-      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
+      coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: minOut.toString(),
     });
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -1916,6 +2020,9 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'turbos') {
     const sellA2b    = !st.a2b;
     const coinInType = st.a2b ? st.coinB : st.coinA;
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildTurbosSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId,
@@ -1925,6 +2032,7 @@ async function executeSell(chatId, ct, pct) {
       a2b:    sellA2b,
       coinInType,
       amountIn: sellAmt.toString(),
+      minAmountOut: minOut.toString(),
     });
     try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -1935,9 +2043,12 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'flowx') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildFlowXSwapTx({
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
-      coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
+      coinInType, amountIn: sellAmt.toString(), minAmountOut: minOut.toString(),
     });
     try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -1948,9 +2059,12 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'kriya') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildKriyaSwapTx({
       wallet: u.walletAddress, poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
-      coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
+      coinInType, amountIn: sellAmt.toString(), minAmountOut: minOut.toString(),
     });
     try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -1961,10 +2075,13 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'bluemove') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
+    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
+    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
     const tx = await buildBlueMoveSwapTx({
       wallet: u.walletAddress, poolId: st.poolId,
       coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
-      coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
+      coinInType, amountIn: sellAmt.toString(), minAmountOut: minOut.toString(),
     });
     try{applyTxOpts(tx, u);}catch{}
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
@@ -2842,14 +2959,20 @@ async function fetchSuiUsd() {
 // Used at buy-time (snapshot entry stats) and at display-time (live PnL).
 async function _liveTokenStats(ct) {
   try {
-    const [pUsd, supply, meta] = await Promise.all([
+    // v206: prefer indexer circulating MC; only compute from total supply
+    // as a last resort. Buy notification uses geckoTok.mcap directly, so
+    // stamping entryMc from _indexerMc keeps the card consistent with the buy.
+    const [pUsd, indexerMc, supply, meta] = await Promise.all([
       _tokenPriceUsd(ct),
+      _indexerMc(ct),
       sui.getTotalSupply({ coinType: ct }).catch(() => null),
       getMeta(ct).catch(() => null),
     ]);
     const dec  = meta?.decimals || 9;
     const supH = supply ? Number(BigInt(supply.value)) / Math.pow(10, dec) : 0;
-    const mc   = (pUsd > 0 && supH > 0) ? pUsd * supH : null;
+    const mc   = (indexerMc && indexerMc > 0)
+      ? indexerMc
+      : ((pUsd > 0 && supH > 0) ? pUsd * supH : null);
     return { priceUsd: pUsd > 0 ? pUsd : null, mc, supplyH: supH || null };
   } catch { return { priceUsd: null, mc: null, supplyH: null }; }
 }
@@ -2868,29 +2991,46 @@ async function _tokenPriceUsd(ct) {
   return null;
 }
 
+/**
+ * v206: Indexer-aware market cap.
+ *
+ * Returns CIRCULATING market cap from GeckoTerminal (same field used by the
+ * buy notification's MCap line) or DexScreener as fallback. Falls back to
+ * priceUsd * total on-chain supply ONLY when both indexers are silent — that
+ * fallback over-states MC for tokens with locked/vesting/treasury supply
+ * (PANS displayed $4.06M instead of true $2.83M because of this), so it must
+ * be the last resort, not the primary source.
+ */
+async function _indexerMc(ct) {
+  try {
+    const gt = await geckoTok(ct).catch(() => null);
+    if (gt?.mcap > 0) return gt.mcap;
+  } catch {}
+  try {
+    const ds = await getDexScreenerPools(ct).catch(() => []);
+    // Prefer marketCap (circulating). FDV is total-supply-based — only used
+    // when no marketCap is available from any pool for this token.
+    const mcPool = (ds || []).filter(p => p.marketCap > 0).sort((a,b) => (b.liq||0) - (a.liq||0))[0];
+    if (mcPool?.marketCap > 0) return mcPool.marketCap;
+    const fdvPool = (ds || []).filter(p => p.fdv > 0).sort((a,b) => (b.liq||0) - (a.liq||0))[0];
+    if (fdvPool?.fdv > 0) return fdvPool.fdv;
+  } catch {}
+  return null;
+}
+
 async function getPnl(pos) {
   if (pos.source==='bonding'||!pos.tokens||pos.tokens<=0) return null;
   const spent = parseFloat(pos.spent || 0);
   if (!(spent > 0)) return null;
-  // Always fetch live USD price + SUI/USD up-front so we can show
-  // bought / current price + market cap regardless of which DEX has the pool.
-  const [pUsd, suiUsd, supplyInfo] = await Promise.all([
+  // v206: live USD price + SUI/USD + indexer circulating MC. No more total-
+  // supply MC math, no more lazy backfill of entryMc from CURRENT SUI/USD
+  // (that produced $4.06M for PANS instead of the real $2.83M).
+  const [pUsd, suiUsd, indexerMc] = await Promise.all([
     _tokenPriceUsd(pos.ct).catch(() => null),
     fetchSuiUsd().catch(() => null),
-    pos.entrySupplyH ? Promise.resolve(null) : sui.getTotalSupply({ coinType: pos.ct }).catch(() => null),
+    _indexerMc(pos.ct).catch(() => null),
   ]);
-  const supplyH = pos.entrySupplyH || (supplyInfo ? Number(BigInt(supplyInfo.value)) / Math.pow(10, pos.dec || 9) : null);
-  const curMc   = (pUsd > 0 && supplyH > 0) ? pUsd * supplyH : null;
-  // Lazy backfill for old positions that were created before entry stats
-  // were captured (so the UI shows real bought/now MC instead of "—").
-  if (!pos.entryPriceUsd && suiUsd > 0 && pos.entry > 0) {
-    pos.entryPriceUsd = pos.entry * suiUsd; // approx — uses *current* SUI/USD
-  }
-  if (!pos.entryMc && pos.entryPriceUsd && supplyH > 0) {
-    pos.entryMc = pos.entryPriceUsd * supplyH;
-  }
-  if (!pos.entrySupplyH && supplyH > 0) pos.entrySupplyH = supplyH;
-  saveDB();
+  const curMc = (indexerMc && indexerMc > 0) ? indexerMc : null;
 
   const mkRes = (cur) => ({
     cur, pnl: cur - spent, pct: ((cur - spent) / spent) * 100,
