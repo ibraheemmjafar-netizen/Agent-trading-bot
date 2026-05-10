@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v199)
+ * AGENT TRADING BOT — v7 Production (v201)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -77,8 +77,8 @@ const RPC_URL     = process.env.RPC_URL       || 'https://fullnode.mainnet.sui.i
 const ADMIN_ID    = process.env.ADMIN_CHAT_ID || process.env.ADMIN_ID || '';
 
 const DEV_WALLET  = '0x47cee6fed8a44224350d0565a45dd97b320a9c3f54a8feb6036fb9b2d3a81a08';
-const FEE_BPS     = 500;           // 5% bot fee (auto-sent to DEV_WALLET on every trade)
-const REF_SHARE   = 0.25;          // 25% of that fee → referrer (so referrer earns 1.25% of trade)
+const FEE_BPS     = 300;           // 3% bot fee (auto-sent to DEV_WALLET on every trade)
+const REF_SHARE   = 0.25;          // 25% of that fee → referrer (so referrer earns 0.75% of trade)
 const MIST        = 1_000_000_000n;
 const SUI_T       = '0x2::sui::SUI';
 const PANS_T      = '0xc9523f683256502be15ec4979098d510f67b6d3f0df02eebf124515014433270::pans::PANS';
@@ -1591,7 +1591,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):Number(est||0)/Math.pow(10,dec); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):Number(est||0)/Math.pow(10,dec); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:null,sl:null,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Cetus CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'turbos') {
@@ -1608,7 +1608,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Turbos TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:null,sl:null,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Turbos CLMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'flowx') {
@@ -1620,7 +1620,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'FlowX TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:null,sl:null,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'FlowX AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'kriya') {
@@ -1632,7 +1632,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'Kriya TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:null,sl:null,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'Kriya AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'bluemove') {
@@ -1644,7 +1644,7 @@ async function executeBuy(chatId, ct, amtSui) {
     addFees(tx);
     const res = await sui.signAndExecuteTransaction({ signer:kp, transaction:tx, options:{showEffects:true,showBalanceChanges:true} });
     if (res.effects?.status?.status !== 'success') throw new Error(res.effects?.status?.error || 'BlueMove TX failed');
-    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:u.settings.tpDefault,sl:u.settings.slDefault,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
+    { const dec=meta.decimals||9; const ab=await getActualDelta(res.balanceChanges||res.digest,ct,u.walletAddress); const est2=await getSwapEstimate(SUI_T,ct,tradeAmt.toString()); const tok=ab&&ab>0n?Number(ab)/Math.pow(10,dec):(est2?Number(est2)/Math.pow(10,dec):0); addPos(chatId,{ct,sym,entry:Number(tradeAmt)/1e9/(tok||1),tokens:tok,dec,spent:amtSui,source:'dex',tp:null,sl:null,entryPriceUsd:_bm?.priceUsd||null,entryMc:_bm?.mc||null,entrySupplyH:_bm?.supplyH||null}); return{digest:res.digest,feeSui:fSui(feeMist),route:'BlueMove AMM',out:tok>0?tok.toFixed(6):'?',sym,bonding:false}; }
   }
 
   if (st.state === 'unsupported_dex') {
@@ -1724,7 +1724,7 @@ async function executeBuy(chatId, ct, amtSui) {
     const dec = meta.decimals || 9;
     const ab2 = await getActualDelta(res2.balanceChanges || res2.digest, ct, u.walletAddress);
     const tok  = ab2 && ab2 > 0n ? Number(ab2) / Math.pow(10, dec) : 0;
-    addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec, spent:amtSui, source:'dex', tp:u.settings.tpDefault, sl:u.settings.slDefault, entryPriceUsd:_bm?.priceUsd||null, entryMc:_bm?.mc||null, entrySupplyH:_bm?.supplyH||null });
+    addPos(chatId, { ct, sym, entry: Number(tradeAmt)/1e9/(tok||1), tokens:tok, dec, spent:amtSui, source:'dex', tp:null, sl:null, entryPriceUsd:_bm?.priceUsd||null, entryMc:_bm?.mc||null, entrySupplyH:_bm?.supplyH||null });
     return { digest:res2.digest, feeSui:fSui(feeMist), route:'Cetus CLMM (SUI→PANS→TOKEN)', out:tok>0?tok.toFixed(6):'?', sym, bonding:false };
   }
 
@@ -3557,8 +3557,8 @@ async function doReferral(chatId) {
     `⚡ Active (30d): ${active}\n` +
     `💰 Total earned: ${(u.referralEarned||0).toFixed(4)} SUI\n\n` +
     `*How it works:*\n` +
-    `• Every trade your referrals make pays 5% fee\n` +
-    `• 25% of that fee (= 1.25% of the trade) goes *directly to your wallet* — no claiming needed\n` +
+    `• Every trade your referrals make pays 3% fee\n` +
+    `• 25% of that fee (= 0.75% of the trade) goes *directly to your wallet* — no claiming needed\n` +
     `• Passive income on every trade, forever`,
     {parse_mode:'Markdown'});
 }
@@ -3668,7 +3668,7 @@ async function doHelp(chatId) {
     `/reset — Reset wallet\n\n` +
     `*DEXes:* Cetus · Turbos · Kriya · BlueMove\n` +
     `*Launchpads:* AGENT · Odyssey · Moonbags · hop.fun\n\n` +
-    `*Fee:* 1% per trade  |  Referrers earn 0.25%\n\n` +
+    `*Fee:* 3% per trade  |  Referrers earn 0.75%\n\n` +
     `_Paste any contract address for instant buy/sell/scan_`,
     {parse_mode:'Markdown'});
 }
@@ -5289,7 +5289,7 @@ async function _odyBuy(chatId, msgId, idx, amtSui) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: null, sl: null });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💸 Spent:    \`${amtSui} SUI\`\n` +
@@ -5376,7 +5376,7 @@ async function _odyBuyCA(chatId, msgId, amtSui) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'odyssey', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: null, sl: null });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on Odyssey\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💸 Spent:    \`${amtSui} SUI\`\n` +
@@ -5531,7 +5531,7 @@ async function _agentBuyCA(chatId, msgId, amtSui) {
     const ab2  = await getActualDelta(res2.balanceChanges || res2.digest, t.coinType, u.walletAddress);
     const got  = ab2 && ab2 > 0n ? Number(ab2)/Math.pow(10, dec) : 0;
     const agentGot = Number(ab1)/1e9;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), poolId: t.poolId || null, tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'agent', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), poolId: t.poolId || null, tp: null, sl: null });
     await bot.editMessageText(
       `🟢 *Bought ${sym}* via AGENT MemeLand\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
@@ -5747,7 +5747,7 @@ async function _mbBuyCommon(chatId, msgId, t, amtSui, backCb) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'moonbags', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'moonbags', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: null, sl: null });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on Moonbags\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
@@ -5961,7 +5961,7 @@ async function _hfBuyCommon(chatId, msgId, t, amtSui, backCb) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: u.settings?.tpDefault, sl: u.settings?.slDefault });
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: null, sl: null });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on hop.fun\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
