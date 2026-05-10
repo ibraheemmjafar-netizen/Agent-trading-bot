@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v209)
+ * AGENT TRADING BOT — v7 Production (v210)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -1019,7 +1019,7 @@ async function detectState(ct) {
     p,
     new Promise(resolve => setTimeout(() => resolve(null), ms)),
   ]);
-  const TASK_CAP_MS = 8000;
+  const TASK_CAP_MS = 12000; // v210: was 8000 — cold RPC chains were exceeding cap
 
   // === Section 1: Turbos (priority 1) ===
   const taskTurbos = (async () => {
@@ -1188,16 +1188,69 @@ async function detectState(ct) {
     return null;
   })();
 
-  // Wait for all 6 primaries to settle. Each is hard-capped at 8s so a
-  // single hung source can never block the user for more than 8 seconds.
+  // === Section 6: DexScreener-driven discovery (priority 7) — v210 ===
+  // Independent fallback that does NOT depend on GeckoTerminal's pool ordering
+  // or rate limits. Sorts DS pairs by USD liquidity desc, returns the deepest
+  // pool whose dexId is supported AND whose RPC pool resolution succeeds.
+  // Adds an extra candidate so v209's liquidity-first ranking has more to chew
+  // on. Critical for BlueMove tokens which v209 was missing when the Gecko
+  // task hit its 8s cap on cold start.
+  const taskAllDexViaDS = (async () => {
+    try {
+      const dsPools = await getDexScreenerPools(ct);
+      if (!dsPools.length) return null;
+      const SUI_NORM = SUI_T.toLowerCase();
+      const ranked = dsPools
+        .filter(p => {
+          const d = (p.dex || '').toLowerCase();
+          return d.includes('cetus') || d.includes('turbos') ||
+                 d.includes('kriya') || d.includes('bluemove');
+        })
+        .sort((a, b) => (Number(b.liq||0)) - (Number(a.liq||0)));
+      for (const p of ranked.slice(0, 6)) {
+        const poolInfo = await getPoolFromRPC(p.address).catch(() => null);
+        if (!poolInfo) continue;
+        const cAl = poolInfo.coinA.toLowerCase();
+        const cBl = poolInfo.coinB.toLowerCase();
+        const hasSui = cAl === SUI_NORM || cAl.endsWith('::sui::sui') ||
+                       cBl === SUI_NORM || cBl.endsWith('::sui::sui');
+        if (!hasSui) continue;
+        const otherCt = (cAl === SUI_NORM || cAl.endsWith('::sui::sui'))
+          ? poolInfo.coinB : poolInfo.coinA;
+        if (!tagEq(otherCt, ct)) continue;
+        const DEX_LABELS = {
+          cetus:'Cetus CLMM', turbos:'Turbos CLMM',
+          kriya:'Kriya AMM', bluemove:'BlueMove AMM',
+        };
+        const dexLabel = DEX_LABELS[poolInfo.dex] || poolInfo.dex;
+        return { state: poolInfo.dex, dex: dexLabel, ...poolInfo,
+                 liq: Number(p.liq||0), ts: Date.now() };
+      }
+    } catch {}
+    return null;
+  })();
+
+  // Wait for all 7 primaries to settle. Each is hard-capped at 12s (v210) so a
+  // single hung source can never block the user for more than 12 seconds.
   const settled = await Promise.all([
-    withCap(taskTurbos.catch(()    => null), TASK_CAP_MS),
-    withCap(taskPansDs.catch(()    => null), TASK_CAP_MS),
-    withCap(taskPansCetus.catch(() => null), TASK_CAP_MS),
-    withCap(taskCetus.catch(()     => null), TASK_CAP_MS),
-    withCap(taskAgent.catch(()     => null), TASK_CAP_MS),
-    withCap(taskGecko.catch(()     => null), TASK_CAP_MS),
+    withCap(taskTurbos.catch(()        => null), TASK_CAP_MS),
+    withCap(taskPansDs.catch(()        => null), TASK_CAP_MS),
+    withCap(taskPansCetus.catch(()     => null), TASK_CAP_MS),
+    withCap(taskCetus.catch(()         => null), TASK_CAP_MS),
+    withCap(taskAgent.catch(()         => null), TASK_CAP_MS),
+    withCap(taskGecko.catch(()         => null), TASK_CAP_MS),
+    withCap(taskAllDexViaDS.catch(()   => null), TASK_CAP_MS),
   ]);
+  // v210: trace each task result so future routing bugs are debuggable from logs
+  try {
+    const _names = ['Turbos','PansDs','PansCetus','Cetus','Agent','Gecko','AllDexViaDS'];
+    const _ctShort = (ct||'').slice(0,40);
+    settled.forEach((r, i) => {
+      if (r) console.log('[detectState %s] %s -> state=%s pool=%s liq=$%s',
+        _ctShort, _names[i], r.state, (r.poolId||'').slice(0,18), r.liq != null ? r.liq : '?');
+      else   console.log('[detectState %s] %s -> null', _ctShort, _names[i]);
+    });
+  } catch {}
 
   // Pick highest-priority winner. Real-DEX hits beat the Gecko
   // "unsupported_dex" sentinel (priority 99) so a working DEX is
@@ -1244,6 +1297,14 @@ async function detectState(ct) {
   if (ranked.length) {
     const top = ranked[0];
     if (bucket(top) === 0) top.r.lowLiq = true;
+    // v210: log the chosen pool so we can verify routing in production
+    try {
+      console.log('[detectState %s] WINNER -> state=%s pool=%s liq=$%s lowLiq=%s',
+        (ct||'').slice(0,40), top.r.state,
+        (top.r.poolId||'').slice(0,18),
+        top.liq != null ? top.liq : '?',
+        top.r.lowLiq ? 'true' : 'false');
+    } catch {}
     stateCache.set(ct, top.r);
     return top.r;
   }
@@ -6481,7 +6542,7 @@ async function main() {
   } catch(e) { console.warn('setMyCommands:', e.message); }
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  AGENT TRADING BOT — v6');
+  console.log('  AGENT TRADING BOT — v210');
   console.log(`  Bot: @${BOT_USERNAME}`);
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
   console.log('  DEX: Cetus CLMM + Turbos CLMM');
