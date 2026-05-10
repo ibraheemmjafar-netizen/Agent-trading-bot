@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v202)
+ * AGENT TRADING BOT — v7 Production (v203)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -3470,6 +3470,13 @@ async function doPositions(chatId) {
           cap += `\n\n🎯 TP: ${pos.tp?'+'+pos.tp+'%':'—'}   🛑 SL: ${pos.sl?'-'+pos.sl+'%':'—'}`;
         }
 
+        // v203: per-position TP/SL controls
+        const tpRow = pos.tp
+          ? [{text:`🎯 TP +${pos.tp}% ✏️`,callback_data:`ptp:${i}`},{text:'🗑 Clear TP',callback_data:`pct:${i}`}]
+          : [{text:'🎯 Set TP',callback_data:`ptp:${i}`}];
+        const slRow = pos.sl
+          ? [{text:`🛑 SL -${pos.sl}% ✏️`,callback_data:`psl:${i}`},{text:'🗑 Clear SL',callback_data:`pcs:${i}`}]
+          : [{text:'🛑 Set SL',callback_data:`psl:${i}`}];
         const sellKb = { inline_keyboard: [
           [{text:'🖨 Print PnL',callback_data:`print:${i}`},{text:'📍 Close track',callback_data:`close_track:${i}`}],
           [
@@ -3479,6 +3486,8 @@ async function doPositions(chatId) {
             {text:'💸 100%', callback_data:`qs:${i}:100`},
           ],
           [{text:'✏️ Custom %', callback_data:`qs:${i}:custom`}],
+          tpRow,
+          slRow,
         ]};
 
         if (p) {
@@ -3498,6 +3507,13 @@ async function doPositions(chatId) {
           `📍 *${pos.sym}/SUI*\n\n` +
           `Invested: ${parseFloat(pos.spent||0).toFixed(4)} SUI\n` +
           `Current:  ⚪ unavailable`;
+        // v203: per-position TP/SL controls (fallback branch)
+        const tpRow = pos.tp
+          ? [{text:`🎯 TP +${pos.tp}% ✏️`,callback_data:`ptp:${i}`},{text:'🗑 Clear TP',callback_data:`pct:${i}`}]
+          : [{text:'🎯 Set TP',callback_data:`ptp:${i}`}];
+        const slRow = pos.sl
+          ? [{text:`🛑 SL -${pos.sl}% ✏️`,callback_data:`psl:${i}`},{text:'🗑 Clear SL',callback_data:`pcs:${i}`}]
+          : [{text:'🛑 Set SL',callback_data:`psl:${i}`}];
         const sellKb = { inline_keyboard:[
           [
             {text:'💸 25%',  callback_data:`qs:${i}:25` },
@@ -3506,6 +3522,8 @@ async function doPositions(chatId) {
             {text:'💸 100%', callback_data:`qs:${i}:100`},
           ],
           [{text:'✏️ Custom %', callback_data:`qs:${i}:custom`}],
+          tpRow,
+          slRow,
         ]};
         await bot.sendMessage(chatId,fallback,{parse_mode:'Markdown',reply_markup:sellKb});
       }
@@ -4247,6 +4265,42 @@ bot.on('callback_query', async(q) => {
       try{await bot.deleteMessage(chatId,q.message.message_id);}catch{}
       return;
     }
+
+    // v203: per-position TP/SL controls from My Orders cards
+    if(data.startsWith('ptp:')){
+      const idx=parseInt(data.split(':')[1]);
+      const uu=getU(chatId); const pos=uu?.positions?.[idx];
+      if(!pos){await bot.answerCallbackQuery(q.id,{text:'Position not found'}).catch(()=>{});return;}
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      updU(chatId,{state:`set_pos_tp:${idx}`});
+      await bot.sendMessage(chatId,`🎯 *Take Profit for ${pos.sym}*\n\nEnter TP % (e.g. 50 = +50%):\n_Send 0 to disable_`,{parse_mode:'Markdown'});
+      return;
+    }
+    if(data.startsWith('psl:')){
+      const idx=parseInt(data.split(':')[1]);
+      const uu=getU(chatId); const pos=uu?.positions?.[idx];
+      if(!pos){await bot.answerCallbackQuery(q.id,{text:'Position not found'}).catch(()=>{});return;}
+      await bot.answerCallbackQuery(q.id).catch(()=>{});
+      updU(chatId,{state:`set_pos_sl:${idx}`});
+      await bot.sendMessage(chatId,`🛑 *Stop Loss for ${pos.sym}*\n\nEnter SL % (e.g. 20 = -20%):\n_Send 0 to disable_`,{parse_mode:'Markdown'});
+      return;
+    }
+    if(data.startsWith('pct:')){
+      const idx=parseInt(data.split(':')[1]);
+      const uu=getU(chatId); const pos=uu?.positions?.[idx];
+      if(!pos){await bot.answerCallbackQuery(q.id,{text:'Position not found'}).catch(()=>{});return;}
+      pos.tp=null; saveDB();
+      await bot.answerCallbackQuery(q.id,{text:`✅ TP cleared for ${pos.sym}`}).catch(()=>{});
+      return;
+    }
+    if(data.startsWith('pcs:')){
+      const idx=parseInt(data.split(':')[1]);
+      const uu=getU(chatId); const pos=uu?.positions?.[idx];
+      if(!pos){await bot.answerCallbackQuery(q.id,{text:'Position not found'}).catch(()=>{});return;}
+      pos.sl=null; saveDB();
+      await bot.answerCallbackQuery(q.id,{text:`✅ SL cleared for ${pos.sym}`}).catch(()=>{});
+      return;
+    }
     if(data.startsWith('flex:') || data.startsWith('print:')){
       await bot.answerCallbackQuery(q.id, {text:'🖨 Generating card...'}).catch(()=>{});
       const uu=getU(chatId); const idx=parseInt(data.split(':')[1]);
@@ -4802,6 +4856,28 @@ bot.on('message', async(msg) => {
     const v=parseFloat(text); if(isNaN(v)||v<0){await bot.sendMessage(chatId,'❌ Enter a number (0 to disable)');return;}
     const uu=getU(chatId); if(uu){uu.settings.slDefault=v===0?null:v;saveDB();}
     await bot.sendMessage(chatId,v===0?'✅ Stop Loss disabled':`✅ Stop Loss default: -${v}%`); return;
+  }
+
+  // v203: per-position TP/SL input handlers
+  if(state&&state.startsWith('set_pos_tp:')){
+    const idx=parseInt(state.split(':')[1]);
+    updU(chatId,{state:null});
+    const v=parseFloat(text); if(isNaN(v)||v<0){await bot.sendMessage(chatId,'❌ Enter a number (0 to disable)');return;}
+    const uu=getU(chatId); const pos=uu?.positions?.[idx];
+    if(!pos){await bot.sendMessage(chatId,'❌ Position no longer exists.');return;}
+    pos.tp=v===0?null:v; saveDB();
+    await bot.sendMessage(chatId,v===0?`✅ TP disabled for ${pos.sym}`:`✅ TP set for ${pos.sym}: +${v}%`);
+    return;
+  }
+  if(state&&state.startsWith('set_pos_sl:')){
+    const idx=parseInt(state.split(':')[1]);
+    updU(chatId,{state:null});
+    const v=parseFloat(text); if(isNaN(v)||v<0){await bot.sendMessage(chatId,'❌ Enter a number (0 to disable)');return;}
+    const uu=getU(chatId); const pos=uu?.positions?.[idx];
+    if(!pos){await bot.sendMessage(chatId,'❌ Position no longer exists.');return;}
+    pos.sl=v===0?null:v; saveDB();
+    await bot.sendMessage(chatId,v===0?`✅ SL disabled for ${pos.sym}`:`✅ SL set for ${pos.sym}: -${v}%`);
+    return;
   }
 
   if(state==='set_copy_amt'){
