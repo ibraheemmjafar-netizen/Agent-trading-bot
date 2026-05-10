@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v206)
+ * AGENT TRADING BOT — v7 Production (v209)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -77,7 +77,7 @@ const RPC_URL     = process.env.RPC_URL       || 'https://fullnode.mainnet.sui.i
 const ADMIN_ID    = process.env.ADMIN_CHAT_ID || process.env.ADMIN_ID || '';
 
 const DEV_WALLET  = '0x47cee6fed8a44224350d0565a45dd97b320a9c3f54a8feb6036fb9b2d3a81a08';
-const FEE_BPS     = 300;           // 3% bot fee (auto-sent to DEV_WALLET on every trade)
+const FEE_BPS     = 100;           // v207: 1% bot fee (auto-sent to DEV_WALLET on every trade; SUI on both buy and sell)
 const REF_SHARE   = 0.25;          // 25% of that fee → referrer (so referrer earns 0.75% of trade)
 const MIST        = 1_000_000_000n;
 const SUI_T       = '0x2::sui::SUI';
@@ -781,6 +781,52 @@ async function estimateFairOut(tokenIn, tokenOut, amountInRaw) {
   return null;
 }
 
+/**
+ * v209: Depth-aware slippage scaler (carry-forward from v208).
+ * Safety belt for thin-but-not-dust pools that pass the new ranking but
+ * still have meaningful price impact between quote and execution.
+ *   liq >= $50K   -> 1x   (liquid; unchanged)
+ *   liq $10K-$50K -> 3x   (mid-cap)
+ *   liq $1K-$10K  -> 6x   (thin)
+ *   liq < $1K     -> 6x   (dust-filtered upstream now; safety net)
+ *   liq unknown   -> 2x   (conservative)
+ * Effective slippage capped at 50%.
+ */
+function _slippageMultiplier(liqUsd) {
+  if (liqUsd == null) return 2;
+  if (liqUsd >= 50000) return 1;
+  if (liqUsd >= 10000) return 3;
+  return 6;
+}
+
+function computeMinOut(estRaw, baseSlippagePct, liqUsd) {
+  if (!estRaw) return 0n;
+  const mult = _slippageMultiplier(liqUsd);
+  const eff  = Math.min(50, Math.max(0, baseSlippagePct || 0) * mult);
+  const num  = BigInt(Math.floor((100 - eff) * 100));
+  return (BigInt(estRaw) * num) / 10000n;
+}
+
+/**
+ * v209: Per-pool liquidity probe used by detectState ranking.
+ * GeckoTerminal first (matches v204+ behaviour); DexScreener fallback
+ * matches the SPECIFIC pool by pairAddress so obscure Cetus CLMM pools
+ * (the RONDA/CHAD failure mode) get measured properly.
+ * Returns USD liquidity as Number, or null when both indexers silent.
+ */
+async function _poolLiqByPair(poolId, tokenCt) {
+  if (!poolId) return null;
+  const gt = await getBluemovePoolLiqUsd(poolId).catch(() => null);
+  if (gt != null) return gt;
+  if (!tokenCt) return null;
+  try {
+    const ds = await getDexScreenerPools(tokenCt).catch(() => []);
+    const pidLow = String(poolId).toLowerCase();
+    const match  = (ds || []).find(p => (p.address || '').toLowerCase() === pidLow);
+    return match?.liq != null ? Number(match.liq) : null;
+  } catch { return null; }
+}
+
 // Read actual token delta for walletAddr from a confirmed TX (balance changes)
 // Returns the BigInt amount change (positive = received, negative = spent) or null
 // Extract balance delta from a balanceChanges array (from TX response or getTransactionBlock)
@@ -1164,29 +1210,42 @@ async function detectState(ct) {
     candidates.push({ priority: isUnsupported ? 99 : (i + 1), result: r });
   }
   candidates.sort((a, b) => a.priority - b.priority);
-  // v205: liquidity-aware selection. Dust pools (e.g. Cetus $0.71-liq pool that
-  // burned the CHAD trader at 36x worse than market) are skipped in favour of
-  // the next-priority candidate that has real liquidity. PANS/AGENT hops and
-  // unsupported_dex are exempt (they have multiple pool IDs or no poolId).
+  // v209: LIQUIDITY-FIRST ranking. v205-v207 ranked by DEX preference order,
+  // then merely *filtered* sub-$1K pools. That broke CHAD/RONDA: bot picked a
+  // $1 Cetus pool over a $13K BlueMove pool because Cetus has higher DEX
+  // priority AND GeckoTerminal returned null for the obscure Cetus pool
+  // (v205 treated null as 'allow'). Fix: probe each pool's actual liquidity,
+  // sort by depth DESC, then tie-break on DEX priority. Threshold raised to
+  // $500 (sub-$500 pools routinely lose >50% even at 6x slippage scaling).
+  // PANS/AGENT hops and unsupported_dex are exempt (no single poolId).
+  const ranked = [];
   for (const c of candidates) {
     const r = c.result;
     const exempt = !r.poolId || ['pans_cetus','agent_cetus','unsupported_dex'].includes(r.state);
-    if (exempt) { stateCache.set(ct, r); return r; }
-    const liq = await getBluemovePoolLiqUsd(r.poolId).catch(() => null);
-    // null = indexer unknown (allow), >= $1000 = OK, < $1000 = dust → skip
-    if (liq == null || liq >= 1000) {
-      if (liq != null) r.liqUsd = liq;
-      stateCache.set(ct, r);
-      return r;
-    }
+    if (exempt) { ranked.push({ liq: Infinity, prio: c.priority, r }); continue; }
+    // Each find* function already populates r.liq from its native indexer.
+    // When that's missing or zero, fall back to a per-pool DexScreener probe.
+    let liq = (typeof r.liq === 'number' && r.liq > 0) ? r.liq : null;
+    if (liq == null) liq = await _poolLiqByPair(r.poolId, ct).catch(() => null);
+    if (liq != null) r.liqUsd = liq;
+    ranked.push({ liq: liq != null ? liq : null, prio: c.priority, r });
   }
-  // All candidates were dust — surface the deepest one with a flag so callers
-  // can warn the user instead of silently routing through a broken pool.
-  if (candidates.length) {
-    const best = candidates[0].result;
-    best.lowLiq = true;
-    stateCache.set(ct, best);
-    return best;
+  // 3 buckets: 2 = measured >=$500 (preferred), 1 = unknown liq (acceptable
+  // fallback when nothing measured passes), 0 = dust <$500 (last resort,
+  // tagged with lowLiq=true so caller can warn the user).
+  const bucket = (x) => (x.liq === Infinity || (x.liq != null && x.liq >= 500)) ? 2 : (x.liq == null ? 1 : 0);
+  ranked.sort((a, b) => {
+    const bdelta = bucket(b) - bucket(a);
+    if (bdelta !== 0) return bdelta;
+    const la = a.liq == null ? 0 : a.liq;
+    const lb = b.liq == null ? 0 : b.liq;
+    return (lb - la) || (a.prio - b.prio);
+  });
+  if (ranked.length) {
+    const top = ranked[0];
+    if (bucket(top) === 0) top.r.lowLiq = true;
+    stateCache.set(ct, top.r);
+    return top.r;
   }
 
   // 6. Bonding curves (sequential — only checked if all primaries returned null).
@@ -1709,9 +1768,8 @@ async function executeBuy(chatId, ct, amtSui) {
   };
 
   if (st.state === 'cetus') {
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await getSwapEstimate(SUI_T, ct, tradeAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildCetusSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId,
@@ -1729,9 +1787,8 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'turbos') {
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildTurbosSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId,
@@ -1750,9 +1807,8 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'flowx') {
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildFlowXSwapTx({
       wallet: u.walletAddress,
       coinA:  st.coinA, coinB: st.coinB, a2b: st.a2b,
@@ -1765,9 +1821,8 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'kriya') {
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildKriyaSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: st.a2b,
@@ -1780,9 +1835,8 @@ async function executeBuy(chatId, ct, amtSui) {
   }
 
   if (st.state === 'bluemove') {
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(SUI_T, ct, tradeAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildBlueMoveSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId,
@@ -1996,9 +2050,8 @@ async function executeSell(chatId, ct, pct) {
     // so for selling we flip to !a2b (token→SUI)
     const sellA2b    = !st.a2b;
     const coinInType = st.a2b ? st.coinB : st.coinA;   // the token side
-    const est        = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await getSwapEstimate(ct, SUI_T, sellAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
 
     const tx = await buildCetusSwapTx({
       wallet: u.walletAddress,
@@ -2020,9 +2073,8 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'turbos') {
     const sellA2b    = !st.a2b;
     const coinInType = st.a2b ? st.coinB : st.coinA;
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildTurbosSwapTx({
       wallet: u.walletAddress,
       poolId: st.poolId,
@@ -2043,9 +2095,8 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'flowx') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildFlowXSwapTx({
       wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: minOut.toString(),
@@ -2059,9 +2110,8 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'kriya') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildKriyaSwapTx({
       wallet: u.walletAddress, poolId: st.poolId, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: minOut.toString(),
@@ -2075,9 +2125,8 @@ async function executeSell(chatId, ct, pct) {
   if (st.state === 'bluemove') {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
-    const slipFactor = BigInt(Math.floor((1 - u.settings.slippage / 100) * 10000));
-    const est        = await estimateFairOut(ct, SUI_T, sellAmt.toString());
-    const minOut     = est ? (BigInt(est) * slipFactor) / 10000n : 0n;
+    const est    = await estimateFairOut(ct, SUI_T, sellAmt.toString());
+    const minOut = computeMinOut(est, u.settings.slippage, st.liqUsd);
     const tx = await buildBlueMoveSwapTx({
       wallet: u.walletAddress, poolId: st.poolId,
       coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
@@ -3123,8 +3172,18 @@ async function _renderPosCard(pos, user) {
       const t = await fetchAgentTokenByCoinType(pos.ct).catch(() => null);
       if (t?.marketCapUsd) curMc = Number(t.marketCapUsd);
     }
+    if (curMc == null) {
+      // v209: prefer the indexer's canonical circulating MC over the derived
+      // ratio. Derivation = entryMc × (cur/spent), where 'cur' is quoted
+      // from the same pool the buy went through. When that pool is thin,
+      // cur is poisoned and Current MC displays as ~25% of true MC right
+      // after the buy (CHAD: $8.17K vs real $35K). Indexer MC reflects the
+      // token-wide deepest pool — what users actually expect to see.
+      const ixMc = await _indexerMc(pos.ct).catch(() => null);
+      if (ixMc != null && ixMc > 0) curMc = ixMc;
+    }
     if (curMc == null && cur != null && spent > 0) {
-      // Derive current MC from PnL ratio: cur/spent × entryMc
+      // Last-resort derivation from PnL ratio: cur/spent × entryMc.
       curMc = pos.entryMc * (cur / spent);
     }
     currentLabel = 'Current MC';
