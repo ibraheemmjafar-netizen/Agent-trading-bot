@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production
+ * AGENT TRADING BOT — v7 Production (v199)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -488,6 +488,42 @@ async function findCetusPool(coinA, coinB) {
         if (!hasCoinA || !hasCoinB) continue;
         const liq = parseFloat(poolEntry.attributes?.reserve_in_usd || 0);
         return { ...poolInfo, liq };
+      }
+    }
+  } catch {}
+
+  // v199: DexScreener last-resort fallback. Cetus REST API 404s on
+  // brand-new low-TVL launches (e.g. CRUSH, $3.7K TVL, indexed by
+  // DexScreener but not by Cetus pools_info). GeckoTerminal sometimes
+  // catches them but is rate-limited (HTTP 429) under modest load.
+  // DexScreener has higher rate limits and indexes new pools faster.
+  // Only fires when all three strategies above returned nothing.
+  // Filters to Cetus only and verifies on-chain — does NOT change
+  // behaviour for PANS-paired or Agent-paired calls that already
+  // succeed via the strategies above.
+  try {
+    for (const addr of [coinB, coinB.split('::')[0]]) {
+      const dsPools = await getDexScreenerPools(addr);
+      if (!dsPools.length) continue;
+
+      // Only Cetus pools, sorted by liquidity desc.
+      const cetusOnly = dsPools
+        .filter(p => p.dex === 'cetus' && p.address)
+        .sort((a, b) => (b.liq || 0) - (a.liq || 0));
+
+      for (const p of cetusOnly.slice(0, 8)) {
+        const poolInfo = await getPoolFromRPC(p.address);
+        if (!poolInfo || poolInfo.dex !== 'cetus') continue;
+        // Must contain BOTH requested coins (same guard the
+        // GeckoTerminal block above uses to avoid wrong-pair pools).
+        const pA = poolInfo.coinA.toLowerCase();
+        const pB = poolInfo.coinB.toLowerCase();
+        const cAlc = coinA.toLowerCase();
+        const cBlc = coinB.toLowerCase();
+        const hasCoinA = pA === cAlc || pB === cAlc;
+        const hasCoinB = pA === cBlc || pB === cBlc;
+        if (!hasCoinA || !hasCoinB) continue;
+        return { ...poolInfo, liq: p.liq || 0 };
       }
     }
   } catch {}
