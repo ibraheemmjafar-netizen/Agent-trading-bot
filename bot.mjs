@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v203)
+ * AGENT TRADING BOT — v7 Production (v204)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -151,6 +151,13 @@ const KRIYA_PKG = '0xa0eba10b173538c8fecca1dff298e488402cc9ff374f8a12ca7758eebe8
 // NOTE: Dex_Info shared object address — confirmed via diag6 on-chain lookup
 const BLUEMOVE_PKG      = '0xb24b6789e088b876afabca733bed2299fbc9e2d6369be4d1acfa17d8145454d9';
 const BLUEMOVE_DEX_INFO = '0x3f2d9f724f4a1ce5e71676448dc452be9a6243dac9c5b975a588c8c867066e92'; // confirmed via diag6 TX input [7]
+
+// ── Cetus Aggregator (v204 — routes BlueMove through working path)
+// Verified May 2026: cetus_agg::bluemove::swap_a2b/b2a achieves 84% live success
+// rate vs ~4% on direct BLUEMOVE router::swap_exact_input single-hop.
+// Cetus Agg internally walks multi-hop variants to find a working route.
+const CETUS_AGG_PKG    = '0x57d4f00af225c487fd21eed6ee0d11510d04347ee209d2ab48d766e48973b1a4';
+const CETUS_AGG_CONFIG = '0x48c7524e9487d9c80fabb3740fb9d653e9e09271f1871e5acc14e24943976812';
 
 // ── Supported launchpads with bonding curve info
 const LAUNCHPADS = {
@@ -1394,19 +1401,51 @@ async function buildKriyaSwapTx({ wallet, poolId, coinA, coinB, a2b, coinInType,
 }
 
 /**
- * Build a BlueMove DEX swap PTB.
- *
- * VERIFIED function signature (from Sui RPC getNormalizedMoveFunction, Apr 2026):
- *   router::swap_exact_input<T0,T1>(amount_in: u64, Coin<T0>, min_out: u64, Dex_Info mut, TxContext mut)
- *
- * Dex_Info = BLUEMOVE_DEX_INFO (global shared DEX registry — not a pool object)
- * Single Coin. No Clock. Recipient via TxContext (tx.sender).
- *
- * a2b=true  → T0=SUI, T1=token
- * a2b=false → T0=token, T1=SUI
+ * v204: Probe a BlueMove pool's USD liquidity via GeckoTerminal.
+ * Returns null if probe fails (network/unknown pool) — caller treats as 'unknown, allow'.
+ * Returns a Number (USD) when known. Used as a pre-flight on dead pools (e.g. RONDA)
+ * where no aggregator path can succeed and submitting only burns gas.
  */
-async function buildBlueMoveSwapTx({ wallet, coinA, coinB, a2b, coinInType, amountIn, minAmountOut }) {
+async function getBluemovePoolLiqUsd(poolId) {
+  if (!poolId) return null;
+  try {
+    const r = await ftch(`${GECKO}/networks/sui-network/pools/${poolId}`, { headers: { Accept: 'application/json' } }, 6000);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const liq = d?.data?.attributes?.reserve_in_usd;
+    return liq != null ? parseFloat(liq) : null;
+  } catch { return null; }
+}
+
+/**
+ * Build a BlueMove DEX swap PTB — v204 routes through Cetus Aggregator.
+ *
+ * VERIFIED function signature (Sui RPC getNormalizedMoveFunction, May 2026):
+ *   cetus_agg::bluemove::swap_a2b<CoinA,CoinB>(
+ *     &mut Config, &mut bluemove::Dex_Info, Coin<CoinA>, &mut TxContext
+ *   ) → Coin<CoinB>
+ *   cetus_agg::bluemove::swap_b2a<CoinA,CoinB>(... Coin<CoinB>) → Coin<CoinA>
+ *
+ * typeArgs convention: ALWAYS [CoinA, CoinB] in pool's declared order.
+ * Direction encoded in function name (swap_a2b vs swap_b2a).
+ *
+ * Output coin returned by value — chained through:
+ *   utils::check_coin_threshold<TOut>(&Coin, min_out: u64)   ← slippage guard
+ *   utils::transfer_or_destroy_coin<TOut>(Coin, &TxContext)  ← sends to sender
+ *
+ * Pre-flight: if poolId given and GeckoTerminal reports liquidity < $1000 USD,
+ * refuses with a friendly message instead of submitting (saves gas).
+ */
+async function buildBlueMoveSwapTx({ wallet, coinA, coinB, a2b, coinInType, amountIn, minAmountOut, poolId }) {
   if (!BLUEMOVE_DEX_INFO) throw new Error('BlueMove Dex_Info address not yet confirmed — run diag6');
+
+  // v204 pre-flight: refuse on dead pools (saves gas on RONDA-class tokens)
+  if (poolId) {
+    const liq = await getBluemovePoolLiqUsd(poolId);
+    if (liq != null && liq < 1000) {
+      throw new Error(`💧 BlueMove pool too inactive ($${liq.toFixed(0)} liquidity) — trading would burn gas. Try again when liquidity returns.`);
+    }
+  }
 
   const tx = new Transaction();
   tx.setGasBudget(50_000_000);
@@ -1429,20 +1468,33 @@ async function buildBlueMoveSwapTx({ wallet, coinA, coinB, a2b, coinInType, amou
     }
   }
 
-  // Type args: [CoinIn, CoinOut]
-  const typeArgs = a2b ? [coinA, coinB] : [coinB, coinA];
+  // typeArgs ALWAYS in pool order [CoinA, CoinB] — direction via function name
+  const fn       = a2b ? 'swap_a2b' : 'swap_b2a';
+  const tokenOut = a2b ? coinB : coinA;
 
-  tx.moveCall({
-    target: `${BLUEMOVE_PKG}::router::swap_exact_input`,
-    typeArguments: typeArgs,
+  const [coinResult] = tx.moveCall({
+    target: `${CETUS_AGG_PKG}::bluemove::${fn}`,
+    typeArguments: [coinA, coinB],
     arguments: [
-      tx.pure.u64(BigInt(amountIn)),                   // amount_in
-      coinInObj,                                         // Coin<CoinIn>
-      tx.pure.u64(BigInt(minAmountOut || '0')),         // min_amount_out
-      tx.object(BLUEMOVE_DEX_INFO),                    // &mut Dex_Info
+      tx.object(CETUS_AGG_CONFIG),    // &mut Config
+      tx.object(BLUEMOVE_DEX_INFO),   // &mut bluemove::Dex_Info
+      coinInObj,                      // Coin<CoinIn>
     ],
   });
-  // NOTE: output coin is transferred to tx.sender inside Move
+
+  // Slippage guard — aborts the PTB if output is below threshold
+  tx.moveCall({
+    target: `${CETUS_AGG_PKG}::utils::check_coin_threshold`,
+    typeArguments: [tokenOut],
+    arguments: [coinResult, tx.pure.u64(BigInt(minAmountOut || '0'))],
+  });
+
+  // Send the output coin to the sender (or destroy if zero)
+  tx.moveCall({
+    target: `${CETUS_AGG_PKG}::utils::transfer_or_destroy_coin`,
+    typeArguments: [tokenOut],
+    arguments: [coinResult],
+  });
 
   return tx;
 }
@@ -1629,6 +1681,7 @@ async function executeBuy(chatId, ct, amtSui) {
   if (st.state === 'bluemove') {
     const tx = await buildBlueMoveSwapTx({
       wallet: u.walletAddress,
+      poolId: st.poolId,
       coinA: st.coinA, coinB: st.coinB, a2b: st.a2b,
       coinInType: SUI_T, amountIn: tradeAmt.toString(), minAmountOut: '0',
     });
@@ -1909,7 +1962,8 @@ async function executeSell(chatId, ct, pct) {
     const coinInType = st.a2b ? st.coinB : st.coinA;
     const sellA2b    = !st.a2b;
     const tx = await buildBlueMoveSwapTx({
-      wallet: u.walletAddress, coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
+      wallet: u.walletAddress, poolId: st.poolId,
+      coinA: st.coinA, coinB: st.coinB, a2b: sellA2b,
       coinInType, amountIn: sellAmt.toString(), minAmountOut: '0',
     });
     try{applyTxOpts(tx, u);}catch{}
