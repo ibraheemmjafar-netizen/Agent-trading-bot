@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v201)
+ * AGENT TRADING BOT — v7 Production (v202)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -875,232 +875,223 @@ async function detectState(ct) {
   const cached = stateCache.get(ct);
   if (cached && Date.now() - cached.ts < STATE_TTL) return cached;
 
-  // 1. Turbos pool API (most reliable — API works, returns d.result[])
-  try {
-    const tPool = await findTurbosPool(SUI_T, ct);
-    if (tPool) {
-      const res = { state:'turbos', dex:'Turbos', ...tPool, ts:Date.now() };
-      stateCache.set(ct, res); return res;
-    }
-  } catch {}
+  // v202: parallel fanout across the 6 primary discovery sources.
+  // Each task contains the SAME logic as the v201 serial sections 1, 2,
+  // 3, 4, 4b, 5 — only the orchestration changed. We wait for all six
+  // (capped at 8s per task) and return the highest-priority non-null
+  // result. Priority matches the old serial order so behaviour is
+  // preserved when multiple sources would have returned for the same
+  // coin. Bonding-curve fallback below is sequential (only fires when
+  // all primaries return null).
 
-  // 2. DexScreener — PRIMARY check for PANS ecosystem tokens.
-  //    Strategy A: query DexScreener by the TARGET TOKEN address.
-  //    Strategy B (fallback): query DexScreener by the PANS token address and
-  //    look for any pool that contains the target token.
-  //    Strategy B is the reliable one — DexScreener always has BVS/PANS when
-  //    searched from the PANS side, even if searching BVS directly returns nothing.
-  try {
-    // Helper: convert a confirmed DS pool entry into a pans_cetus state result.
-    // Bug fix: the pool MUST also contain `ct` (the user's token) — otherwise we'd
-    // build swap calls with typeArguments that don't match the wallet's coin type,
-    // causing CommandArgumentError { arg_idx: 3, kind: TypeMismatch } on sell or
-    // delivering the wrong token on buy hop2. Compare via normalizeStructTag to
-    // tolerate leading-zero / case variations.
-    const ctNorm = (() => { try { return normalizeStructTag(ct); } catch { return ct.toLowerCase(); } })();
-    const tagEq = (a, b) => {
-      try { return normalizeStructTag(a) === normalizeStructTag(b); }
-      catch { return (a||'').toLowerCase() === (b||'').toLowerCase(); }
-    };
-    const tryPansState = async (dsPool) => {
-      if (!dsPool?.address) return null;
-      const poolInfo = await getPoolFromRPC(dsPool.address).catch(() => null);
-      if (!poolInfo) return null;
-      const PANS_NORM = PANS_T.toLowerCase();
-      const SUI_NORM  = SUI_T.toLowerCase();
-      const coinAl = poolInfo.coinA.toLowerCase();
-      const coinBl = poolInfo.coinB.toLowerCase();
-      const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
-      const hasSui  = coinAl === SUI_NORM  || coinAl.endsWith('::sui::sui') ||
-                      coinBl === SUI_NORM  || coinBl.endsWith('::sui::sui');
-      // CRITICAL: the OTHER coin (non-PANS) must equal ct, or we'll route through
-      // a sibling PANS-paired pool (e.g. KYLN/PANS instead of BVS/PANS).
-      const otherCoin = (coinAl === PANS_NORM) ? poolInfo.coinB : poolInfo.coinA;
-      const hasCt = tagEq(otherCoin, ct);
-      if (!hasPans || hasSui || !hasCt) return null;
-      const suiPansPool = await findSuiPansPool();
-      if (!suiPansPool) return null;
-      return {
-        state:'pans_cetus', dex:'Cetus (PANS hop)',
-        tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
-        suiPansPool, liq:dsPool.liq, ts:Date.now(),
+  const ctIsPansSec3 = (() => { try { return normalizeStructTag(ct) === normalizeStructTag(PANS_T); } catch { return ct.toLowerCase() === PANS_T.toLowerCase(); } })();
+  const ctIsAgentSec4b = (() => { try { return normalizeStructTag(ct) === normalizeStructTag(AGENT_T); } catch { return ct.toLowerCase() === AGENT_T.toLowerCase(); } })();
+  const tagEq = (a, b) => {
+    try { return normalizeStructTag(a) === normalizeStructTag(b); }
+    catch { return (a||'').toLowerCase() === (b||'').toLowerCase(); }
+  };
+  const withCap = (p, ms) => Promise.race([
+    p,
+    new Promise(resolve => setTimeout(() => resolve(null), ms)),
+  ]);
+  const TASK_CAP_MS = 8000;
+
+  // === Section 1: Turbos (priority 1) ===
+  const taskTurbos = (async () => {
+    try {
+      const tPool = await findTurbosPool(SUI_T, ct);
+      if (tPool) return { state:'turbos', dex:'Turbos', ...tPool, ts:Date.now() };
+    } catch {}
+    return null;
+  })();
+
+  // === Section 2: DexScreener — PANS ecosystem (priority 2) ===
+  const taskPansDs = (async () => {
+    try {
+      const tryPansState = async (dsPool) => {
+        if (!dsPool?.address) return null;
+        const poolInfo = await getPoolFromRPC(dsPool.address).catch(() => null);
+        if (!poolInfo) return null;
+        const PANS_NORM = PANS_T.toLowerCase();
+        const SUI_NORM  = SUI_T.toLowerCase();
+        const coinAl = poolInfo.coinA.toLowerCase();
+        const coinBl = poolInfo.coinB.toLowerCase();
+        const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
+        const hasSui  = coinAl === SUI_NORM  || coinAl.endsWith('::sui::sui') ||
+                        coinBl === SUI_NORM  || coinBl.endsWith('::sui::sui');
+        const otherCoin = (coinAl === PANS_NORM) ? poolInfo.coinB : poolInfo.coinA;
+        const hasCt = tagEq(otherCoin, ct);
+        if (!hasPans || hasSui || !hasCt) return null;
+        const suiPansPool = await findSuiPansPool();
+        if (!suiPansPool) return null;
+        return {
+          state:'pans_cetus', dex:'Cetus (PANS hop)',
+          tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
+          suiPansPool, liq:dsPool.liq, ts:Date.now(),
+        };
       };
-    };
-
-    // Strategy A — search by target token address
-    for (const addr of [ct, ct.split('::')[0]]) {
-      const dsPools = await getDexScreenerPools(addr);
-      for (const p of dsPools) {
-        if (!p.dex.includes('cetus')) continue;
-        const res = await tryPansState(p);
-        if (res) { stateCache.set(ct, res); return res; }
+      // Strategy A — search by target token address
+      for (const addr of [ct, ct.split('::')[0]]) {
+        const dsPools = await getDexScreenerPools(addr);
+        for (const p of dsPools) {
+          if (!p.dex.includes('cetus')) continue;
+          const res = await tryPansState(p);
+          if (res) return res;
+        }
       }
-    }
+      // Strategy B — search by PANS address, look for our token in results
+      const pansDsPool = await findPansPoolForToken(ct);
+      if (pansDsPool) {
+        const res = await tryPansState(pansDsPool);
+        if (res) return res;
+      }
+    } catch {}
+    return null;
+  })();
 
-    // Strategy B — search by PANS address, look for our token in results
-    const pansDsPool = await findPansPoolForToken(ct);
-    if (pansDsPool) {
-      const res = await tryPansState(pansDsPool);
-      if (res) { stateCache.set(ct, res); return res; }
-    }
-  } catch {}
-
-  // 3. PANS ecosystem — Cetus API + GeckoTerminal fallback
-  //    Skip when ct === PANS itself: a 2-hop "TOKEN→PANS→SUI" route makes no
-  //    sense, and findCetusPool(PANS,PANS) is now guarded to return null anyway.
-  try {
-    const ctIsPansSec3 = (() => { try { return normalizeStructTag(ct) === normalizeStructTag(PANS_T); } catch { return ct.toLowerCase() === PANS_T.toLowerCase(); } })();
-    if (!ctIsPansSec3) {
+  // === Section 3: Cetus REST + GeckoTerminal — PANS ecosystem (priority 3) ===
+  const taskPansCetus = (async () => {
+    if (ctIsPansSec3) return null;
+    try {
       const pansPool = await findCetusPool(PANS_T, ct);
       if (pansPool) {
-        // Defense-in-depth: confirm the returned pool's non-PANS side equals ct.
-        const tagEqS3 = (a,b)=>{ try { return normalizeStructTag(a)===normalizeStructTag(b); } catch { return (a||'').toLowerCase()===(b||'').toLowerCase(); } };
-        const otherSide = tagEqS3(pansPool.coinA, PANS_T) ? pansPool.coinB : pansPool.coinA;
-        if (tagEqS3(otherSide, ct)) {
+        const otherSide = tagEq(pansPool.coinA, PANS_T) ? pansPool.coinB : pansPool.coinA;
+        if (tagEq(otherSide, ct)) {
           const suiPansPool = await findSuiPansPool();
           if (suiPansPool) {
-            const res = {
+            return {
               state:'pans_cetus', dex:'Cetus (PANS hop)',
               tokenPansPool: pansPool,
               suiPansPool:   suiPansPool,
               ts: Date.now(),
             };
-            stateCache.set(ct, res); return res;
           }
         }
       }
-    }
-  } catch {}
+    } catch {}
+    return null;
+  })();
 
-  // 4. Cetus pool API — SUI/TOKEN direct pair
-  try {
-    const pool = await findCetusPool(SUI_T, ct);
-    if (pool) {
-      const res = { state:'cetus', dex:'Cetus', ...pool, ts:Date.now() };
-      stateCache.set(ct, res); return res;
-    }
-  } catch {}
+  // === Section 4: Cetus SUI direct (priority 4) ===
+  const taskCetus = (async () => {
+    try {
+      const pool = await findCetusPool(SUI_T, ct);
+      if (pool) return { state:'cetus', dex:'Cetus', ...pool, ts:Date.now() };
+    } catch {}
+    return null;
+  })();
 
-  // 4b. AGENT MemeLand — AGENT/TOKEN Cetus pool (2-hop sell: MEME→AGENT→SUI)
-  // Tokens launched on AGENT MemeLand pair against AGENT, not SUI.
-  // detectState must recognise them as 'agent_cetus' so executeSell can route
-  // them through the existing 2-hop logic (mirrors _agentSellCA).
-  // Skip when ct === AGENT itself (mirror of section 3 PANS guard).
-  try {
-    const ctIsAgentSec4b = (() => { try { return normalizeStructTag(ct) === normalizeStructTag(AGENT_T); } catch { return ct.toLowerCase() === AGENT_T.toLowerCase(); } })();
-    if (!ctIsAgentSec4b) {
+  // === Section 4b: AGENT MemeLand Cetus (priority 5) ===
+  const taskAgent = (async () => {
+    if (ctIsAgentSec4b) return null;
+    try {
       const agentPool = await findCetusPool(AGENT_T, ct);
       if (agentPool) {
-        const tagEqS4b = (a,b)=>{ try { return normalizeStructTag(a)===normalizeStructTag(b); } catch { return (a||'').toLowerCase()===(b||'').toLowerCase(); } };
-        const otherSide = tagEqS4b(agentPool.coinA, AGENT_T) ? agentPool.coinB : agentPool.coinA;
-        if (tagEqS4b(otherSide, ct)) {
-          const res = { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...agentPool, ts:Date.now() };
-          stateCache.set(ct, res); return res;
+        const otherSide = tagEq(agentPool.coinA, AGENT_T) ? agentPool.coinB : agentPool.coinA;
+        if (tagEq(otherSide, ct)) {
+          return { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...agentPool, ts:Date.now() };
         }
       }
-    }
-  } catch {}
+    } catch {}
+    return null;
+  })();
 
-  // 5. GeckoTerminal — find pool address, then query Sui RPC for pool type.
-  //    Uses shared geckoCache — no duplicate HTTP calls, no 429 rate limits.
-  //    Checks ALL pools from ALL address variants before giving up.
-  try {
-    let firstUnsupported = null; // track in case nothing better found
-    for (const addr of [ct, ct.split('::')[0]]) {
-      const gPools = await getGeckoPools(addr);
-      if (!gPools.length) continue;
-
-      // Iterate ALL pools — keep checking even if early entries are on unsupported DEXes
-      for (const poolEntry of gPools.slice(0, 8)) {
-        const poolAddress = poolEntry.attributes?.address;
-        if (!poolAddress) continue;
-
-        const dexId = (poolEntry.relationships?.dex?.data?.id || '').toLowerCase();
-        const liq   = parseFloat(poolEntry.attributes?.reserve_in_usd || 0);
-
-        // flow-x excluded: Container object not found on-chain (disabled Apr 2026)
-        const knownDex = dexId.includes('cetus') || dexId.includes('turbos') ||
-                         dexId.includes('kriya')  || dexId.includes('bluemove');
-
-        if (!knownDex) {
-          // Remember first unsupported name but KEEP LOOKING at remaining pools
-          if (!firstUnsupported && dexId) firstUnsupported = dexId;
-          continue;
+  // === Section 5: GeckoTerminal full scan (priority 6 / 99 for unsupported_dex) ===
+  const taskGecko = (async () => {
+    let firstUnsupported = null;
+    try {
+      for (const addr of [ct, ct.split('::')[0]]) {
+        const gPools = await getGeckoPools(addr);
+        if (!gPools.length) continue;
+        for (const poolEntry of gPools.slice(0, 8)) {
+          const poolAddress = poolEntry.attributes?.address;
+          if (!poolAddress) continue;
+          const dexId = (poolEntry.relationships?.dex?.data?.id || '').toLowerCase();
+          const liq   = parseFloat(poolEntry.attributes?.reserve_in_usd || 0);
+          const knownDex = dexId.includes('cetus') || dexId.includes('turbos') ||
+                           dexId.includes('kriya')  || dexId.includes('bluemove');
+          if (!knownDex) {
+            if (!firstUnsupported && dexId) firstUnsupported = dexId;
+            continue;
+          }
+          const poolInfo = await getPoolFromRPC(poolAddress);
+          if (!poolInfo) continue;
+          const SUI_NORM  = SUI_T.toLowerCase();
+          const PANS_NORM = PANS_T.toLowerCase();
+          const coinAl = poolInfo.coinA.toLowerCase();
+          const coinBl = poolInfo.coinB.toLowerCase();
+          const hasSui  = coinAl === SUI_NORM || coinAl.endsWith('::sui::sui') ||
+                          coinBl === SUI_NORM || coinBl.endsWith('::sui::sui');
+          const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
+          const AGENT_NORM = AGENT_T.toLowerCase();
+          const hasAgent = coinAl === AGENT_NORM || coinBl === AGENT_NORM;
+          const otherVsPans  = (coinAl === PANS_NORM)  ? poolInfo.coinB : poolInfo.coinA;
+          const otherVsAgent = (coinAl === AGENT_NORM) ? poolInfo.coinB : poolInfo.coinA;
+          const hasCtVsPans  = hasPans  && tagEq(otherVsPans,  ct);
+          const hasCtVsAgent = hasAgent && tagEq(otherVsAgent, ct);
+          if (!hasSui && hasPans && hasCtVsPans && poolInfo.dex === 'cetus') {
+            try {
+              const suiPansPool = await findSuiPansPool();
+              if (suiPansPool) {
+                return {
+                  state:'pans_cetus', dex:'Cetus (PANS hop)',
+                  tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
+                  suiPansPool:   suiPansPool,
+                  liq, ts: Date.now(),
+                };
+              }
+            } catch {}
+            continue;
+          }
+          if (!hasSui && hasAgent && hasCtVsAgent && poolInfo.dex === 'cetus') {
+            return { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...poolInfo, liq, ts: Date.now() };
+          }
+          if (!hasSui) continue;
+          const DEX_LABELS = {
+            cetus:'Cetus CLMM', turbos:'Turbos CLMM',
+            kriya:'Kriya AMM', bluemove:'BlueMove AMM',
+          };
+          const dexLabel = DEX_LABELS[poolInfo.dex] || poolInfo.dex;
+          return { state: poolInfo.dex, dex: dexLabel, ...poolInfo, liq, ts: Date.now() };
         }
-
-        // Query Sui RPC for pool object type — gets exact coinA/coinB and DEX routing info
-        const poolInfo = await getPoolFromRPC(poolAddress);
-        if (!poolInfo) continue;
-
-        // Accept SUI-paired pools, or PANS-paired pools (2-hop route)
-        const SUI_NORM  = SUI_T.toLowerCase();
-        const PANS_NORM = PANS_T.toLowerCase();
-        const coinAl = poolInfo.coinA.toLowerCase();
-        const coinBl = poolInfo.coinB.toLowerCase();
-        const hasSui  = coinAl === SUI_NORM || coinAl.endsWith('::sui::sui') ||
-                        coinBl === SUI_NORM || coinBl.endsWith('::sui::sui');
-        const hasPans = coinAl === PANS_NORM || coinBl === PANS_NORM;
-
-        const AGENT_NORM = AGENT_T.toLowerCase();
-        const hasAgent = coinAl === AGENT_NORM || coinBl === AGENT_NORM;
-
-        // Defense-in-depth: same hasCt check as section 2's tryPansState — the
-        // non-PANS/non-AGENT side of the pool MUST equal user's ct, or the bot
-        // will pick a sibling pool (e.g. KYLN/PANS instead of BVS/PANS) and the
-        // sell will fail at Move type-check (arg_idx 3 TypeMismatch).
-        const tagEqS5 = (a, b) => {
-          try { return normalizeStructTag(a) === normalizeStructTag(b); }
-          catch { return (a||'').toLowerCase() === (b||'').toLowerCase(); }
-        };
-        const otherVsPans  = (coinAl === PANS_NORM)  ? poolInfo.coinB : poolInfo.coinA;
-        const otherVsAgent = (coinAl === AGENT_NORM) ? poolInfo.coinB : poolInfo.coinA;
-        const hasCtVsPans  = hasPans  && tagEqS5(otherVsPans,  ct);
-        const hasCtVsAgent = hasAgent && tagEqS5(otherVsAgent, ct);
-
-        if (!hasSui && hasPans && hasCtVsPans && poolInfo.dex === 'cetus') {
-          // TOKEN/PANS pool on Cetus — look for SUI/PANS hop pool via GeckoTerminal-resilient helper
-          try {
-            const suiPansPool = await findSuiPansPool();
-            if (suiPansPool) {
-              const res = {
-                state:'pans_cetus', dex:'Cetus (PANS hop)',
-                tokenPansPool: { poolId:poolInfo.poolId, coinA:poolInfo.coinA, coinB:poolInfo.coinB, a2b:poolInfo.a2b },
-                suiPansPool:   suiPansPool,
-                liq, ts: Date.now(),
-              };
-              stateCache.set(ct, res); return res;
-            }
-          } catch {}
-          continue;
-        }
-
-        // AGENT MemeLand token — TOKEN/AGENT Cetus pool (2-hop sell: MEME→AGENT→SUI)
-        if (!hasSui && hasAgent && hasCtVsAgent && poolInfo.dex === 'cetus') {
-          const res = { state:'agent_cetus', dex:'Cetus (AGENT hop)', ...poolInfo, liq, ts: Date.now() };
-          stateCache.set(ct, res); return res;
-        }
-
-        if (!hasSui) continue;
-
-        const DEX_LABELS = {
-          cetus:'Cetus CLMM', turbos:'Turbos CLMM',
-          kriya:'Kriya AMM', bluemove:'BlueMove AMM',
-        };
-        const dexLabel = DEX_LABELS[poolInfo.dex] || poolInfo.dex;
-        const res = { state: poolInfo.dex, dex: dexLabel, ...poolInfo, liq, ts: Date.now() };
-        stateCache.set(ct, res); return res;
       }
-    }
+      if (firstUnsupported) {
+        const dex = firstUnsupported[0].toUpperCase() + firstUnsupported.slice(1);
+        return { state: 'unsupported_dex', dex, ts: Date.now() };
+      }
+    } catch {}
+    return null;
+  })();
 
-    // Exhausted all pools — if we saw any pool at all, report its DEX as unsupported
-    if (firstUnsupported) {
-      const dex = firstUnsupported[0].toUpperCase() + firstUnsupported.slice(1);
-      const res = { state: 'unsupported_dex', dex, ts: Date.now() };
-      stateCache.set(ct, res); return res;
-    }
-  } catch {}
+  // Wait for all 6 primaries to settle. Each is hard-capped at 8s so a
+  // single hung source can never block the user for more than 8 seconds.
+  const settled = await Promise.all([
+    withCap(taskTurbos.catch(()    => null), TASK_CAP_MS),
+    withCap(taskPansDs.catch(()    => null), TASK_CAP_MS),
+    withCap(taskPansCetus.catch(() => null), TASK_CAP_MS),
+    withCap(taskCetus.catch(()     => null), TASK_CAP_MS),
+    withCap(taskAgent.catch(()     => null), TASK_CAP_MS),
+    withCap(taskGecko.catch(()     => null), TASK_CAP_MS),
+  ]);
 
-  // 5. Bonding curves
+  // Pick highest-priority winner. Real-DEX hits beat the Gecko
+  // "unsupported_dex" sentinel (priority 99) so a working DEX is
+  // always preferred over the "DEX not supported" message.
+  const candidates = [];
+  for (let i = 0; i < settled.length; i++) {
+    const r = settled[i];
+    if (!r) continue;
+    const isUnsupported = r.state === 'unsupported_dex';
+    candidates.push({ priority: isUnsupported ? 99 : (i + 1), result: r });
+  }
+  candidates.sort((a, b) => a.priority - b.priority);
+  if (candidates.length) {
+    const best = candidates[0].result;
+    stateCache.set(ct, best);
+    return best;
+  }
+
+  // 6. Bonding curves (sequential — only checked if all primaries returned null).
   for (const [key, lp] of Object.entries(LAUNCHPADS)) {
     try {
       const enc = encodeURIComponent(ct);
