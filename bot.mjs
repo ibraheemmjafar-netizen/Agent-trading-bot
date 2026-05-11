@@ -1,5 +1,5 @@
 /**
- * AGENT TRADING BOT — v7 Production (v210)
+ * AGENT TRADING BOT — v7 Production (v211)
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -3151,6 +3151,40 @@ async function getPnl(pos) {
     entryMc: pos.entryMc || null,
   });
   try {
+    // v211: hop.fun positions must be priced against the live bonding
+    // curve (virtual reserves), NOT a dust Cetus pool that DexScreener
+    // happens to surface. Reverses the constant-product sell quote:
+    //   cur_sui_mist = vsr - (vsr*vtr)/(vtr + tokensRaw)
+    if (pos.source === 'hopfun') {
+      const _t = await fetchHopFunCoin(sui, pos.ct).catch(() => null);
+      if (_t && _t.virtualSuiReserves > 0n && _t.virtualTokenReserves > 0n && pos.tokens > 0) {
+        // BigInt math for the constant-product reverse-quote so that
+        // _vtr + _tokensRaw never exceeds Number.MAX_SAFE_INTEGER (2^53)
+        // — hop.fun tokens with 9 dec and >1e15 raw supply would silently
+        // round otherwise. Float conversion happens only at the very end.
+        const _vsr = BigInt(_t.virtualSuiReserves);
+        const _vtr = BigInt(_t.virtualTokenReserves);
+        const _dec = pos.dec || 9;
+        const _tokensRaw = BigInt(Math.floor(pos.tokens * Math.pow(10, _dec)));
+        const _denom = _vtr + _tokensRaw;
+        const _curMist = _denom > 0n ? _vsr - (_vsr * _vtr) / _denom : 0n;
+        const _cur = Number(_curMist) / 1e9;
+        if (_cur > 0) {
+          const _res = mkRes(_cur);
+          if (suiUsd > 0) {
+            // Price-per-token: small ratio, safe in Number after division.
+            const _priceSuiPerHumanTok = (Number(_vsr) / Number(_vtr)) * Math.pow(10, _dec) / 1e9;
+            _res.priceUsd = _priceSuiPerHumanTok * suiUsd;
+            if (_t.totalSupply > 0n) {
+              const _totH = Number(BigInt(_t.totalSupply)) / Math.pow(10, _dec);
+              if (_totH > 0) _res.mc = _res.priceUsd * _totH;
+            }
+          }
+          return _res;
+        }
+      }
+      // Fall through to generic only if curve fetch failed (e.g. graduated)
+    }
     // AGENT MemeLand tokens route MEME→AGENT→SUI (2 hops) so direct
     // getSwapEstimate always returns 0. Use Railway backend priceSui first.
     if (pos.source === 'agent') {
@@ -4118,9 +4152,25 @@ async function showBuyConfirm(chatId, ct, amtSui, eid) {
   const feeMist=(amtM*BigInt(FEE_BPS))/10000n;
   const tradeAmt=amtM-feeMist;
   updU(chatId,{pd:{...getU(chatId).pd,ct,amtSui}});
-  let est='?';
-  try{const out=await getSwapEstimate(SUI_T,ct,tradeAmt.toString());if(out&&out!=='0')est=(Number(out)/Math.pow(10,meta.decimals||9)).toFixed(4);}catch{}
+  // v211: parallel safety probes — detectState (lowLiq) + getTokenData
+  // (honeypot). Each capped at 3.5s so a slow probe never hangs the
+  // confirm; missing data just hides the warning.
+  const _to = (p, ms) => Promise.race([p, new Promise(r => setTimeout(() => r(null), ms))]);
+  let est='?', warnBlock='', _hpBlocked=false;
+  try {
+    const [stRes, scanRes, outRaw] = await Promise.all([
+      _to(detectState(ct).catch(() => null), 3500),
+      _to(getTokenData(ct, u.walletAddress).catch(() => null), 3500),
+      _to((async()=>{try{return await getSwapEstimate(SUI_T,ct,tradeAmt.toString());}catch{return null;}})(), 3500),
+    ]);
+    if (outRaw && outRaw !== '0') est = (Number(outRaw)/Math.pow(10,meta.decimals||9)).toFixed(4);
+    const warns = [];
+    if (stRes && stRes.lowLiq === true) warns.push('⚠️ *LOW LIQUIDITY pool* — expect heavy slippage and possible failed swap.');
+    if (scanRes && scanRes.honeypot === false) { warns.push('🚨 *HONEYPOT DETECTED* — sells are likely to fail. Buy is blocked.'); _hpBlocked = true; }
+    if (warns.length) warnBlock = warns.join('\n') + '\n\n';
+  } catch {}
   const text=
+    warnBlock +
     `🟢 *Confirm Buy*\n\n` +
     `*${sym}/SUI*\n\n` +
     `Amount:   ${amtSui} SUI\n` +
@@ -4128,7 +4178,9 @@ async function showBuyConfirm(chatId, ct, amtSui, eid) {
     `Trade:    ${fSui(tradeAmt)} SUI\n` +
     (est!='?'?`Est get: ~${est} ${sym}\n`:'')+
     `Slippage: ${u.settings.slippage}%`;
-  const kb={inline_keyboard:[[{text:'✅ Confirm',callback_data:'bc'},{text:'❌ Cancel',callback_data:'ca'}]]};
+  const kb={inline_keyboard: _hpBlocked
+    ? [[{text:'❌ Cancel',callback_data:'ca'}]]
+    : [[{text:'✅ Confirm',callback_data:'bc'},{text:'❌ Cancel',callback_data:'ca'}]]};
   if(eid) await bot.editMessageText(text,{chat_id:chatId,message_id:eid,parse_mode:'Markdown',reply_markup:kb}).catch(async()=>bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb}));
   else await bot.sendMessage(chatId,text,{parse_mode:'Markdown',reply_markup:kb});
 }
@@ -5242,10 +5294,23 @@ bot.on('message', async(msg) => {
     return;
   }
 
-  // Raw CA paste — resolve bare package address to full coin type before storing
+  // Raw CA paste — resolve bare package address to full coin type before storing.
+  // v211: probe launchpads first; if the CA lives on hop.fun / Odyssey / Moonbags,
+  // route to that launchpad's UI so the buy hits the right curve, not a dust
+  // Cetus pool (root cause of the GAI hop.fun → Cetus $0 PnL bug).
   if(text.startsWith('0x')&&text.length>40){
     const ct=await resolveCoinType(text);
     updU(chatId,{pd:{ct}});
+    try {
+      const [hf, ody, mb] = await Promise.all([
+        isHopFunToken(sui, ct).catch(() => null),
+        isOdysseyToken(ct).catch(() => null),
+        isMoonbagsToken(ct).catch(() => null),
+      ]);
+      if (hf  && !hf.isCompleted)  { await _showHfByCA (chatId, ct, hf ); return; }
+      if (ody && !ody.isCompleted) { await _showOdyByCA(chatId, ct, ody); return; }
+      if (mb  && !mb.isCompleted)  { await _showMbByCA (chatId, ct, mb ); return; }
+    } catch {}
     await bot.sendMessage(chatId,`📋 \`${trunc(ct)}\`\n\nWhat do you want to do?`,{parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'💰 Buy',callback_data:'bfs'},{text:'💸 Sell',callback_data:'sfs'},{text:'🔍 Scan',callback_data:'sct'}]]}});
     return;
   }
@@ -6342,7 +6407,28 @@ async function _hfBuyCommon(chatId, msgId, t, amtSui, backCb) {
     const dec  = meta.decimals || 9;
     const ab   = await getActualDelta(res.balanceChanges || res.digest, t.coinType, u.walletAddress);
     const got  = ab && ab > 0n ? Number(ab)/Math.pow(10, dec) : 0;
-    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', entryMc: t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null), tp: null, sl: null });
+    // v211: hop.fun curve has no marketCapUsd; derive entry MC + USD price
+    // from on-chain virtual reserves so the PnL card shows real numbers,
+    // not "—". Best-effort — silent fallback to null on RPC issues.
+    let _hfEntryPriceUsd = null, _hfEntryMc = null;
+    try {
+      const _hf = await fetchHopFunCoin(sui, t.coinType).catch(() => null);
+      const _vsr = _hf?.virtualSuiReserves   ?? (t.virtualSuiReserves   ? BigInt(t.virtualSuiReserves)   : 0n);
+      const _vtr = _hf?.virtualTokenReserves ?? (t.virtualTokenReserves ? BigInt(t.virtualTokenReserves) : 0n);
+      const _tot = _hf?.totalSupply ?? 0n;
+      if (_vsr > 0n && _vtr > 0n) {
+        const _suiUsd = await fetchSuiUsd().catch(() => null);
+        const _priceSuiPerHumanTok = (Number(_vsr) / Number(_vtr)) * Math.pow(10, dec) / 1e9;
+        if (_suiUsd > 0 && _priceSuiPerHumanTok > 0) {
+          _hfEntryPriceUsd = _priceSuiPerHumanTok * _suiUsd;
+          if (_tot > 0n) {
+            const _totH = Number(_tot) / Math.pow(10, dec);
+            if (_totH > 0) _hfEntryMc = _hfEntryPriceUsd * _totH;
+          }
+        }
+      }
+    } catch {}
+    addPos(chatId, { ct: t.coinType, sym: t.symbol, entry: parseFloat(amtSui)/(got||1), tokens: got, dec, spent: amtSui, source:'hopfun', entryPriceUsd: _hfEntryPriceUsd, entryMc: _hfEntryMc != null ? _hfEntryMc : (t.marketCapUsd ? Number(t.marketCapUsd) : (t.marketCap ? Number(t.marketCap) : null)), tp: null, sl: null });
     await bot.editMessageText(
       `🟢 *Bought ${t.symbol}* on hop.fun\n━━━━━━━━━━━━━━━━━━━━\n` +
       `💰 Spent:    ${amtSui} SUI\n` +
@@ -6542,7 +6628,7 @@ async function main() {
   } catch(e) { console.warn('setMyCommands:', e.message); }
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  AGENT TRADING BOT — v210');
+  console.log('  AGENT TRADING BOT — v211');
   console.log(`  Bot: @${BOT_USERNAME}`);
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
   console.log('  DEX: Cetus CLMM + Turbos CLMM');
