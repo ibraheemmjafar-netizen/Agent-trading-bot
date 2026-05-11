@@ -1,5 +1,21 @@
 /**
- * AGENT TRADING BOT — v7 Production (v211)
+ * AGENT TRADING BOT — v7 Production (v213)
+ *
+ * v213 fixes (verified via live on-chain round-trip on user wallet):
+ *   - hop.fun PnL: net the 0.9% sell-side curve fee (was 0.892%
+ *     optimistic vs real sell, measured live in tx HHujFmVr...).
+ *   - Limit-order wizard: warn when target is a hop.fun pre-grad
+ *     token (no Cetus pool exists for _spotPriceUsd → limit never
+ *     fires; Snipe + min-MC is the right tool there).
+ *   - copyEngine: extract coin type + amounts from hop.fun
+ *     ::curve::TradedEvent<T> (was silently no-op for hop.fun
+ *     trades by tracked wallets).
+ *
+ * v212 fixes (still in effect):
+ *   - TP/SL: set-confirmation echoes live PnL + trigger context
+ *   - TP/SL: flex/print PnL card caption surfaces both values
+ *   - hop.fun: backfill entryMc + entryPriceUsd for legacy positions
+ *   - hop.fun: prefer live curve-derived current MC over derivation
  *
  * All fixes verified via live Sui RPC (getNormalizedMoveFunction, getObject, queryEvents)
  * and confirmed against real on-chain transactions — April 2026.
@@ -3167,7 +3183,12 @@ async function getPnl(pos) {
         const _dec = pos.dec || 9;
         const _tokensRaw = BigInt(Math.floor(pos.tokens * Math.pow(10, _dec)));
         const _denom = _vtr + _tokensRaw;
-        const _curMist = _denom > 0n ? _vsr - (_vsr * _vtr) / _denom : 0n;
+        // v213: hop.fun charges 0.9% on BOTH sides. The bare curve
+        //       reverse-quote above is the GROSS payout; net it down
+        //       by (10000-90)/10000 so PnL matches what the user
+        //       actually receives on sell. Live drift was 0.892%.
+        const _curMistGross = _denom > 0n ? _vsr - (_vsr * _vtr) / _denom : 0n;
+        const _curMist = (_curMistGross * 9_910n) / 10_000n;
         const _cur = Number(_curMist) / 1e9;
         if (_cur > 0) {
           const _res = mkRes(_cur);
@@ -3257,6 +3278,39 @@ async function _renderPosCard(pos, user) {
   let entryLabel = 'Entry SUI', currentLabel = 'Current SUI';
   let entryValue = `${spent.toFixed(4)} SUI`;
   let currentValue = cur != null ? `${cur.toFixed(4)} SUI` : '—';
+
+  // v212: hop.fun MC backfill — legacy positions bought pre-v211 have no
+  // entryMc. Fetch the bonding curve once, derive entry price + MC from
+  // virtual reserves, and persist so subsequent renders are instant.
+  if (pos.source === 'hopfun' && (!pos.entryMc || pos.entryMc <= 0)) {
+    try {
+      const _hf = await fetchHopFunCoin(sui, pos.ct).catch(() => null);
+      const _vsr = _hf?.virtualSuiReserves   ?? 0n;
+      const _vtr = _hf?.virtualTokenReserves ?? 0n;
+      const _tot = _hf?.totalSupply ?? 0n;
+      const _dec = pos.dec || 6;
+      if (_vsr > 0n && _vtr > 0n) {
+        const _suiUsd = await fetchSuiUsd().catch(() => null);
+        const _priceSuiPerHumanTok = (Number(_vsr) / Number(_vtr)) * Math.pow(10, _dec) / 1e9;
+        if (_suiUsd > 0 && _priceSuiPerHumanTok > 0) {
+          // For legacy positions we don't know the original entry price,
+          // so we use the user's actual cost basis: spent SUI / tokens held
+          // × SUI/USD. That keeps Entry MC honest (not the curve’s current).
+          const _tokensH = pos.tokens || 0;
+          if (_tokensH > 0 && spent > 0 && _tot > 0n) {
+            const _entryPxUsd = (spent / _tokensH) * _suiUsd;
+            const _totH = Number(_tot) / Math.pow(10, _dec);
+            const _entryMc = _entryPxUsd * _totH;
+            if (_entryMc > 0) {
+              pos.entryMc = _entryMc;
+              pos.entryPriceUsd = _entryPxUsd;
+              try { saveDB(); } catch {}
+            }
+          }
+        }
+      }
+    } catch {}
+  }
 
   if (pos.entryMc && pos.entryMc > 0) {
     entryLabel = 'Entry MC';
@@ -3390,10 +3444,26 @@ async function copyEngine() {
           const ev=(tx.events||[]).find(e=>e.type?.toLowerCase().includes('swap')||e.type?.toLowerCase().includes('trade'));
           if(!ev) continue;
           const pj=ev.parsedJson||{};
-          const coinOut  = pj.coin_type_out||pj.token_out||pj.coinTypeOut||null;
-          const coinIn   = pj.coin_type_in ||pj.token_in ||pj.coinTypeIn ||null;
-          const evAmtIn  = pj.amount_in  ? BigInt(pj.amount_in)  : null; // raw input amount
-          const evAmtOut = pj.amount_out ? BigInt(pj.amount_out) : null;
+          // v213: was const → let so the hop.fun fallback below can rewrite
+          //       these when the matched event is a hop.fun ::curve::TradedEvent.
+          let coinOut  = pj.coin_type_out||pj.token_out||pj.coinTypeOut||null;
+          let coinIn   = pj.coin_type_in ||pj.token_in ||pj.coinTypeIn ||null;
+          let evAmtIn  = pj.amount_in  ? BigInt(pj.amount_in)  : null; // raw input amount
+          let evAmtOut = pj.amount_out ? BigInt(pj.amount_out) : null;
+          // v213: hop.fun TradedEvent uses sui_amount / token_amount / is_buy,
+          //       and the coin type lives in the event-type generic
+          //       (<pkg>::curve::TradedEvent<0x..::tok::TOK>). Without this
+          //       extractor copy trade silently no-ops on every hop.fun trade.
+          if (!coinIn && !coinOut && ev.type && ev.type.includes('::curve::')) {
+            const _g  = ev.type.match(/<(.+)>$/);
+            const _ct = _g ? _g[1] : null;
+            const _isBuy  = pj.is_buy === true  || pj.isBuy === true;
+            const _isSell = pj.is_buy === false || pj.isBuy === false;
+            const _suiAmt = pj.sui_amount   ? BigInt(pj.sui_amount)   : null;
+            const _tokAmt = pj.token_amount ? BigInt(pj.token_amount) : null;
+            if (_ct && _isBuy)  { coinOut = _ct;    coinIn  = SUI_T; evAmtIn = _suiAmt; evAmtOut = _tokAmt; }
+            if (_ct && _isSell) { coinOut = SUI_T;  coinIn  = _ct;   evAmtIn = _tokAmt; evAmtOut = _suiAmt; }
+          }
 
           // ── COPY BUY: tracked wallet bought a token (SUI → token)
           const bought = (coinOut && coinOut!==SUI_T) ? coinOut : null;
@@ -4524,7 +4594,18 @@ bot.on('callback_query', async(q) => {
         if(arg==='custom'){updU(chatId,{state:'wiz_limit_amt_custom'});await bot.sendMessage(chatId,'✏️ Enter custom SUI amount (e.g. 1.5):');return;}
         uu.pd.wiz=uu.pd.wiz||{}; uu.pd.wiz.sui=parseFloat(arg); saveDB();
         updU(chatId,{state:'wiz_limit_target'});
-        await bot.sendMessage(chatId,`📊 *Step 2 of 3* — Target price (USD)\n\nBuy ${arg} SUI when price reaches what?\n\nSend the target USD price (e.g. \`0.0005\`):`,{parse_mode:'Markdown'});
+        // v213: pre-grad hop.fun tokens have no Cetus pool, so the limit
+        //       engine's _spotPriceUsd returns null forever and the order
+        //       silently never fires. Warn the user up front and point
+        //       them at Snipe + min-MC, which DOES work pre-graduation.
+        let _hfWarn = '';
+        try {
+          const _c = await fetchHopFunCoin(sui, uu.pd.ct).catch(() => null);
+          if (_c && _c.virtualSuiReserves > 0n && !_c.isCompleted) {
+            _hfWarn = '\n\n⚠️ This is a hop.fun bonding-curve token. Limit orders won\u2019t fire until it graduates to a DEX. Use ⚡ *Snipe* with a min-MC trigger instead.';
+          }
+        } catch {}
+        await bot.sendMessage(chatId,`📊 *Step 2 of 3* — Target price (USD)\n\nBuy ${arg} SUI when price reaches what?\n\nSend the target USD price (e.g. \`0.0005\`):`+_hfWarn,{parse_mode:'Markdown'});
         return;
       }
       if(tag==='ldir'){
@@ -4673,7 +4754,11 @@ bot.on('callback_query', async(q) => {
       const pos=uu?.positions?.[idx]; if(!pos){await bot.sendMessage(chatId,'❌ Position not found.');return;}
       try {
         const buf = await _renderPosCard(pos, uu);
-        const cap = `${(pos.sym||'?').toUpperCase()} ${pos.entryMc?'· MC P&L':'· SUI P&L'}  ·  shared via @${(await bot.getMe()).username}`;
+        // v212: surface TP/SL on flex card caption
+        const _tpsl = (pos.tp || pos.sl)
+          ? `\n🎯 TP: ${pos.tp?'+'+pos.tp+'%':'—'}   🛑 SL: ${pos.sl?'-'+pos.sl+'%':'—'}`
+          : '';
+        const cap = `${(pos.sym||'?').toUpperCase()} ${pos.entryMc?'· MC P&L':'· SUI P&L'}  ·  shared via @${(await bot.getMe()).username}`+_tpsl;
         await bot.sendPhoto(chatId, buf, { caption: cap });
       } catch(e){
         await bot.sendMessage(chatId,`❌ Couldn't generate PnL card: ${(e.message||'').slice(0,120)}`);
@@ -5232,7 +5317,22 @@ bot.on('message', async(msg) => {
     const uu=getU(chatId); const pos=uu?.positions?.[idx];
     if(!pos){await bot.sendMessage(chatId,'❌ Position no longer exists.');return;}
     pos.tp=v===0?null:v; saveDB();
-    await bot.sendMessage(chatId,v===0?`✅ TP disabled for ${pos.sym}`:`✅ TP set for ${pos.sym}: +${v}%`);
+    // v212: echo live context so user SEES the value landed (was: silent one-liner)
+    let _ctx = '';
+    try {
+      const _p = await getPnl(pos).catch(() => null);
+      if (_p) {
+        const _s = _p.pct >= 0 ? '+' : '';
+        _ctx = `\n\nNow: ${_s}${_p.pct.toFixed(2)}%`;
+        if (v > 0 && pos.entryMc && pos.entryMc > 0) {
+          const _trigMc = pos.entryMc * (1 + v/100);
+          _ctx += `  ·  fires when MC ≥ ${fmtMoney(_trigMc)}`;
+        } else if (v > 0) {
+          _ctx += `  ·  fires at ${_s.includes('+')?'':'+'}${v}% gain`;
+        }
+      }
+    } catch {}
+    await bot.sendMessage(chatId,(v===0?`✅ TP disabled for ${pos.sym}`:`✅ TP set for ${pos.sym}: +${v}%`)+_ctx);
     return;
   }
   if(state&&state.startsWith('set_pos_sl:')){
@@ -5242,7 +5342,22 @@ bot.on('message', async(msg) => {
     const uu=getU(chatId); const pos=uu?.positions?.[idx];
     if(!pos){await bot.sendMessage(chatId,'❌ Position no longer exists.');return;}
     pos.sl=v===0?null:v; saveDB();
-    await bot.sendMessage(chatId,v===0?`✅ SL disabled for ${pos.sym}`:`✅ SL set for ${pos.sym}: -${v}%`);
+    // v212: echo live context (matches TP handler)
+    let _ctx = '';
+    try {
+      const _p = await getPnl(pos).catch(() => null);
+      if (_p) {
+        const _s = _p.pct >= 0 ? '+' : '';
+        _ctx = `\n\nNow: ${_s}${_p.pct.toFixed(2)}%`;
+        if (v > 0 && pos.entryMc && pos.entryMc > 0) {
+          const _trigMc = pos.entryMc * (1 - v/100);
+          _ctx += `  ·  fires when MC ≤ ${fmtMoney(_trigMc)}`;
+        } else if (v > 0) {
+          _ctx += `  ·  fires at -${v}% loss`;
+        }
+      }
+    } catch {}
+    await bot.sendMessage(chatId,(v===0?`✅ SL disabled for ${pos.sym}`:`✅ SL set for ${pos.sym}: -${v}%`)+_ctx);
     return;
   }
 
@@ -5386,7 +5501,12 @@ bot.onText(/\/print(?:\s+(\d+))?/, async (msg, match) => {
     if (pickIdx != null && positions[pickIdx]) {
       try {
         const buf = await _renderPosCard(positions[pickIdx], u);
-        await bot.sendPhoto(chatId, buf, { caption: `${(positions[pickIdx].sym||'?').toUpperCase()} PnL card` });
+        // v212: surface TP/SL on /print caption
+        const _pp = positions[pickIdx];
+        const _tpsl = (_pp.tp || _pp.sl)
+          ? `\n🎯 TP: ${_pp.tp?'+'+_pp.tp+'%':'—'}   🛑 SL: ${_pp.sl?'-'+_pp.sl+'%':'—'}`
+          : '';
+        await bot.sendPhoto(chatId, buf, { caption: `${(_pp.sym||'?').toUpperCase()} PnL card`+_tpsl });
       } catch (e) { await bot.sendMessage(chatId, `❌ ${(e.message||'').slice(0,120)}`); }
       return;
     }
@@ -6628,7 +6748,7 @@ async function main() {
   } catch(e) { console.warn('setMyCommands:', e.message); }
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  AGENT TRADING BOT — v211');
+  console.log('  AGENT TRADING BOT — v213');
   console.log(`  Bot: @${BOT_USERNAME}`);
   console.log(`  Users: ${Object.keys(DB).length} | RPC: ${RPC_URL}`);
   console.log('  DEX: Cetus CLMM + Turbos CLMM');
